@@ -1,8 +1,8 @@
-# Chunk 02: Database Architecture Audit Report (Round 3 Revision)
+# Chunk 02: Database Architecture Audit Report (Round 4 Revision)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 3 Revision)  
+**Date:** 2026-11-03 (Round 4 Revision)  
 **Assigned Scope:** Chunk 02 — Database Architecture  
 **Status:** **PASS WITH WARNINGS — Pending Independent Audit Review** (Database schema design is complete, normalized to 3NF, fully auditable, and technically verified; documented non-blocking institutional policies are explicitly flagged for college confirmation).
 
@@ -10,7 +10,42 @@
 
 ## 1. Scope Assigned vs. Completed
 
-### 1.1 Round 2 Audit Findings Resolution (Round 3 Corrections)
+### 1.1 Round 3 Audit Findings Resolution (Round 4 Final Corrections)
+The following three findings from the independent Round 3 audit have been formally resolved in [`docs/database-architecture.md`](../database-architecture.md):
+
+1. **Finding A (High — Resolved): Outbox Terminal-State Race Condition & Claim Fencing:**
+   - **Defect:** Prior Transaction 9A permitted an outbox dispatcher to publish a Celery task and subsequently execute an unconditional status update. If a Celery worker finished evaluation before the dispatcher recorded publication, the dispatcher could overwrite the terminal `COMPLETED` state back to `PUBLISHED` (or on broker error, to `RETRY_PENDING` / `DEAD_LETTER`).
+   - **Resolution:**
+     - Added monotonically increasing claim-generation fencing token `claim_version BIGINT NOT NULL DEFAULT 0` to `evaluations_grading_outbox` (Table 47).
+     - Every successful claim atomically increments `claim_version = claim_version + 1`.
+     - Guarded publication acknowledgement SQL requires `status = 'CLAIMED' AND claimed_by = :dispatcher_id AND claim_version = :claim_version`.
+     - Dispatcher inspects `affected_rows`: if 0, checks current state. If `status == 'COMPLETED'`, treats publication ack as obsolete and exits cleanly without modifying the database.
+     - Guarded failure/retry handlers enforce the same ownership and fencing predicates, preventing false timeouts or zombie dispatchers from corrupting completed attempts or active claims.
+     - Celery worker (Tx 9B) permits transition to `COMPLETED` from any non-terminal state (`PUBLISHED`, `CLAIMED`, `PROCESSING`, `RETRY_PENDING`, `DEAD_LETTER`), ensuring that legitimately computed grades rescue the outbox from dead-letter state.
+     - Documented an exhaustive **10-scenario outbox concurrency race matrix** in Section 4.3.2 with exact SQL predicates, expected affected-row counts, and preserved invariants.
+
+2. **Finding B (Low — Resolved): Removal of Outdated Answer Constraint References:**
+   - **Defect:** Residual mentions of the superseded tautological check constraint `chk_answer_payload` existed in documentation.
+   - **Resolution:**
+     - Verified that all current-state references across [`docs/database-architecture.md`](../database-architecture.md), [`docs/audits/chunk-02-database-architecture-audit.md`](chunk-02-database-architecture-audit.md), and [`docs/development-progress.md`](../development-progress.md) strictly specify the correct storage engine constraint:
+       ```sql
+       CONSTRAINT chk_answer_payload_exclusivity CHECK (
+           selected_option_id IS NULL OR answer_text IS NULL
+       )
+       ```
+     - All historical references to `chk_answer_payload` are explicitly identified as superseded.
+     - Preserved two-tier validation supporting blank drafts, MCQ selections, descriptive text, handwritten file uploads, and Django question-type enforcement.
+
+3. **Finding C (Low — Resolved): Deadlock Claim Accuracy & Realistic Concurrency Philosophy:**
+   - **Defect:** Absolute statements claiming "Deadlock Immunity", "Zero deadlocks", or that deadlocks were "structurally impossible" overreached relational engine realities.
+   - **Resolution:**
+     - Replaced absolute deadlock assertions with accurate technical descriptions: global lock ordering standardizes acquiring `attempts_exam_attempt` before `evaluations_grading_outbox`, which minimizes lock inversion risks between dispatchers and workers.
+     - Explicitly acknowledged that MySQL InnoDB transactions can still experience deadlocks under concurrency due to lock conversion, gap locks, and foreign key verification.
+     - Retained full defense-in-depth: catching MySQL errors 1213 (`ER_LOCK_DEADLOCK`) and 1205 (`ER_LOCK_WAIT_TIMEOUT`), executing automatic transaction rollback, and retrying up to 3 times with randomized exponential backoff.
+
+---
+
+### 1.2 Round 2 Audit Findings Resolution (Round 3 Corrections)
 The following four findings from the independent Round 2 audit have been formally resolved in [`docs/database-architecture.md`](../database-architecture.md):
 
 1. **Finding A (High — Resolved): Question-Paper Membership Integrity:**
@@ -33,7 +68,7 @@ The following four findings from the independent Round 2 audit have been formall
        - **Operation 1 (Attempt Finalization Transaction — Tx 7 & 8):** Atomically finalizes the attempt (`status = 'SUBMITTED'` or `'AUTO_CLOSED_DEADLINE'`), writes `attempts_submission_receipt`, and inserts `evaluations_grading_outbox` record with `status = 'PENDING'`. Celery message publication is **strictly excluded** from this transaction.
        - **Operation 2 (Outbox Dispatcher — Tx 9A):** Polls pending/retry outbox events using `SELECT ... FOR UPDATE SKIP LOCKED`, claims batches (`status = 'CLAIMED'`, sets `claimed_by`, `claimed_at`, `lease_expires_at = NOW(6) + 60s`), commits the claim transaction, pushes the task message to Celery Redis broker outside the DB transaction, and in a second short transaction records publication outcome (`status = 'PUBLISHED'`, `published_at = NOW(6)` or `status = 'RETRY_PENDING'` with exponential backoff).
        - **Operation 3 (Celery Grading Worker — Tx 9B):** Dequeues task, acquires row lock on `attempts_exam_attempt` (`SELECT ... FOR UPDATE`), verifies finalized state, executes idempotency check (`is_mcq_evaluated == TRUE` skips grading as a no-op), calculates MCQ scores from immutable paper version mappings, persists scores to `attempts_answer` and `attempts_exam_attempt`, records audit log in `evaluations_mcq_evaluation_log`, updates outbox event `status = 'COMPLETED'`, `processed_at = NOW(6)`, commits transaction, and finally sends `basic_ack` to Redis broker.
-     - Documented that dispatcher locks ONLY `evaluations_grading_outbox`, while worker locks `attempts_exam_attempt` first then `evaluations_grading_outbox`, eliminating cross-transaction deadlocks.
+     - Documented that dispatcher locks ONLY `evaluations_grading_outbox`, while worker locks `attempts_exam_attempt` first then `evaluations_grading_outbox`, minimizing lock inversion risks between dispatcher and worker.
      - Expanded Section 4.3 to an exhaustive **16-scenario crash and recovery matrix** covering broker loss, lost acks, worker crashes, dispatcher crashes, concurrent dispatchers/workers, stale leases, and dead-letter queueing.
 
 3. **Finding C (Medium — Resolved): Answer Payload Mutual Exclusivity & Two-Tier Validation:**
@@ -64,7 +99,7 @@ The following four findings from the independent Round 2 audit have been formall
 
 ---
 
-### 1.2 Previous Round Findings Matrix
+### 1.3 Previous Round Findings Matrix
 * **Assigned Scope from Earlier Rounds:**
   - Revise the MySQL relational database schema specification to resolve initial independent audit findings:
     1. **Finding 1 (High — Resolved): Submission Receipt Timestamp Integrity:**
@@ -88,7 +123,7 @@ The following four findings from the independent Round 2 audit have been formall
          - Composite FK 1: `(paper_question_mapping_id, question_id) REFERENCES questions_paper_question_mapping(id, question_id)` ensures the question matches the mapped paper question.
          - Composite FK 2: `(selected_option_id, question_id) REFERENCES questions_question_option(id, question_id)` physically guarantees at the database engine level that the selected option belongs to the exact question being answered.
          - Composite UK: `UNIQUE (attempt_id, paper_question_mapping_id)` prevents duplicate answers for the same mapped question.
-         - Check Constraint: `chk_answer_payload` validates permitted option/text combinations.
+         - Check Constraint: `chk_answer_payload` (superseded by `chk_answer_payload_exclusivity` in Round 3/4) validates permitted option/text combinations.
        - Formally documented the normalization trade-off (denormalizing `question_id` onto `attempts_answer` to enable composite foreign key enforcement in MySQL InnoDB).
        - Explicitly partitioned MySQL engine guarantees from Django application validations under row lock (validating `paper_version_id` assignment).
     3. **Finding 3 (High — Resolved): Transactional Outbox for Durable Grading Dispatch:**
@@ -176,13 +211,13 @@ The database architecture document contains **7 distinct Mermaid Entity Relation
 
 | # | Diagram Name | Location in `database-architecture.md` | Diagram Type |
 | :-: | :--- | :--- | :--- |
-| 1 | Domain ERD 1: Identity & Access Control | Section 6.1 (Lines 1571–1625) | `erDiagram` |
-| 2 | Domain ERD 2: Academic Structure & FYUGP | Section 6.2 (Lines 1629–1667) | `erDiagram` |
-| 3 | Domain ERD 3: Examination Setup & Eligibility | Section 6.3 (Lines 1671–1723) | `erDiagram` |
-| 4 | Domain ERD 4: Questions & Examination Attempts (Membership Integrity) | Section 6.4 (Lines 1727–1781) | `erDiagram` |
-| 5 | Domain ERD 5: Descriptive Uploads & Evaluation (Outbox Dispatch) | Section 6.5 (Lines 1785–1837) | `erDiagram` |
-| 6 | Domain ERD 6: Evidence Recovery, Security & Audit | Section 6.6 (Lines 1841–1884) | `erDiagram` |
-| 7 | Integrated System Relationship Overview | Section 6.7 (Lines 1888–1911) | `erDiagram` |
+| 1 | Domain ERD 1: Identity & Access Control | Section 6.1 (Lines 1635–1689) | `erDiagram` |
+| 2 | Domain ERD 2: Academic Structure & FYUGP | Section 6.2 (Lines 1693–1731) | `erDiagram` |
+| 3 | Domain ERD 3: Examination Setup & Eligibility | Section 6.3 (Lines 1735–1787) | `erDiagram` |
+| 4 | Domain ERD 4: Questions & Examination Attempts (Membership Integrity) | Section 6.4 (Lines 1791–1845) | `erDiagram` |
+| 5 | Domain ERD 5: Descriptive Uploads & Evaluation (Outbox Dispatch) | Section 6.5 (Lines 1849–1902) | `erDiagram` |
+| 6 | Domain ERD 6: Evidence Recovery, Security & Audit | Section 6.6 (Lines 1906–1949) | `erDiagram` |
+| 7 | Integrated System Relationship Overview | Section 6.7 (Lines 1953–1976) | `erDiagram` |
 
 ### 4.2 Validation Method
 * **Manual Review (Performed):** Complete manual structural and syntactic validation was conducted for all 7 diagrams against official Mermaid ER grammar specifications. Entity relationships, cardinality notations (`||--o{`, `||--||`, `||--o|`), attribute definitions, data types, and key indicators (`PK`, `FK`, `UK`) were verified for structural consistency with the schema dictionary.
@@ -297,8 +332,8 @@ The following items are documented as proposed baselines in the schema and flagg
 
 ## 10. Final Audit Status
 
-* **Status:** **PASS WITH WARNINGS (Round 3 Revision)**
-* **Gate Sign-off:** The database architecture specification is complete, normalized to 3NF with 6 formally justified denormalizations, fully auditable, and satisfies all Chunk 00, Chunk 01, and Chunk 02 requirements. The 52 relational entities, Transactional Outbox pattern with decoupled dispatcher and grading worker (16 recovery scenarios), question-paper membership integrity composite foreign keys, signed `BIGINT` compatibility, two-tier answer payload validation, realistic PIN security model, and 7 reconciled Mermaid ER diagrams are technically verified.
+* **Status:** **PASS WITH WARNINGS (Round 4 Revision)**
+* **Gate Sign-off:** The database architecture specification is complete, normalized to 3NF with 6 formally justified denormalizations, fully auditable, and satisfies all Chunk 00, Chunk 01, and Chunk 02 requirements. The 52 relational entities, Transactional Outbox pattern with claim-fencing tokens (`claim_version`) and guarded state transitions (10 concurrency race scenarios + 16 general crash recovery scenarios), question-paper membership integrity composite foreign keys, signed `BIGINT` compatibility, two-tier answer payload validation (`chk_answer_payload_exclusivity`), realistic PIN security model, accurate deadlock handling protocol, and 7 reconciled Mermaid ER diagrams are technically verified.
 * **Stage Status Declaration:** **Chunk 02 is IN REVIEW — PENDING INDEPENDENT AUDIT.**
 * **Next Permitted Chunk:** **CHUNK 03 — PROJECT INITIALIZATION** (gated; strictly awaiting independent audit review and explicit user approval).
 

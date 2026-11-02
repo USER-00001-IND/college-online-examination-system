@@ -970,7 +970,7 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   | `error_message` | TEXT | Yes | NULL | Error diagnostics if failed |
 
 #### Table 47: `evaluations_grading_outbox`
-* **Purpose:** **Transactional Outbox Table**. Decouples attempt finalization from Celery message broker publication and asynchronous grading worker execution, guaranteeing at-least-once durable dispatch intent surviving process, network, and broker failures.
+* **Purpose:** **Transactional Outbox Table with Claim Fencing**. Decouples attempt finalization from Celery message broker publication and asynchronous grading worker execution, guaranteeing at-least-once durable dispatch intent surviving process, network, and broker failures without risk of stale dispatchers overwriting terminal evaluation states.
 * **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
@@ -982,6 +982,7 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   | `payload_json` | JSON | No | None | Serialized attempt metadata, paper version, and student ID |
   | `idempotency_key` | VARCHAR(128) | No | None | Deterministic key `attempt_{attempt_id}_mcq_grading` (`UNIQUE`) |
   | `status` | VARCHAR(20) | No | 'PENDING' | Enum: `PENDING`, `CLAIMED`, `PUBLISHED`, `PROCESSING`, `COMPLETED`, `RETRY_PENDING`, `FAILED`, `DEAD_LETTER` |
+  | `claim_version` | BIGINT | No | 0 | Monotonically increasing claim-generation fencing token |
   | `retry_count` | TINYINT | No | 0 | Number of dispatch/execution attempts |
   | `max_retries` | TINYINT | No | 5 | Maximum retry attempts before transitioning to `DEAD_LETTER` |
   | `next_retry_at` | DATETIME(6) | Yes | NULL | Timestamp for exponential backoff retry |
@@ -1363,77 +1364,96 @@ The application and database layers enforce a **comprehensive deadlock handling 
 * **Trigger:** Dedicated background dispatcher process running on polling schedule (every 1 second) or triggered by post-commit signal.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
-  1. `SELECT * FROM evaluations_grading_outbox WHERE (status IN ('PENDING', 'RETRY_PENDING') AND (next_retry_at IS NULL OR next_retry_at <= NOW(6))) OR (status = 'CLAIMED' AND lease_expires_at <= NOW(6)) ORDER BY created_at ASC LIMIT 50 FOR UPDATE SKIP LOCKED`
-* **Operations (Step-by-Step):**
-  1. **Claim Outbox Batch:** For each acquired row, update status to `CLAIMED`, record dispatcher identity, and grant a 60-second lease:
+  1. `SELECT id, event_id, attempt_id, claim_version FROM evaluations_grading_outbox WHERE (status IN ('PENDING', 'RETRY_PENDING') AND (next_retry_at IS NULL OR next_retry_at <= NOW(6))) OR (status = 'CLAIMED' AND lease_expires_at <= NOW(6)) ORDER BY created_at ASC LIMIT 50 FOR UPDATE SKIP LOCKED`
+* **Operations (Step-by-Step with Claim Fencing):**
+  1. **Claim Outbox Batch & Increment Fencing Token:** For each acquired row, update status to `CLAIMED`, record dispatcher identity, grant a 60-second lease, and increment `claim_version`:
      ```sql
      UPDATE evaluations_grading_outbox 
      SET status = 'CLAIMED',
          claimed_by = :dispatcher_node_id,
          claimed_at = NOW(6),
-         lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND)
-     WHERE id = :outbox_id;
+         lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND),
+         claim_version = claim_version + 1
+     WHERE id = :outbox_id 
+       AND (status IN ('PENDING', 'RETRY_PENDING') OR (status = 'CLAIMED' AND lease_expires_at <= NOW(6)));
      ```
+     - Dispatcher retains the newly assigned `claim_version = :new_claim_version`.
   2. **Commit Claim Transaction:** The claim transaction commits immediately, releasing row locks on the outbox table.
   3. **Publish to Celery Broker (Outside DB Transaction):**
-     - Dispatcher pushes message to Celery queue (`queue='grading_queue'`) with payload `{ "event_id": :event_id, "attempt_id": :attempt_id }`.
-  4. **Record Publication Outcome (New Short DB Transaction):**
-     - If broker enqueue succeeds:
+     - Dispatcher pushes message to Celery queue (`queue='grading_queue'`) with payload `{ "event_id": :event_id, "attempt_id": :attempt_id, "claim_version": :new_claim_version }`.
+  4. **Record Publication Outcome via Guarded SQL (New Short DB Transaction):**
+     - **On Broker Enqueue Success:**
        ```sql
        UPDATE evaluations_grading_outbox 
        SET status = 'PUBLISHED',
            published_at = NOW(6)
-       WHERE id = :outbox_id;
+       WHERE id = :outbox_id
+         AND status = 'CLAIMED'
+         AND claimed_by = :dispatcher_node_id
+         AND claim_version = :new_claim_version;
        ```
-     - If broker enqueue fails (network error, Redis down):
+       - **Inspect Affected-Row Count:**
+         - If `affected_rows == 1`: Transition to `PUBLISHED` succeeded cleanly.
+         - If `affected_rows == 0`: The row is no longer in state `CLAIMED` owned by this dispatcher generation. Dispatcher queries current state:
+           ```sql
+           SELECT status, claim_version, claimed_by FROM evaluations_grading_outbox WHERE id = :outbox_id;
+           ```
+           - If `status == 'COMPLETED'`: The worker already finished grading! Publication acknowledgement is obsolete; exit cleanly without modifying DB.
+           - If `claim_version > :new_claim_version` or `claimed_by != :dispatcher_node_id`: Superseded by newer claim; yield ownership and exit cleanly.
+           - Never execute an unconditional update forcing the event back to `PUBLISHED`.
+     - **On Broker Enqueue Failure (Network drop, Redis down):**
        ```sql
        UPDATE evaluations_grading_outbox 
        SET status = IF(retry_count + 1 >= max_retries, 'DEAD_LETTER', 'RETRY_PENDING'),
            retry_count = retry_count + 1,
            next_retry_at = DATE_ADD(NOW(6), INTERVAL LEAST(300, POW(2, retry_count) * 5) SECOND),
            last_error = :exception_traceback
-       WHERE id = :outbox_id;
+       WHERE id = :outbox_id
+         AND status = 'CLAIMED'
+         AND claimed_by = :dispatcher_node_id
+         AND claim_version = :new_claim_version;
        ```
-  - **Guarantees:** Broker publication never implies grading completion. Crashes between claiming and publication are recovered automatically when `lease_expires_at` lapses.
+       - **Inspect Affected-Row Count:**
+         - If `affected_rows == 1`: Retry or dead-letter state recorded cleanly.
+         - If `affected_rows == 0`: Check current state. If `status == 'COMPLETED'`, grading succeeded despite socket error; exit cleanly without altering state.
+  - **Guarantees:** Monotonically increasing `claim_version` prevents zombie dispatchers from overwriting active claims or terminal grading states.
 
 #### Transaction 9B: Celery Grading Worker Idempotent MCQ Evaluation (Operation 3: Celery Grading Worker)
-* **Trigger:** Celery worker dequeues task `{ "event_id": :event_id, "attempt_id": :attempt_id }` from `grading_queue`.
+* **Trigger:** Celery worker dequeues task `{ "event_id": :event_id, "attempt_id": :attempt_id, "claim_version": :claim_version }` from `grading_queue`.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order (Global Lock Hierarchy):**
   1. `SELECT * FROM attempts_exam_attempt WHERE id = :attempt_id FOR UPDATE`
-  2. `SELECT * FROM evaluations_grading_outbox WHERE event_id = :event_id FOR UPDATE`
+  2. `SELECT id, status, claim_version FROM evaluations_grading_outbox WHERE event_id = :event_id FOR UPDATE`
 * **Operations (Step-by-Step):**
   1. **Attempt Validation & Idempotency Check:**
      - Verify attempt status is finalized (`SUBMITTED` or `AUTO_CLOSED_DEADLINE`). If not finalized, log warning and reject.
-     - Check `is_mcq_evaluated`:
-       - If `is_mcq_evaluated == TRUE`: MCQ grading has already completed (duplicate delivery). Skip grading calculation, update outbox `status = 'COMPLETED'`, `processed_at = NOW(6)`, commit transaction, and acknowledge message.
-  2. **Calculate MCQ Marks:**
-     - Query answers, paper mappings, and question options:
-       ```sql
-       SELECT a.id, a.selected_option_id, m.marks, m.negative_marks, o.is_correct
-       FROM attempts_answer a
-       JOIN questions_paper_question_mapping m ON a.paper_question_mapping_id = m.id
-       LEFT JOIN questions_question_option o ON a.selected_option_id = o.id
-       WHERE a.attempt_id = :attempt_id AND o.id IS NOT NULL;
-       ```
-     - Compute awarded marks for each question:
-       - If `o.is_correct == TRUE`: `marks`
-       - If `o.is_correct == FALSE`: `-1 * negative_marks`
-       - If unanswered: `0.00`
-  3. **Persist Scores & Audit Logs:**
-     - Update each `attempts_answer` row with `awarded_marks = :score, is_evaluated = TRUE`.
-     - Update `attempts_exam_attempt` set `total_score_mcq = :total_mcq, is_mcq_evaluated = TRUE`.
-     - Insert detailed audit row into `evaluations_mcq_evaluation_log`.
-  4. **Update Outbox Status to COMPLETED:**
-     ```sql
-     UPDATE evaluations_grading_outbox 
-     SET status = 'COMPLETED',
-         processed_at = NOW(6)
-     WHERE event_id = :event_id;
-     ```
-  5. **Commit Database Transaction:** Commits all score updates and outbox status atomically.
-  6. **Acknowledge Celery Message:** Send Celery `basic_ack` to Redis broker.
-  - **Deadlock Immunity:** Lock hierarchy acquires `attempts_exam_attempt` before `evaluations_grading_outbox`. Since dispatcher (Tx 9A) never accesses `attempts_exam_attempt`, cross-transaction deadlocks between dispatcher and grading worker are structurally impossible.
+     - Evaluate attempt and outbox state:
+       - **Case 1 (Duplicate Delivery on Completed Task):** If `attempts_exam_attempt.is_mcq_evaluated == TRUE` AND `outbox.status == 'COMPLETED'`: MCQ grading was already committed and outbox finalized. Skip calculation, commit transaction, and acknowledge message.
+       - **Case 2 (Attempt Scored but Outbox Incomplete):** If `attempts_exam_attempt.is_mcq_evaluated == TRUE` AND `outbox.status != 'COMPLETED'`: Attempt scores are durable. Update outbox to `COMPLETED`:
+         ```sql
+         UPDATE evaluations_grading_outbox 
+         SET status = 'COMPLETED', processed_at = NOW(6) 
+         WHERE id = :outbox_id;
+         ```
+         Commit transaction and acknowledge message.
+       - **Case 3 (Fresh Evaluation):** If `attempts_exam_attempt.is_mcq_evaluated == FALSE`:
+         - Query student answers, paper mappings, and question options.
+         - Compute MCQ awarded marks (`+marks` for correct, `-negative_marks` for incorrect, `0.00` for blank).
+         - Update each `attempts_answer` row with `awarded_marks = :score, is_evaluated = TRUE`.
+         - Update `attempts_exam_attempt` set `total_score_mcq = :total_mcq, is_mcq_evaluated = TRUE`.
+         - Insert audit row into `evaluations_mcq_evaluation_log`.
+         - Transition outbox event to `COMPLETED`:
+           ```sql
+           UPDATE evaluations_grading_outbox 
+           SET status = 'COMPLETED',
+               processed_at = NOW(6)
+           WHERE id = :outbox_id 
+             AND status IN ('PUBLISHED', 'CLAIMED', 'PROCESSING', 'RETRY_PENDING', 'DEAD_LETTER');
+           ```
+           - **Terminal State Invariant:** Transition to `COMPLETED` is permitted from any non-terminal state (including `CLAIMED` if worker beat dispatcher acknowledgement, or `DEAD_LETTER` if retry threshold was reached during worker execution). This guarantees that successfully committed grades are never lost or left in dead-letter limbo.
+  2. **Commit Database Transaction:** Commits score updates and outbox completion atomically.
+  3. **Acknowledge Celery Message:** Send Celery `basic_ack` to Redis broker.
+  - **Deadlock Risk Minimization & Handling:** Lock hierarchy standardizes acquiring `attempts_exam_attempt` before `evaluations_grading_outbox`. Because the dispatcher (Tx 9A) operates strictly on `evaluations_grading_outbox` without acquiring row locks on `attempts_exam_attempt`, lock order inversion between dispatcher and grading worker transactions is minimized. Furthermore, both workers and dispatchers catch transient MySQL errors 1213 (`ER_LOCK_DEADLOCK`) and 1205 (`ER_LOCK_WAIT_TIMEOUT`), executing automatic transaction rollback and bounded retry with randomized exponential backoff.
 
 #### Transaction 10: Faculty Descriptive Grading
 * **Trigger:** Faculty evaluator submits score for descriptive question.
@@ -1488,17 +1508,61 @@ The application and database layers enforce a **comprehensive deadlock handling 
 
 ---
 
-### 4.3 Transactional Outbox Failure Scenario Analysis (16 Scenarios)
+### 4.3 Transactional Outbox Concurrency, Fencing & Crash Recovery Analysis
 
-The Transactional Outbox pattern guarantees **at-least-once durable dispatch intent**. Downstream grading worker execution is strictly idempotent. The system handles all 16 failure scenarios without data loss, stranded events, or score duplication:
+The Transactional Outbox pattern guarantees **at-least-once durable dispatch intent** while strictly maintaining that **`COMPLETED` is terminal and immutable**.
+
+#### 4.3.1 Outbox Claim Fencing & Guarded Concurrency State Machine
+
+To prevent stale outbox dispatchers or delayed network responses from overwriting terminal grading states, the outbox engine implements a **monotonically increasing claim-generation fencing token (`claim_version`)** alongside guarded conditional transitions:
+
+```
++---------------------------------------------------------------------------------------------------+
+|                                OUTBOX CONCURRENCY STATE TRANSITIONS                               |
++---------------------------------------------------------------------------------------------------+
+| Current State   | Permitted Transition | Acting Actor   | Guard Predicate (WHERE clause)          |
++-----------------+----------------------+----------------+-----------------------------------------+
+| PENDING         | -> CLAIMED           | Dispatcher Tx  | status IN ('PENDING', 'RETRY_PENDING')  |
+| CLAIMED         | -> PUBLISHED         | Dispatcher Tx  | status='CLAIMED' AND ver=:v AND by=:id  |
+| CLAIMED         | -> RETRY_PENDING     | Dispatcher Tx  | status='CLAIMED' AND ver=:v AND by=:id  |
+| CLAIMED         | -> DEAD_LETTER       | Dispatcher Tx  | status='CLAIMED' AND ver=:v AND by=:id  |
+| CLAIMED         | -> RETRY_PENDING     | Reconciliation | status='CLAIMED' AND lease_expired      |
+| PUBLISHED       | -> RETRY_PENDING     | Reconciliation | status='PUBLISHED' AND attempt_not_eval |
+| Non-Terminal *  | -> COMPLETED         | Grading Worker | status IN (PUBLISHED, CLAIMED, RETRY, DL)|
+| COMPLETED       | IMMUTABLE TERMINAL   | ALL ACTORS     | NO TRANSITION PERMITTED                 |
++-----------------+----------------------+----------------+-----------------------------------------+
+* Non-Terminal: Any status prior to grading completion. Once COMPLETED, no dispatcher can alter state.
+```
+
+#### 4.3.2 Ten Critical Outbox Concurrency Race Scenarios & Fencing Verification Matrix
+
+> [!NOTE]
+> **Static Architecture Analysis vs. Execution Status:** The following concurrency matrix documents the exact relational state transitions, SQL predicates, and expected affected-row counts derived through formal static analysis of MySQL 8.0 InnoDB ACID guarantees. Live concurrency test execution in a running MySQL instance has **NOT** been performed and is gated until Chunk 03 implementation.
+
+| # | Race Scenario & Interleaving | Guarded SQL Predicate & Affected Rows | Final State | Invariant Preserved |
+| :-: | :--- | :--- | :---: | :--- |
+| **1** | **Worker completes before dispatcher publication ack**<br>1. Disp claims (`ver=1`).<br>2. Disp pushes to Redis.<br>3. Worker executes, grades attempt, commits outbox `COMPLETED`.<br>4. Disp runs guarded update. | `UPDATE ... SET status='PUBLISHED' WHERE id=:id AND status='CLAIMED' AND claim_version=1;`<br>**Affected Rows:** `0`. Disp detects `status=='COMPLETED'`, exits cleanly. | `COMPLETED` | Terminal `COMPLETED` state is never overwritten by delayed dispatcher publication update. |
+| **2** | **Worker completes before dispatcher failure handler executes**<br>1. Disp pushes to Redis; socket timeout on client.<br>2. Worker receives task, grades, commits outbox `COMPLETED`.<br>3. Disp failure handler runs. | `UPDATE ... SET status='RETRY_PENDING' WHERE id=:id AND status='CLAIMED' AND claim_version=1;`<br>**Affected Rows:** `0`. Disp detects `status=='COMPLETED'`, cancels retry. | `COMPLETED` | Completed grading is never corrupted into `RETRY_PENDING` or `DEAD_LETTER` due to false broker timeouts. |
+| **3** | **Dispatcher A lease expires and Dispatcher B reclaims**<br>1. Disp A stalls during pause.<br>2. Disp B detects expired lease.<br>3. Disp B reclaims, sets `ver=claim_version+1`. | `UPDATE ... SET status='CLAIMED', claim_version=claim_version+1 WHERE id=:id AND status='CLAIMED' AND lease_expires_at<=NOW();`<br>**Affected Rows:** `1` (for Disp B). | `CLAIMED` (by B, `ver=2`) | Stale claim is safely reclaimed with incremented fencing token; Disp A token (1) is invalidated. |
+| **4** | **Dispatcher A receives delayed broker ack after B claims**<br>1. Event reclaimed by Disp B (`ver=2`).<br>2. Stale Disp A wakes up, receives delayed ACK, attempts publication update. | `UPDATE ... SET status='PUBLISHED' WHERE id=:id AND status='CLAIMED' AND claimed_by='disp-A' AND claim_version=1;`<br>**Affected Rows:** `0` (fails on `claim_version`). Disp A yields. | `CLAIMED` (by B, `ver=2`) | Stale dispatcher cannot overwrite claim ownership or reset timestamps of a newer dispatcher. |
+| **5** | **Dispatcher A receives delayed broker error after B claims**<br>1. Event reclaimed by Disp B (`ver=2`).<br>2. Stale Disp A receives broker error, attempts failure handler update. | `UPDATE ... SET status='RETRY_PENDING' WHERE id=:id AND status='CLAIMED' AND claimed_by='disp-A' AND claim_version=1;`<br>**Affected Rows:** `0` (fails on `claim_version`). Disp A yields. | `CLAIMED` (by B, `ver=2`) | Zombie dispatcher's delayed errors cannot abort or trigger retry backoff on an active claim owned by another node. |
+| **6** | **Worker completes while reconciliation examines expired claim**<br>1. Event in `CLAIMED` with expired lease.<br>2. Worker grades and sets outbox `COMPLETED`.<br>3. Supervisor runs lease cleanup. | `UPDATE ... SET status='RETRY_PENDING' WHERE id=:id AND status='CLAIMED' AND lease_expires_at<=NOW();`<br>**Affected Rows:** `0` (status is `COMPLETED`, not `CLAIMED`). | `COMPLETED` | Reconciliation supervisor can never reset a completed event to `RETRY_PENDING`. |
+| **7** | **Duplicate Celery tasks execute concurrently**<br>1. Redis delivers duplicate tasks to Worker 1 and Worker 2.<br>2. W1 acquires attempt row lock; W2 blocks.<br>3. W1 grades, sets `is_mcq_evaluated=TRUE`, commits.<br>4. W2 unblocks, reads `is_mcq_evaluated==TRUE`. | **Worker 1:** Updates attempt + outbox (`affected_rows=1`).<br>**Worker 2:** Detects `is_mcq_evaluated==TRUE`, skips grading (`affected_rows=0`), sends Celery ACK. | `COMPLETED` | Strict idempotency under duplicate delivery; zero duplicate score calculation or mark alteration. |
+| **8** | **Worker completes while retry threshold is reached**<br>1. Event reaches `retry_count=4`.<br>2. Disp crashes; supervisor sets `DEAD_LETTER`.<br>3. Active worker finishes grading and commits outbox. | `UPDATE ... SET status='COMPLETED' WHERE id=:id AND status IN ('PUBLISHED','CLAIMED','PROCESSING','RETRY_PENDING','DEAD_LETTER');`<br>**Affected Rows:** `1`. Worker commits. | `COMPLETED` | Legitimately completed grading rescues outbox from `DEAD_LETTER`, preventing false administrative alarms. |
+| **9** | **Worker completes after event enters DEAD_LETTER**<br>1. Delayed Celery task dequeued after admin dead-lettering.<br>2. Worker checks attempt lock: `is_mcq_evaluated==FALSE`.<br>3. Worker grades and commits `COMPLETED`. | `UPDATE ... SET status='COMPLETED' WHERE id=:id AND status IN ('PUBLISHED','CLAIMED','PROCESSING','RETRY_PENDING','DEAD_LETTER');`<br>**Affected Rows:** `1`. Worker commits. | `COMPLETED` | Successfully calculated grades are preserved and recorded as `COMPLETED` rather than orphaned in dead-letter limbo. |
+| **10** | **Dispatcher crashes after broker publication before recording status**<br>1. Task enqueued in Redis.<br>2. Disp dies before updating status to `PUBLISHED`.<br>3. Worker or supervisor intervenes. | **Case A (Worker executes):** Worker commits `COMPLETED` from `status='CLAIMED'` (`affected_rows=1`).<br>**Case B (Queue delayed):** Supervisor resets expired claim (`affected_rows=1`). | `COMPLETED` | No event is stranded indefinitely in `CLAIMED` status; idempotent worker execution ensures correctness. |
+
+#### 4.3.3 General Outbox Crash & System Recovery Matrix (16 Scenarios)
+
+The system handles all 16 general crash and infrastructure failure scenarios without data loss or inconsistent state:
 
 | # | Failure Scenario | Failure Timing & System State | Recovery Mechanism & Invariant Preserved |
 | :-: | :--- | :--- | :--- |
 | **1** | **Crash before finalization commit** | Web worker or supervisor crashes during manual submission or auto-close transaction before MySQL `COMMIT`. | MySQL detects client disconnect and rolls back attempt status, receipt, and outbox event cleanly. Attempt remains `IN_PROGRESS`. Client retries with identical UUID; zero orphaned state. |
 | **2** | **Crash immediately after finalization commit** | Worker crashes after MySQL transaction commits but before responding to client or notifying dispatcher. | Attempt is durably `SUBMITTED`/`AUTO_CLOSED_DEADLINE`, receipt exists, and outbox event is persisted (`status = 'PENDING'`). Outbox dispatcher discovers event on next poll. Client retry receives cached receipt (HTTP 200). |
 | **3** | **Dispatcher crash before event claim** | Dispatcher crashes while querying pending events. | Zero rows were locked or modified. Outbox event remains `status = 'PENDING'`. Another dispatcher instance or restarted dispatcher claims the event on next polling interval. |
-| **4** | **Dispatcher crash after claim but before publication** | Dispatcher marks event `CLAIMED` (`lease_expires_at = NOW() + 60s`), commits claim, but crashes before sending message to Celery Redis broker. | Reconciliation supervisor queries `evaluations_grading_outbox WHERE status = 'CLAIMED' AND lease_expires_at <= NOW()`. Resets status to `RETRY_PENDING`, increments `retry_count`, and sets `next_retry_at = NOW()`. Event is re-claimed. |
-| **5** | **Broker accepts message but ack is lost** | Dispatcher publishes task to Redis, Redis accepts it, but network drop prevents Redis confirmation reaching dispatcher. | Dispatcher catches timeout, treats as transient failure, increments `retry_count`, and sets status to `RETRY_PENDING`. Dispatcher subsequently re-publishes. Duplicate Celery message is processed idempotently by worker. |
+| **4** | **Dispatcher crash after claim but before publication** | Dispatcher marks event `CLAIMED` (`lease_expires_at = NOW() + 60s`), commits claim, but crashes before sending message to Celery Redis broker. | Reconciliation supervisor queries `evaluations_grading_outbox WHERE status = 'CLAIMED' AND lease_expires_at <= NOW()`. Resets status to `RETRY_PENDING`, increments `retry_count`, and sets `next_retry_at = NOW()`. Event is re-claimed with new `claim_version`. |
+| **5** | **Broker accepts message but ack is lost** | Dispatcher publishes task to Redis, Redis accepts it, but network drop prevents Redis confirmation reaching dispatcher. | Dispatcher catches timeout, treats as transient failure, increments `retry_count`, and sets status to `RETRY_PENDING` via guarded SQL. Dispatcher subsequently re-publishes. Duplicate Celery message is processed idempotently by worker. |
 | **6** | **Dispatcher crash after publication but before status update** | Message successfully enqueued in Redis, but dispatcher crashes before updating outbox status to `PUBLISHED`. | Event remains `CLAIMED` in MySQL. Celery worker dequeues task, locks attempt, executes grading, and updates outbox to `COMPLETED`. When supervisor inspects lease, event is already `COMPLETED` (no action needed). |
 | **7** | **Duplicate publication** | Event is published twice due to network retries or dispatcher lease expiry race. | Both Celery messages contain identical `event_id` and `attempt_id`. First worker grades and sets `is_mcq_evaluated = TRUE`. Second worker acquires attempt lock, detects `is_mcq_evaluated == TRUE`, skips grading, and sends Celery `basic_ack`. Zero score alteration. |
 | **8** | **Worker crash before grading** | Celery worker dequeues task from Redis, but crashes before opening MySQL transaction or acquiring attempt lock. | Celery tasks use `acks_late=True`. Because worker crashed before sending ACK, Redis broker detects lost worker and redelivers message to another active Celery worker. |
@@ -1815,6 +1879,7 @@ erDiagram
         string event_type
         string idempotency_key UK
         string status
+        bigint claim_version
         tinyint retry_count
         datetime next_retry_at
         string claimed_by
