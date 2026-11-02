@@ -1,15 +1,15 @@
 """
-Tests for production security baseline and HTTP security headers.
+Tests for production security baseline, HTTP security headers, and reverse proxy trust boundaries.
 """
 
 import importlib
 import os
 from unittest import mock
-from django.test import SimpleTestCase
+from django.test import RequestFactory, SimpleTestCase, override_settings
 
 
 class ProductionSecurityBaselineTests(SimpleTestCase):
-    """Verifies that production configuration enforces all required security headers and flags."""
+    """Verifies that production configuration enforces all required security headers, proxy trust boundaries, and flags."""
 
     @classmethod
     def setUpClass(cls):
@@ -26,6 +26,7 @@ class ProductionSecurityBaselineTests(SimpleTestCase):
             'CSRF_TRUSTED_ORIGINS': 'https://exam.college.edu',
             'SECURE_SSL_REDIRECT': 'True',
         }
+        cls.rf = RequestFactory()
 
     def test_production_security_flags(self):
         """Verify production security headers, cookie flags, and HSTS settings."""
@@ -64,3 +65,48 @@ class ProductionSecurityBaselineTests(SimpleTestCase):
             importlib.reload(prod)
 
             self.assertFalse(prod.ALLOW_WSGI_TIMESTAMP_FALLBACK)
+
+    def test_proxy_header_trust_disabled_by_default(self):
+        """Verify SECURE_PROXY_SSL_HEADER is None by default in production."""
+        with mock.patch.dict(os.environ, self.valid_prod_env, clear=False):
+            prod = importlib.import_module('config.settings.production')
+            importlib.reload(prod)
+
+            self.assertIsNone(prod.SECURE_PROXY_SSL_HEADER)
+
+    def test_spoofed_proxy_header_rejected_when_trust_disabled(self):
+        """Verify spoofed X-Forwarded-Proto header does not trick Django into treating request as secure when trust is disabled."""
+        with override_settings(SECURE_PROXY_SSL_HEADER=None):
+            # Client connects via plain HTTP and injects a spoofed header
+            request = self.rf.get('/', HTTP_X_FORWARDED_PROTO='https')
+            self.assertFalse(request.is_secure())
+
+    def test_proxy_header_trust_enabled_when_explicitly_configured(self):
+        """Verify SECURE_PROXY_SSL_HEADER is enabled when TRUST_PROXY_SSL_HEADER=True and handles verified proxy requests."""
+        env_with_proxy = dict(self.valid_prod_env)
+        env_with_proxy['TRUST_PROXY_SSL_HEADER'] = 'True'
+        with mock.patch.dict(os.environ, env_with_proxy, clear=False):
+            prod = importlib.import_module('config.settings.production')
+            importlib.reload(prod)
+
+            self.assertEqual(prod.SECURE_PROXY_SSL_HEADER, ('HTTP_X_FORWARDED_PROTO', 'https'))
+
+            with override_settings(SECURE_PROXY_SSL_HEADER=prod.SECURE_PROXY_SSL_HEADER):
+                # When trusted, verified HTTPS request from Nginx is recognized as secure
+                secure_request = self.rf.get('/', HTTP_X_FORWARDED_PROTO='https')
+                self.assertTrue(secure_request.is_secure())
+
+                # When Nginx indicates plain HTTP, request is not secure
+                insecure_request = self.rf.get('/', HTTP_X_FORWARDED_PROTO='http')
+                self.assertFalse(insecure_request.is_secure())
+
+    def test_production_proxy_documentation_presence(self):
+        """Verify production settings docstring documents reverse proxy trust invariants and isolation."""
+        prod = importlib.import_module('config.settings.production')
+        with open(prod.__file__, 'r') as f:
+            content = f.read()
+
+        self.assertIn('Nginx', content)
+        self.assertIn('X-Forwarded-Proto', content)
+        self.assertIn('Unix domain socket', content)
+        self.assertIn('FAIL-CLOSED DEFAULT', content)

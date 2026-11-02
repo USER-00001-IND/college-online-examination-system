@@ -82,6 +82,10 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
+# Reverse Proxy SSL Header Trust Boundary (Disabled by default across all environments)
+# Enabled only in production when TRUST_PROXY_SSL_HEADER=True and Nginx isolation is verified
+SECURE_PROXY_SSL_HEADER = None
+
 # Signed 64-bit integer primary keys (consistent with MySQL 8.x schema design)
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

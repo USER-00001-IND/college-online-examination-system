@@ -39,7 +39,7 @@ class SettingsLoadingTests(TestCase):
         """Verify institutional policy variables are strictly unconfigured initially."""
         self.assertIsNone(settings.EXAM_PIN_DELIVERY_METHOD)
         self.assertIsNone(settings.EXAM_EVIDENCE_KEY_RETENTION_PERIOD)
-        self.assertFalse(settings.INSTULTIONAL_CONFIG_APPROVED if hasattr(settings, 'INSTULTIONAL_CONFIG_APPROVED') else settings.INSTITUTIONAL_CONFIG_APPROVED)
+        self.assertFalse(settings.INSTITUTIONAL_CONFIG_APPROVED)
 
     def test_development_settings_loading(self):
         """Verify development settings load with appropriate development defaults."""
@@ -48,6 +48,7 @@ class SettingsLoadingTests(TestCase):
         self.assertEqual(dev_settings.ENVIRONMENT_NAME, 'development')
         self.assertTrue(dev_settings.ALLOW_WSGI_TIMESTAMP_FALLBACK)
         self.assertIn('localhost', dev_settings.ALLOWED_HOSTS)
+        self.assertIsNone(dev_settings.SECURE_PROXY_SSL_HEADER)
 
     def test_production_settings_loading_with_valid_env(self):
         """Verify production settings load cleanly when valid environment variables are present."""
@@ -72,3 +73,22 @@ class SettingsLoadingTests(TestCase):
             self.assertEqual(prod_settings.DATABASES['default']['ENGINE'], 'django.db.backends.mysql')
             self.assertEqual(prod_settings.DATABASES['default']['NAME'], 'prod_exam_db')
             self.assertIn('exam.college.edu', prod_settings.ALLOWED_HOSTS)
+            # Verify proxy SSL header trust is disabled by default
+            self.assertIsNone(prod_settings.SECURE_PROXY_SSL_HEADER)
+
+    def test_production_settings_enables_proxy_ssl_header_when_configured(self):
+        """Verify production enables SECURE_PROXY_SSL_HEADER when operator explicitly sets TRUST_PROXY_SSL_HEADER."""
+        env_vars = {
+            'SECRET_KEY': 'a-valid-production-secret-key-with-sufficient-entropy-12345',
+            'ALLOWED_HOSTS': 'exam.college.edu',
+            'DB_NAME': 'prod_exam_db',
+            'DB_USER': 'prod_exam_user',
+            'DB_PASSWORD': 'strong_production_password_value',
+            'DB_HOST': 'db-cluster.internal',
+            'DB_PORT': '3306',
+            'TRUST_PROXY_SSL_HEADER': 'True',
+        }
+        with mock.patch.dict(os.environ, env_vars, clear=False):
+            prod_settings = importlib.import_module('config.settings.production')
+            importlib.reload(prod_settings)
+            self.assertEqual(prod_settings.SECURE_PROXY_SSL_HEADER, ('HTTP_X_FORWARDED_PROTO', 'https'))

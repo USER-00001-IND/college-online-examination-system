@@ -1,9 +1,10 @@
-# Chunk 03: Backend Foundation Audit Report
+# Chunk 03: Backend Foundation Audit Report (Round 2 Security Corrections)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03  
+**Date:** 2026-11-03 (Round 2 Revision)  
 **Assigned Scope:** Chunk 03 — Backend Foundation  
+**Audited Commit:** `0460fbcdef5194ce19ea3085468701c0c2366b7a`  
 **Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Backend scaffolding, modular application packages, environment settings hierarchy, health check endpoint, security baselines, structured error handling, JSON/structured logging, and smoke test suite are complete and verified; models, domain migrations, examination logic, and background workers remain gated).
 
 ---
@@ -17,70 +18,97 @@ In accordance with Chunk 03 instructions and the stage transition authorization 
 3. **Modular Domain App Scaffolds:** Created 10 application package skeletons matching the Chunk 02 domain design (`apps.core`, `apps.accounts`, `apps.academics`, `apps.examinations`, `apps.questions`, `apps.attempts`, `apps.evidence`, `apps.uploads`, `apps.evaluations`, `apps.operations`). All domain models and migrations are strictly deferred.
 4. **Health Check Endpoint:** Implemented public, credential-safe health endpoint at `/api/v1/health/` returning service liveness, environment, version, and timestamp.
 5. **Centralized Error Handling:** Implemented `apps.core.exceptions.custom_exception_handler` enforcing a standardized JSON error envelope (`{"error": {"code": "...", "message": "...", "details": {...}, "timestamp": "..."}}`) and suppressing stack traces in production.
-6. **Structured Logging & Redaction:** Implemented `apps.core.logging.SensitiveDataFilter` and `JSONLogFormatter` redacting passwords, PINs, tokens, and authorization headers from console and JSON log records.
+6. **Structured Logging & Redaction:** Implemented `apps.core.logging.SensitiveDataFilter` and `JSONLogFormatter` redacting passwords, PINs, tokens, and authorization headers from console and JSON log records, with complete traceback suppression in production.
 7. **Security Baseline & Deployment Check:** Configured strict HTTPS security headers, secure cookie flags, and fail-closed environment validation for production. Django's `check --deploy` passes with 0 issues.
 8. **Dependency Manifest & Secrets Template:** Created pinned `backend/requirements.txt` and fully documented `backend/.env.example` containing zero secrets.
-9. **Automated Smoke Test Suite:** Created 29 automated unit and integration tests across 7 test modules, achieving 100% pass rate under both Django's test runner and Pytest.
+9. **Automated Smoke Test Suite:** Created 43 automated unit and integration tests across 7 test modules, achieving 100% pass rate under both Django's test runner and Pytest.
+
+---
+
+### 1.2 Round 2 Audit Findings Resolution
+
+#### Finding A (HIGH — BLOCKING): Sensitive Information Leakage in Production Logs (Exception Messages & Tracebacks)
+- **Defect & Root Cause:** `backend/apps/core/exceptions.py` previously logged unhandled 500 exceptions using `logger.error("Unhandled exception in view %s: %s", view_name, str(exc), exc_info=True)`. Arbitrary database, connection, or authentication exception strings (`str(exc)`) and Python tracebacks (`exc_info=True`) could leak raw passwords, database connection URLs, examination PINs, tokens, or file paths into server logs. The logging filter did not comprehensively sanitize arbitrary traceback frames or exception string arguments.
+- **Resolution Implemented:**
+  1. *Production Log Sanitization in Exception Handler (`backend/apps/core/exceptions.py:108-142`):* When `settings.DEBUG` is `False`, `custom_exception_handler` **never** passes `str(exc)`, raw exception arguments, or `exc_info=True` to the logger. Instead, it logs a clean structured diagnostic event containing only safe, non-sensitive identifiers:
+     - `error_category`: `'UnhandledServerException'`
+     - `exception_type`: `exc.__class__.__name__` (safe standard class name)
+     - `sanitized_view`: view class name extracted safely (e.g. `view.__class__.__name__`), never request objects or user input
+     - `request_id`: extracted safely from `request.META['HTTP_X_REQUEST_ID']` (or `'N/A'`)
+  2. *Client Response Protection (`backend/apps/core/exceptions.py:133-140`):* Clients strictly receive a standardized generic 500 error envelope (`{"error": {"code": "INTERNAL_SERVER_ERROR", "message": "An unexpected server error occurred.", "details": {}, "timestamp": "..."}}`), completely hiding stack traces, file paths, and database details.
+  3. *Traceback Suppression in Logging Filter (`backend/apps/core/logging.py:132-145`):* `SensitiveDataFilter` explicitly zeroes out `record.exc_info = None`, `record.exc_text = None`, and `record.stack_info = None` when `settings.DEBUG` is `False`, ensuring that no third-party logger or unhandled exception handler can emit unsanitized tracebacks into production logs.
+  4. *Exception Object Sanitization (`backend/apps/core/logging.py:75-81`):* If an `Exception` instance is passed in `record.args` or custom attributes, `redact_data` replaces it with `f"[{data.__class__.__name__}]"` in production, preventing raw exception string leaks.
+  5. *JSON Formatter Exclusion (`backend/apps/core/logging.py:176-189`):* `JSONLogFormatter` suppresses the `exception` traceback field in production (`DEBUG=False`), outputting only safe structured fields (`error_category`, `exception_type`, `request_id`, `view`).
+  6. *Development Usability Preserved (`backend/apps/core/exceptions.py:143-167`):* When `settings.DEBUG` is `True`, detailed exception messages and sanitized tracebacks remain accessible to developers for local debugging.
+
+#### Finding B (MEDIUM): Trusted Reverse Proxy Boundary (`SECURE_PROXY_SSL_HEADER`)
+- **Defect & Root Cause:** `backend/config/settings/production.py` previously unconditionally configured `SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')`. If Django/Gunicorn were reachable directly over the network or if the reverse proxy forwarded client headers without overwriting them, an attacker could spoof `X-Forwarded-Proto: https` over plain HTTP, bypassing HTTPS redirection (`SECURE_SSL_REDIRECT`) and compromising CSRF and secure cookie protections.
+- **Resolution Implemented:**
+  1. *Fail-Closed Default (`backend/config/settings/production.py:77-113` & `backend/config/settings/base.py:86-88`):* Forwarded-header trust is **disabled by default** (`SECURE_PROXY_SSL_HEADER = None`).
+  2. *Explicit Configuration Gate (`TRUST_PROXY_SSL_HEADER`):* Proxy SSL header trust is enabled **only** when an operator explicitly sets `TRUST_PROXY_SSL_HEADER=True` in production environment variables.
+  3. *Input Validation (`backend/config/settings/production.py:100-107`):* If `TRUST_PROXY_SSL_HEADER` contains an invalid non-boolean value, production settings raise `ImproperlyConfigured` immediately.
+  4. *Interaction Documentation (`backend/config/settings/production.py:81-99`, `backend/README.md:52-73`, `.env.example:39-47`):* Extensively documented how reverse-proxy TLS termination, HTTPS redirects, secure cookies (`SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`), and CSRF tokens interact:
+     - Nginx must terminate TLS and unconditionally overwrite `proxy_set_header X-Forwarded-Proto $scheme;` (never forward client-supplied input).
+     - Direct client access to Django/Gunicorn must be mechanically eliminated via Unix domain socket (`/run/gunicorn.sock` mode `0660`) or strict loopback firewall rules.
+  5. *Request-Level Verification:* Added automated tests verifying that a spoofed `X-Forwarded-Proto: https` header on plain HTTP does **not** fool Django when proxy trust is disabled, and that `request.is_secure()` returns `True` only when explicitly trusted.
+
+#### Finding C (LOW): Institutional Policy Test Typo
+- **Defect & Root Cause:** In `backend/tests/test_settings.py:42`, the assertion contained a fallback concealing a misspelled setting:
+  `self.assertFalse(settings.INSTULTIONAL_CONFIG_APPROVED if hasattr(settings, 'INSTULTIONAL_CONFIG_APPROVED') else settings.INSTITUTIONAL_CONFIG_APPROVED)`
+- **Resolution Implemented:**
+  1. Replaced line 42 with a direct, unambiguous assertion:
+     ```python
+     self.assertFalse(settings.INSTITUTIONAL_CONFIG_APPROVED)
+     self.assertIsNone(settings.EXAM_PIN_DELIVERY_METHOD)
+     self.assertIsNone(settings.EXAM_EVIDENCE_KEY_RETENTION_PERIOD)
+     ```
+  2. Verified across the entire repository that no other occurrences of `INSTULTIONAL` exist.
 
 ---
 
 ## 2. Inventory of Files Created & Modified
 
-### 2.1 Project Infrastructure & Dependencies
+### 2.1 Project Infrastructure & Documentation
 | File Path | Description / Role |
 | :--- | :--- |
 | [`.gitignore`](file:///home/zero/Documents/college/.gitignore) | Project-wide Git ignore rules covering Python bytecode, virtual environments (`.venv`), `.env` secrets, SQLite artifacts, uploads, and node caches. |
 | [`requirements.txt`](file:///home/zero/Documents/college/requirements.txt) | Root pointer referencing `backend/requirements.txt`. |
 | [`backend/requirements.txt`](file:///home/zero/Documents/college/backend/requirements.txt) | Pinned dependency manifest for Django 5.0, DRF 3.15, PyMySQL, django-environ, django-cors-headers, cryptography, and pytest. |
-| [`.env.example`](file:///home/zero/Documents/college/.env.example) | Root environment variable template containing documented dummy settings and zero secrets. |
-| [`backend/.env.example`](file:///home/zero/Documents/college/backend/.env.example) | Backend environment variable template documenting database, host, security, and institutional policy gates. |
-| [`backend/README.md`](file:///home/zero/Documents/college/backend/README.md) | Local developer setup guide, environment documentation, server execution instructions, and test commands. |
+| [`.env.example`](file:///home/zero/Documents/college/.env.example) | Root environment variable template documenting `TRUST_PROXY_SSL_HEADER=False` with zero secrets. |
+| [`backend/.env.example`](file:///home/zero/Documents/college/backend/.env.example) | Backend environment variable template documenting database, host, security, and reverse proxy trust boundaries. |
+| [`backend/README.md`](file:///home/zero/Documents/college/backend/README.md) | Setup guide, reverse proxy security invariants, Nginx overwrite rules, Unix socket isolation, and test instructions. |
+| [`docs/development-progress.md`](file:///home/zero/Documents/college/docs/development-progress.md) | Progress tracker updated with Decision 20 documenting Round 2 security corrections. |
 
 ### 2.2 Django Core & Configuration
-| File Path | Description / Role |
-| :--- | :--- |
-| [`backend/manage.py`](file:///home/zero/Documents/college/backend/manage.py) | Django command-line runner ensuring `backend` is on `sys.path` and defaulting to `config.settings.development`. |
-| [`backend/config/__init__.py`](file:///home/zero/Documents/college/backend/config/__init__.py) | Package initialization registering `pymysql.install_as_MySQLdb()` for pure-Python MySQL 8.x database compatibility. |
-| [`backend/config/urls.py`](file:///home/zero/Documents/college/backend/config/urls.py) | Root URL routing containing `/api/v1/health/`. |
-| [`backend/config/wsgi.py`](file:///home/zero/Documents/college/backend/config/wsgi.py) | WSGI server entry point for synchronous web server deployments. |
-| [`backend/config/asgi.py`](file:///home/zero/Documents/college/backend/config/asgi.py) | ASGI server entry point for asynchronous deployments. |
-| [`backend/config/settings/__init__.py`](file:///home/zero/Documents/college/backend/config/settings/__init__.py) | Settings package marker. |
-| [`backend/config/settings/base.py`](file:///home/zero/Documents/college/backend/config/settings/base.py) | Universal base settings: `INSTALLED_APPS` (10 local domain apps), middleware, REST framework defaults, `DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'`, unconfigured institutional policy gates, and logging configuration. |
-| [`backend/config/settings/development.py`](file:///home/zero/Documents/college/backend/config/settings/development.py) | Local development settings: `DEBUG = True`, relaxed CORS/CSRF for Vite (@5173), SQLite fallback when MySQL variables are omitted, and browsable API renderer. |
-| [`backend/config/settings/production.py`](file:///home/zero/Documents/college/backend/config/settings/production.py) | Production settings: `DEBUG = False` (enforced), fail-closed validation for `SECRET_KEY`, `ALLOWED_HOSTS`, and MySQL credentials; HSTS (31,536,000s), Secure cookies, JSON logging, and disabled timestamp fallback. |
-| [`backend/config/settings/test.py`](file:///home/zero/Documents/college/backend/config/settings/test.py) | Isolated unit test settings: in-memory SQLite (`:memory:`), MD5 accelerated password hashing, quiet CRITICAL logging, and deterministic secrets. |
-
-### 2.3 Modular Application Packages (`backend/apps/`)
-| App Package | AppConfig Class | Scope / Responsibility |
+| File Path | Lines Changed | Description / Role |
 | :--- | :--- | :--- |
-| `apps.core` | `CoreConfig` | Core utilities: health check view, standardized DRF exception handler, and sensitive data logging filter. |
-| `apps.accounts` | `AccountsConfig` | Identity, authentication, user profiles, and roles (Chunk 04). Domain models deferred. |
-| `apps.academics` | `AcademicsConfig` | Gauhati University FYUGP 4-year curriculum, departments, programs, and courses (Chunk 05). Domain models deferred. |
-| `apps.examinations` | `ExaminationsConfig` | General examination setup, papers, and scheduling (Chunk 08). Domain models deferred. |
-| `apps.questions` | `QuestionsConfig` | Question bank, MCQ options, and paper question mappings (Chunk 08). Domain models deferred. |
-| `apps.attempts` | `AttemptsConfig` | Student exam attempts, monotonic answer saving, and row locking (Chunk 11). Domain models deferred. |
-| `apps.evidence` | `EvidenceConfig` | Encrypted IndexedDB offline cache DEKs and diagnostic recovery bundles (Chunk 11). Domain models deferred. |
-| `apps.uploads` | `UploadsConfig` | Private disk storage and malware scanning for descriptive handwritten answer sheets (Chunk 11). Domain models deferred. |
-| `apps.evaluations` | `EvaluationsConfig` | Transactional grading outbox, evaluations, and grading workers (Chunk 12). Domain models deferred. |
-| `apps.operations` | `OperationsConfig` | System audit logging and institutional configuration gates (Chunk 13). Domain models deferred. |
+| [`backend/manage.py`](file:///home/zero/Documents/college/backend/manage.py) | Unchanged | Django command-line runner ensuring `backend` is on `sys.path`. |
+| [`backend/config/__init__.py`](file:///home/zero/Documents/college/backend/config/__init__.py) | Unchanged | Package initialization registering `pymysql.install_as_MySQLdb()`. |
+| [`backend/config/urls.py`](file:///home/zero/Documents/college/backend/config/urls.py) | Unchanged | Root URL routing containing `/api/v1/health/`. |
+| [`backend/config/wsgi.py`](file:///home/zero/Documents/college/backend/config/wsgi.py) | Unchanged | WSGI server entry point for synchronous web deployments. |
+| [`backend/config/asgi.py`](file:///home/zero/Documents/college/backend/config/asgi.py) | Unchanged | ASGI server entry point for asynchronous deployments. |
+| [`backend/config/settings/base.py`](file:///home/zero/Documents/college/backend/config/settings/base.py) | Lines 86–88 | Added `SECURE_PROXY_SSL_HEADER = None` baseline default. |
+| [`backend/config/settings/development.py`](file:///home/zero/Documents/college/backend/config/settings/development.py) | Unchanged | Development settings (`DEBUG = True`, SQLite fallback, browsable API). |
+| [`backend/config/settings/production.py`](file:///home/zero/Documents/college/backend/config/settings/production.py) | Lines 19–23, 77–113 | Enforced `len(SECRET_KEY) >= 50`; implemented fail-closed `TRUST_PROXY_SSL_HEADER` with validation; documented Nginx TLS termination and socket isolation invariants. |
+| [`backend/config/settings/test.py`](file:///home/zero/Documents/college/backend/config/settings/test.py) | Unchanged | Isolated unit test settings (in-memory SQLite, MD5 hashers, quiet logging). |
 
-### 2.4 Core Services Implementation
-| File Path | Description / Role |
-| :--- | :--- |
-| [`backend/apps/core/views.py`](file:///home/zero/Documents/college/backend/apps/core/views.py) | Implements `HealthCheckView` (`GET /api/v1/health/`), returning JSON status, version, environment, and ISO 8601 timestamp without credential exposure. |
-| [`backend/apps/core/exceptions.py`](file:///home/zero/Documents/college/backend/apps/core/exceptions.py) | Implements `custom_exception_handler`, normalizing DRF exceptions (400, 401, 403, 404, 405, 408, 409, 410, 429) and unhandled 500 exceptions into a uniform envelope while suppressing tracebacks in production. |
-| [`backend/apps/core/logging.py`](file:///home/zero/Documents/college/backend/apps/core/logging.py) | Implements `SensitiveDataFilter` (regex and dictionary key redaction for passwords, PINs, tokens, authorization headers) and `JSONLogFormatter` for structured output. |
+### 2.3 Modular Application Packages & Core Services
+| File Path | Lines Changed | Description / Role |
+| :--- | :--- | :--- |
+| [`backend/apps/core/exceptions.py`](file:///home/zero/Documents/college/backend/apps/core/exceptions.py) | Lines 95–167 | Implemented production exception log sanitization: raw `str(exc)` and `exc_info=True` completely eliminated in production; emitted safe structured metadata (`error_category`, `exception_type`, `sanitized_view`, `request_id`); returned generic 500 envelope. |
+| [`backend/apps/core/logging.py`](file:///home/zero/Documents/college/backend/apps/core/logging.py) | Lines 75–81, 107–145, 176–189 | Suppressed `exc_info` and `exc_text` in production; sanitized `Exception` instances in `record.args`; sanitized custom attributes; excluded traceback serialization from `JSONLogFormatter` in production. |
+| 9 Domain App Skeletons | Unchanged | Scaffolds for `accounts`, `academics`, `examinations`, `questions`, `attempts`, `evidence`, `uploads`, `evaluations`, `operations` with domain models deferred. |
 
-### 2.5 Automated Smoke Tests (`backend/tests/`)
+### 2.4 Automated Smoke Tests (`backend/tests/`)
 | Test File | Tests Implemented |
 | :--- | :--- |
-| [`backend/tests/test_settings.py`](file:///home/zero/Documents/college/backend/tests/test_settings.py) | Verifies test settings, installed domain apps (10 apps), unconfigured policy gates, development settings loading, and production settings loading under mock environment. (5 tests) |
+| [`backend/tests/test_settings.py`](file:///home/zero/Documents/college/backend/tests/test_settings.py) | Corrected typo (`INSTITUTIONAL_CONFIG_APPROVED`); added tests for `SECURE_PROXY_SSL_HEADER` defaults and explicit enablement. (6 tests) |
 | [`backend/tests/test_health.py`](file:///home/zero/Documents/college/backend/tests/test_health.py) | Verifies GET 200 OK, JSON content type, payload structure, credential leak prevention, unauthenticated access, and disallowed HTTP methods. (4 tests) |
-| [`backend/tests/test_security.py`](file:///home/zero/Documents/college/backend/tests/test_security.py) | Verifies production `DEBUG=False`, security headers (XSS, nosniff, frame options, HSTS), secure cookies, exclusion of `BrowsableAPIRenderer`, and disallowance of WSGI timestamp fallback. (3 tests) |
+| [`backend/tests/test_security.py`](file:///home/zero/Documents/college/backend/tests/test_security.py) | Verifies production `DEBUG=False`, security headers, secure cookies, proxy trust disabled by default, spoofed `X-Forwarded-Proto` rejection, explicit proxy trust enablement, and reverse-proxy documentation. (7 tests) |
 | [`backend/tests/test_database_config.py`](file:///home/zero/Documents/college/backend/tests/test_database_config.py) | Verifies signed `BigAutoField` default auto field, MySQL 8.x InnoDB connection dictionary generation with strict SQL mode and utf8mb4 charset, and production MySQL engine enforcement. (3 tests) |
-| [`backend/tests/test_missing_env.py`](file:///home/zero/Documents/college/backend/tests/test_missing_env.py) | Verifies fail-closed `ImproperlyConfigured` exceptions when `SECRET_KEY`, `ALLOWED_HOSTS`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, or wildcard CORS are misconfigured in production. (6 tests) |
-| [`backend/tests/test_exceptions.py`](file:///home/zero/Documents/college/backend/tests/test_exceptions.py) | Verifies custom exception handler formatting for `ValidationError` (400), `PermissionDenied` (403), `NotFound` (404), and unhandled 500 exception stack trace suppression when `DEBUG=False`. (4 tests) |
-| [`backend/tests/test_logging.py`](file:///home/zero/Documents/college/backend/tests/test_logging.py) | Verifies `SensitiveDataFilter` string pattern redaction (Bearer, password, pin), dictionary key redaction, sequence argument redaction, and `JSONLogFormatter` valid JSON emission. (4 tests) |
+| [`backend/tests/test_missing_env.py`](file:///home/zero/Documents/college/backend/tests/test_missing_env.py) | Verifies fail-closed `ImproperlyConfigured` exceptions for missing/insecure `SECRET_KEY`, missing/wildcard `ALLOWED_HOSTS`, missing DB credentials, wildcard CORS, and invalid `TRUST_PROXY_SSL_HEADER`. (7 tests) |
+| [`backend/tests/test_exceptions.py`](file:///home/zero/Documents/college/backend/tests/test_exceptions.py) | Verifies 400, 403, 404 error envelopes; captures actual logging output to verify that passwords, exam PINs, and bearer tokens do NOT leak into production logs or HTTP responses; verifies traceback suppression in production. (7 tests) |
+| [`backend/tests/test_logging.py`](file:///home/zero/Documents/college/backend/tests/test_logging.py) | Verifies `SensitiveDataFilter` string pattern redaction, dictionary key redaction, sequence argument redaction, custom record attribute sanitization, `Exception` arg sanitization, `exc_info` suppression, and `JSONLogFormatter` output. (9 tests) |
 
 ---
 
@@ -101,63 +129,27 @@ All dependencies are installed in `.venv` and verified under Python 3.12.3:
 
 ---
 
-## 4. Key Configuration & Architecture Decisions
+## 4. Verification & Test Execution Results
 
-1. **Four-Tier Settings Isolation:**
-   - Universal defaults reside in `base.py`.
-   - `development.py` enables fast developer iteration (`DEBUG=True`, CORS for local frontend, and SQLite fallback if MySQL is unconfigured).
-   - `production.py` is strictly fail-closed (`DEBUG=False` mandatory, missing secret or host variables raise `ImproperlyConfigured`, HTTPS enforced, and MySQL required).
-   - `test.py` isolates unit testing using in-memory SQLite and accelerated password hashing.
-2. **Database Engine & Primary Key Standardization:**
-   - Target database: MySQL 8.x with InnoDB and `utf8mb4_0900_ai_ci`.
-   - `DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'` sets signed 64-bit integer auto-incrementing primary keys across all modular apps, maintaining 100% compatibility with the Chunk 02 relational schema design.
-   - Initial connection commands enforce strict SQL mode (`STRICT_TRANS_TABLES, NO_ENGINE_SUBSTITUTION, ONLY_FULL_GROUP_BY`).
-3. **Option B Bounded-Processing Consistency Alignment:**
-   - Reverse proxy ingress timestamping (`X-Request-Arrival-Time`) is mandatory in production.
-   - `ALLOW_WSGI_TIMESTAMP_FALLBACK = False` in `production.py` strictly prevents backend fallback timestamps from masking reverse proxy ingress delays.
-   - WSGI fallback is permitted exclusively in `development.py` and `test.py` (`ALLOW_WSGI_TIMESTAMP_FALLBACK = True`) for developer convenience without an Nginx proxy.
-4. **Standardized API Error Envelope:**
-   - All REST API errors conform to:
-     ```json
-     {
-       "error": {
-         "code": "VALIDATION_ERROR",
-         "message": "Validation failed.",
-         "details": { ... },
-         "timestamp": "2026-11-03T03:30:00Z"
-       }
-     }
-     ```
-   - Unhandled exceptions in production return generic `INTERNAL_SERVER_ERROR` with empty details, preventing database schema, table names, or file paths from leaking to client responses.
-5. **Sensitive Data Redaction in Logging:**
-   - `SensitiveDataFilter` runs on all log records, matching sensitive patterns (`Bearer ...`, `Basic ...`, `password=...`, `pin=...`) and recursively masking dictionary keys (`password`, `pin`, `exam_pin`, `token`, `secret`, `authorization`, `dek`, `kek`).
-   - Production logging formats single-line JSON records via `JSONLogFormatter` for log aggregators.
-6. **Unconfigured Institutional Policy Baseline:**
-   - Institutional policy gates remain unconfigured (`EXAM_PIN_DELIVERY_METHOD = None`, `EXAM_EVIDENCE_KEY_RETENTION_PERIOD = None`, `INSTITUTIONAL_CONFIG_APPROVED = False`) to prevent premature policy lock-in prior to Chunk 05 / Chunk 08 administrative confirmation.
-
----
-
-## 5. Verification & Test Execution Results
-
-### 5.1 Django Test Runner
+### 4.1 Django Test Runner
 Command executed:
 ```bash
 python backend/manage.py test tests --settings=config.settings.test
 ```
 Output:
 ```
-Found 29 test(s).
+Found 43 test(s).
 Creating test database for alias 'default'...
 System check identified no issues (0 silenced).
-.............................
+...........................................
 ----------------------------------------------------------------------
-Ran 29 tests in 0.025s
+Ran 43 tests in 0.036s
 
 OK
 Destroying test database for alias 'default'...
 ```
 
-### 5.2 Pytest Execution
+### 4.2 Pytest Execution
 Command executed:
 ```bash
 pytest backend/tests --ds=config.settings.test
@@ -169,20 +161,20 @@ platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.7.0
 django: version: 5.0.14, settings: config.settings.test (from option)
 rootdir: /home/zero/Documents/college
 plugins: django-4.14.0
-collected 29 items
+collected 43 items
 
-backend/tests/test_exceptions.py ....                                    [ 13%]
-backend/tests/test_health.py ....                                        [ 27%]
-backend/tests/test_settings.py .....                                     [ 44%]
-backend/tests/test_database_config.py ...                                [ 55%]
-backend/tests/test_logging.py ....                                       [ 68%]
-backend/tests/test_missing_env.py ......                                 [ 89%]
-backend/tests/test_security.py ...                                       [100%]
+backend/tests/test_exceptions.py .......                                 [ 16%]
+backend/tests/test_health.py ....                                        [ 25%]
+backend/tests/test_settings.py ......                                    [ 39%]
+backend/tests/test_database_config.py ...                                [ 46%]
+backend/tests/test_logging.py .........                                  [ 67%]
+backend/tests/test_missing_env.py .......                                [ 83%]
+backend/tests/test_security.py .......                                   [100%]
 
-============================== 29 passed in 0.37s ==============================
+============================== 43 passed in 0.39s ==============================
 ```
 
-### 5.3 Django Development System Check
+### 4.3 Django Development System Check
 Command executed:
 ```bash
 python backend/manage.py check --settings=config.settings.development
@@ -192,14 +184,14 @@ Output:
 System check identified no issues (0 silenced).
 ```
 
-### 5.4 Django Production Deployment Check (`check --deploy`)
+### 4.4 Django Production Deployment Check (`check --deploy`)
 Command executed:
 ```bash
-SECRET_KEY="test-production-secret-key-entropy-12345" \
+SECRET_KEY="test-production-secret-key-with-sufficient-entropy-over-50-characters-long-12345" \
 ALLOWED_HOSTS="exam.college.edu" \
 DB_NAME="prod_exam_db" \
 DB_USER="prod_user" \
-DB_PASSWORD="secret_password" \
+DB_PASSWORD="password" \
 DB_HOST="127.0.0.1" \
 DB_PORT="3306" \
 CORS_ALLOWED_ORIGINS="https://exam.college.edu" \
@@ -210,6 +202,20 @@ Output:
 ```
 System check identified no issues (0 silenced).
 ```
+
+---
+
+## 5. Distinction Between Unit-Tested Configuration & Unverified Deployment Infrastructure
+
+> [!IMPORTANT]
+> The automated test suite rigorously tests **Django application configuration settings**, header evaluation logic, exception handling, log redaction, and error responses within the Python test harness.
+> 
+> However, unit tests **cannot** physically verify external deployment infrastructure that has not yet been instantiated:
+> 1. **Nginx Reverse Proxy Process:** Whether Nginx is running, configured with `proxy_set_header X-Forwarded-Proto $scheme;`, or terminating TLS is an operational deployment concern to be verified during Chunk 16 (Deployment).
+> 2. **Network & Socket Isolation:** Whether Gunicorn binds exclusively to a Unix domain socket (`/run/gunicorn.sock` mode `0660`) or whether external firewall rules block direct access to port 8000 must be verified on the target host environment.
+> 3. **Live MySQL Daemon:** Database settings are verified against Django's MySQL dictionary schema, but no live MySQL connection or table generation has been performed in Chunk 03.
+> 
+> By enforcing `TRUST_PROXY_SSL_HEADER=False` by default, the application **fails closed** against spoofed forwarded headers even if deployed inadvertently without reverse proxy isolation.
 
 ---
 
@@ -250,5 +256,5 @@ The following criteria carried over from previous audits remain binding requirem
 ## 8. Final Audit Status & Declaration
 
 * **Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT**
-* **Declaration:** Chunk 03 — Backend Foundation has implemented the minimal backend infrastructure, configuration hierarchy, security baselines, health endpoint, structured error handling, logging redaction, and automated smoke test suite. All domain models, migrations, examination business logic, grading workers, and frontend implementations remain gated.
+* **Declaration:** Chunk 03 Round 2 security corrections have successfully resolved Findings A, B, and C. The backend foundation enforces secure production exception log sanitization, fail-closed reverse proxy trust boundaries, and verified institutional policy defaults. All 43 automated smoke tests pass.
 * **Next Permitted Chunk:** **CHUNK 04 — AUTHENTICATION AND ROLES** (gated; strictly awaiting independent audit review and explicit user approval).

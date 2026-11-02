@@ -83,3 +83,13 @@ class MissingEnvironmentVariablesTests(SimpleTestCase):
                 prod = importlib.import_module('config.settings.production')
                 importlib.reload(prod)
             self.assertIn("Wildcard '*' is forbidden in production CORS", str(ctx.exception))
+
+    def test_invalid_proxy_trust_raises_error(self):
+        """Verify production fails if TRUST_PROXY_SSL_HEADER has invalid non-boolean value."""
+        env_vars = self._get_base_valid_env()
+        env_vars['TRUST_PROXY_SSL_HEADER'] = 'invalid_non_bool_value'
+        with mock.patch.dict(os.environ, env_vars, clear=False):
+            with self.assertRaises(ImproperlyConfigured) as ctx:
+                prod = importlib.import_module('config.settings.production')
+                importlib.reload(prod)
+            self.assertIn("Invalid TRUST_PROXY_SSL_HEADER", str(ctx.exception))

@@ -1,7 +1,7 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-03 (Chunk 03 Backend Foundation Initialization)  
+**Last Updated:** 2026-11-03 (Chunk 03 Round 2 Security Corrections)  
 
 ---
 
@@ -59,6 +59,7 @@
 17. **Submission Receipt Timestamp Integrity:** Explicit timestamp semantics on `attempts_submission_receipt` separating manual submission ($T_{\text{ingress}}$ in `submitted_at`) from deadline auto-closure (`official_end_time` in `closed_at`); enforced via MySQL CHECK constraint `chk_receipt_status_timestamps`; zero fabrication of manual submission timestamps or client UUIDs for auto-closed attempts.
 18. **Private Descriptive Upload Storage Architecture:** Physical handwritten answer sheet photos and PDFs stored outside HTTP webroot in private disk storage; files renamed to random UUID4 identifiers (`uploads_descriptive_upload.file_uuid`) to eliminate path traversal and direct enumeration; ClamAV malware scanning status tracking; streaming access restricted strictly to authenticated Django controller views with role checks.
 19. **Two-Tier Answer Payload Validation Architecture:** Tier 1 storage engine enforcement via MySQL CHECK constraint `chk_answer_payload_exclusivity CHECK (selected_option_id IS NULL OR answer_text IS NULL)` mechanically forbidding corrupted hybrid payloads containing both an MCQ option and descriptive text simultaneously, while safely permitting unanswered drafts (`NULL, NULL`), MCQ selections (`opt, NULL`), and descriptive drafts (`NULL, text`); Tier 2 Django application layer validation under row lock validating incoming payload against `question.question_type`: MCQ questions reject typed text and file uploads, while descriptive questions reject option selections and accept typed text, uploaded handwritten sheet files (`uploads_descriptive_upload`), or both.
+20. **Production Log Sanitization & Reverse Proxy Trust Boundary (Chunk 03 Round 2 Corrections):** Enforced strict production exception logging policy in `custom_exception_handler` and `SensitiveDataFilter`: raw exception strings (`str(exc)`), arguments, and Python tracebacks (`exc_info`) are completely suppressed from production logs and responses, emitting structured diagnostic metadata (`error_category`, `exception_type`, `sanitized_view`, `request_id`) while clients receive generic HTTP 500 envelopes. Forwarded HTTPS proxy header trust (`SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')`) is fail-closed and disabled by default (`SECURE_PROXY_SSL_HEADER = None`), strictly requiring operator enablement via `TRUST_PROXY_SSL_HEADER=True` with documented verification that Nginx terminates TLS, unconditionally overwrites `X-Forwarded-Proto $scheme`, and mechanically blocks direct client access to Gunicorn/Django via Unix domain socket (mode 0660) or loopback firewall. Corrected misspelled institutional policy test assertion (`INSTITUTIONAL_CONFIG_APPROVED`).
 
 
 ---

@@ -1,7 +1,7 @@
 """
 Centralized error handling conventions for College Online Examination System.
 Standardizes all DRF error responses into a consistent JSON envelope and suppresses
-internal stack traces from API responses.
+internal stack traces and sensitive error data from API responses and production logs.
 """
 
 import logging
@@ -53,9 +53,12 @@ def custom_exception_handler(exc: Exception, context: Dict[str, Any]) -> Optiona
             "timestamp": "2026-11-03T03:30:00Z"
         }
     }
+    Enforces strict production log sanitization: raw exception messages and stack traces
+    are never emitted into production logs or returned in production HTTP responses.
     """
     response = drf_exception_handler(exc, context)
     now_iso = datetime.now(timezone.utc).isoformat()
+    is_debug = getattr(settings, 'DEBUG', False)
 
     if response is not None:
         status_code = response.status_code
@@ -91,17 +94,38 @@ def custom_exception_handler(exc: Exception, context: Dict[str, Any]) -> Optiona
         }
         return response
 
-    # Unhandled 500 error
-    view_name = context.get('view', None)
-    logger.error(
-        "Unhandled exception in view %s: %s",
-        view_name,
-        str(exc),
-        exc_info=True,
-    )
+    # --------------------------------------------------------------------------
+    # Unhandled 500 error handling & secure production logging
+    # --------------------------------------------------------------------------
+    view = context.get('view', None)
+    sanitized_view = view.__class__.__name__ if hasattr(view, '__class__') else str(view or 'UnknownView')
 
-    # In production or when DEBUG is False, suppress stack traces and internal messages
-    if not getattr(settings, 'DEBUG', False):
+    request = context.get('request', None)
+    request_id = 'N/A'
+    if request and hasattr(request, 'META') and isinstance(request.META, dict):
+        request_id = str(request.META.get('HTTP_X_REQUEST_ID', 'N/A'))
+
+    exc_class = exc.__class__.__name__
+    error_category = 'UnhandledServerException'
+
+    if not is_debug:
+        # PRODUCTION: Log structured diagnostic event without raw exception message or traceback
+        # Never log str(exc), exception args, request bodies, cookies, or auth headers
+        logger.error(
+            "Unhandled server exception in view '%s' [category=%s, type=%s, request_id=%s]",
+            sanitized_view,
+            error_category,
+            exc_class,
+            request_id,
+            extra={
+                'error_category': error_category,
+                'exception_type': exc_class,
+                'view': sanitized_view,
+                'request_id': request_id,
+            },
+            exc_info=False,
+        )
+
         error_payload = {
             'error': {
                 'code': 'INTERNAL_SERVER_ERROR',
@@ -111,12 +135,26 @@ def custom_exception_handler(exc: Exception, context: Dict[str, Any]) -> Optiona
             }
         }
     else:
-        # In DEBUG mode, allow error message for debugging while keeping the envelope
+        # DEVELOPMENT: Allow traceback in development logs and include debug type in response
+        logger.error(
+            "Unhandled server exception in view '%s' [%s]: %s",
+            sanitized_view,
+            exc_class,
+            str(exc),
+            exc_info=True,
+            extra={
+                'error_category': error_category,
+                'exception_type': exc_class,
+                'view': sanitized_view,
+                'request_id': request_id,
+            },
+        )
+
         error_payload = {
             'error': {
                 'code': 'INTERNAL_SERVER_ERROR',
                 'message': str(exc),
-                'details': {'type': exc.__class__.__name__},
+                'details': {'type': exc_class},
                 'timestamp': now_iso,
             }
         }
