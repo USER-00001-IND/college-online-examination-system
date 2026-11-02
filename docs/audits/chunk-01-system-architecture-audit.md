@@ -1,8 +1,8 @@
-# Chunk 01: System Architecture Audit Report (Round 6 Revision)
+# Chunk 01: System Architecture Audit Report (Round 7 Revision)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 6 Revision)  
+**Date:** 2026-11-03 (Round 7 Revision)  
 **Assigned Scope:** Chunk 01 — System Architecture  
 **Status:** **PASS WITH WARNINGS** (Core architecture is complete, robust, and technically verified; documented non-blocking institutional policies are explicitly flagged for college confirmation).
 
@@ -14,31 +14,26 @@
   - Design modular monolith architecture using React, Vite, Tailwind CSS, React Router, Django, DRF, MySQL, ReportLab, and SMTP.
   - Incorporate approved Chunk 00 requirements (Self-registration with approval, hybrid descriptive text + uploads, dual-tier PIN security, configurable roll-number generator, ReportLab PDFs).
   - Define frontend and backend modules, boundaries, and dependencies.
-  - Incorporate all Round 6 independent review corrections:
-    1. **Blocking Contradiction Resolved — Post-Deadline Encrypted Answer Key Recovery:**
-       - Reconciled the conflict where post-deadline preserved answers were inaccessible after browser restart because key release was previously blocked once attempts were finalized or server time passed the deadline.
-       - Established a **Dual-Track Key-Management Lifecycle** with separate authorization contracts, endpoints, and security guarantees:
-         - **Track A (Live Exam Key Recovery):** `POST /api/attempts/{id}/recover-cache-key/` scoped strictly to active `IN_PROGRESS` attempts before `official_end_time` to resume live answering and synchronized submission.
-         - **Track B (Post-Deadline Read-Only Evidence Recovery):** `POST /api/attempts/{id}/recover-evidence-key/` scoped strictly to finalized attempts (`SUBMITTED`, `AUTO_CLOSED_DEADLINE`) within the configurable post-deadline retention window to decrypt local IndexedDB storage, view original drafts in a watermarked read-only viewer, and export `AUDIT_RECOVERY_BUNDLE`.
-       - Strictly prohibited live exam reactivation, answer alteration, or automated regrading via Track B.
-    2. **Key Retention and Data Lifecycle Specification:**
-       - Documented server-wrapped DEK retention window (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, pending institutional approval / `UNCONFIGURED`, recommended baseline 14–30 days).
-       - Documented local browser storage retention (`LOCAL_EVIDENCE_CACHE_MAX_AGE_DAYS`).
-       - Documented permanent ciphertext unrecoverability upon server key deletion (`PERMANENTLY_UNRECOVERABLE_KEY_PURGED`).
-       - Documented device switching and browser cache clearing boundaries (local IndexedDB is device-specific).
-       - Clearly distinguished synchronized answers (`COMMITTED` in MySQL) from unsynchronized diagnostic evidence (IndexedDB records).
-       - Defined evidence export telemetry and signed audit acknowledgement (`AuditLog: EVIDENCE_BUNDLE_EXPORTED`).
-       - Defined administrative access controls: administrators cannot silently dump student storage; forensic DEK access requires dual-authorization and audit logging (`AuditLog: ADMIN_EVIDENCE_DEK_ACCESS`).
-       - Documented interaction with institutional workstation sanitization: warned that lab PCs with Deep Freeze wipe user profiles on reboot, requiring candidates to export their recovery bundle before logging off or restarting.
-    3. **Preserved All Prior Security Baselines:**
-       - Maintained Web Crypto API `AES-256-GCM` encryption at rest in IndexedDB with 96-bit random IVs and AAD binding.
-       - Maintained complete removal of Examination PINs as local wrapping keys (zero offline dictionary attack vulnerability).
-       - Maintained strict fail-closed production ingress timestamp enforcement (HTTP 502 `INGRESS_TIMESTAMP_INVALID` on missing/untrusted/skewed proxy timestamps).
-       - Maintained application transaction recording time (`transaction_recorded_at`) distinction from hardware commit instant.
-       - Maintained ReportLab pure-Python PDF generation, configurable roll-number engine, and multi-tier role authorization.
+  - Incorporate all Round 7 independent review corrections:
+    1. **Finding A (High Priority Resolved) — Deadline Finalization Race Condition:**
+       - Eliminated the race condition where the background deadline worker could auto-close an attempt while valid on-time requests ($T_{\text{ingress}} \le \text{official\_end\_time}$) were still queued in socket backlogs or executing in Gunicorn workers.
+       - Designed a two-stage finalization protocol for the deadline supervisor worker:
+         - *Stage 1 (Queue Drain Wait):* Mandatory delay window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$) before initiating attempt closure, allowing requests buffered at Nginx/sockets to enter Django.
+         - *Stage 2 (In-Flight Registry Verification):* Redis-backed active request tracking (`exam:inflight:{attempt_id}`) across multiple Gunicorn workers. Supervisor defers finalization while active requests remain, bounded by a hard ceiling timeout (30s total) to prevent indefinite stalls.
+         - *Stage 3 (Atomic Finalization):* Exclusive row lock (`SELECT ... FOR UPDATE` on `ExamAttempt`), freezing attempt state to `AUTO_CLOSED_DEADLINE`, followed by asynchronous, idempotent MCQ evaluation.
+       - Specified a universal row-lock acquisition order across Autosave, Submission, and Supervisor finalization.
+       - Provided exhaustive 12-scenario concurrency analysis covering worker crashes, slow body uploads, out-of-order network arrival, retries, and duplicate evaluations with authoritative outcomes and HTTP status codes.
+    2. **Finding B (Medium Priority Resolved) — Evidence Retention Configuration State Machine:**
+       - Defined an explicit 4-state operational machine: `UNCONFIGURED`, `CONFIGURED`, `EXPIRED`, and `LEGAL_HOLD / GRIEVANCE_PENDING`.
+       - Implemented a **Hard Production Activation Gate**: examination publishing and activation is strictly blocked while `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` remains `UNCONFIGURED`.
+       - Enforced institutional role authorization (`IsCollegeSuperAdmin`) with mandatory written justification and audit logging (`AuditLog: RETENTION_POLICY_CONFIGURED`).
+       - Captured retention policy as an immutable snapshot on `Examination` (`evidence_key_retention_days`) and `ExamAttempt` (`evidence_key_expires_at`), preventing retroactive changes to active/finalized attempts.
+       - Defined exact countdown start at `finalized_at`, server-authoritative request-time expiry enforcement (HTTP 410 `EVIDENCE_RETENTION_EXPIRED`), scheduled daily key deletion (`purge_expired_evidence_keys`), audit logging (`AuditLog: EVIDENCE_KEY_PURGED`), and failure recovery.
+       - Specified legal hold suspension (`is_under_legal_hold = True`) for active grievances.
+       - Detailed lab workstation sanitization policies and warned candidates to export bundles prior to PC reboots.
   - Reconcile Mermaid diagrams, list exact locations, and distinguish manual review from automated validation.
 * **Scope Completed:**
-  - 100% of the assigned architectural tasks and all Round 6 review corrections completed.
+  - 100% of the assigned architectural tasks and all Round 7 review corrections completed.
   - Zero application code, migrations, or dependencies installed (strict adherence to gate rules).
 
 ---
@@ -47,9 +42,9 @@
 
 | File | Status | Description |
 | :--- | :---: | :--- |
-| [`docs/architecture.md`](../architecture.md) | **Updated** | Master architecture document containing system overview, module definitions, workflows, security boundaries, and all 11 Mermaid diagrams. Updated with the Dual-Track Key-Management Lifecycle (Live Exam Recovery vs. Post-Deadline Read-Only Evidence Recovery), comprehensive evidence retention and workstation sanitization policies, recovery bundle specifications, fail-closed ingress verification, and accurate transaction recording semantics. |
+| [`docs/architecture.md`](../architecture.md) | **Updated** | Master architecture document containing system overview, module definitions, workflows, security boundaries, and all 11 Mermaid diagrams. Updated with two-stage deadline finalization protocol, Redis cross-worker in-flight registry, 12-scenario concurrency analysis, formal evidence-retention configuration state machine, production activation gate, and legal hold mechanics. |
 | [`docs/development-progress.md`](../development-progress.md) | **Updated** | Progress tracking ledger recording chunk statuses, approvals, and decisions. Kept Chunk 01 pending user approval. |
-| [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **Updated** | Comprehensive audit report reflecting the finalized Round 6 corrected architecture baseline with truthful status and validation disclosure. |
+| [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **Updated** | Comprehensive audit report reflecting the finalized Round 7 corrected architecture baseline with truthful status and validation disclosure. |
 | [`design.md`](../../design.md) | **Preserved** | Unmodified; retains master requirements contract. |
 
 ---
@@ -72,16 +67,15 @@ The system is designed as a **Modular Monolith** engineered for high integrity, 
    - `SubjectCategory` (Major, Minor, MDC, AEC, SEC, VAC) modeled dynamically in DB rather than hardcoded enums.
    - Cross-programme paper support for shared NEP courses (e.g., Environmental Studies VAC).
    - Explicit registration: Eligibility requires an approved `StudentSubjectEnrollment` record.
-4. **Examination Lifecycle & Dual-Tier Access:**
+4. **Examination Lifecycle & Concurrency Protocol:**
    - Account login establishes student identity; live exam entry requires entering a separate, cryptographically hashed Examination PIN.
-   - Early access allows entering the Waiting Room only; new attempts are permitted only within `[start_time, entry_cutoff_time]`; active attempts may resume until `end_time`; attempts are permanently locked after submit or auto-close.
-   - Server-authoritative timer; conservative ingress timestamping ($T_{\text{ingress}} \le \text{official\_end\_time}$); zero trust in client timestamps; monotonic sequence versioning; idempotent submission; ReportLab PDF generation; private storage for admit cards and student descriptive uploads.
+   - Server-authoritative timer ($T_{\text{ingress}} \le \text{official\_end\_time}$); zero trust in client timestamps; monotonic sequence versioning; idempotent submission.
+   - **Race-Free Finalization:** Ingress Queue Drain Window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$) and Redis in-flight tracking prevent premature auto-closure while valid on-time requests are buffered or processing.
+   - Strict row-lock acquisition order (`SELECT ... FOR UPDATE` on `ExamAttempt`) serializes concurrent autosaves, submissions, and supervisor workers.
 5. **Shared-Device Cryptographic Confidentiality & Dual-Track Key Recovery:**
-   - Local answer persistence protected at rest using Web Crypto API `AES-256-GCM` with 96-bit random IVs and AAD binding.
-   - Zero credentials or PINs stored locally as wrapping keys.
-   - Server-assisted key release partitioned into:
-     - **Track A (Live Exam Key Recovery):** Unwraps DEK into volatile RAM for active attempts before `end_time` to resume answering.
-     - **Track B (Post-Deadline Read-Only Evidence Recovery):** Unwraps DEK into volatile RAM for finalized attempts within `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` to export `AUDIT_RECOVERY_BUNDLE` and view original local answers in a read-only viewer. Write APIs strictly disabled.
+   - Local answer persistence protected at rest using Web Crypto API `AES-256-GCM` with 96-bit random IVs and AAD binding. Zero local PIN wrapping.
+   - Server-assisted key release partitioned into Track A (Live Exam Recovery, active `IN_PROGRESS`, $T \le \text{deadline}$, write-enabled) and Track B (Post-Deadline Read-Only Evidence Recovery, finalized attempts within `EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, strictly read-only).
+   - Production examination activation gate enforces approved retention policy before scheduling.
 
 ---
 
@@ -104,8 +98,8 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 | 7 | Complete Examination Lifecycle | Section 8.1 (Line 402) | `flowchart TD` |
 | 8 | Descriptive Answer File-Upload Pipeline | Section 11.2 (Line 569) | `sequenceDiagram` |
 | 9 | Background Admit-Card Email Delivery | Section 12.2 (Line 635) | `flowchart LR` |
-| 10 | Examination Attempt and Submission Sequence | Section 13.5 (Line 1010) | `sequenceDiagram` |
-| 11 | Evaluation & Results Publication Architecture | Section 14 (Line 1061) | `flowchart TD` |
+| 10 | Examination Attempt and Submission Sequence | Section 13.5 (Line 1007) | `sequenceDiagram` |
+| 11 | Evaluation & Results Publication Architecture | Section 14 (Line 1058) | `flowchart TD` |
 
 ### 4.2 Validation Method
 
@@ -124,8 +118,10 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 | **Configurable roll numbers** | Dynamic pattern-based template engine (`RollNumberScheme`) supporting college prefix, academic session, programme code, and zero-padded sequence numbers. Documented default is strictly illustrative; supports atomic `SELECT ... FOR UPDATE` allocation, admin correction workflows, and historical locking. | Section 10 |
 | **ReportLab PDF admit cards** | Pure-Python `reportlab.platypus` document builder generating pixel-perfect PDFs with candidate info, schedule table, instructions, and barcode/QR without OS cairo/pango dependencies. | Section 12 |
 | **Unified deadline timestamping ($T_{\text{ingress}}$)** | Distinction of 5 request stages; Nginx `$msec` semantics & limitations acknowledged; Nginx overwrites `X-Request-Arrival-Time`; accepted strictly from `TRUSTED_PROXIES`; direct backend access prevented via Unix socket/firewall; mandatory fail-closed behavior on missing/invalid timestamps in production (HTTP 502); WSGI fallback strictly restricted to dev/test environments. Writes accepted only when $T_{\text{ingress}} \le \text{official\_end\_time}$. | Section 13.1 |
+| **Two-stage finalization protocol** | Prevents race condition between in-flight on-time writes and deadline auto-closure. Stage 1 queue drain window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$) + Stage 2 Redis in-flight tracking (`exam:inflight:{id}`) + hard ceiling timeout (30s). Full 12-scenario concurrency analysis documented. | Section 13.1 & 13.4 |
+| **Evidence retention state machine** | Formal 4-state lifecycle (`UNCONFIGURED` -> `CONFIGURED` -> `EXPIRED` / `LEGAL_HOLD`). Hard production gate blocks exam activation while unconfigured. Immutable snapshots per exam and attempt. Scheduled daily deletion and legal hold mechanics. | Section 13.3.6 |
 | **Encrypted offline cache & dual-track recovery** | Concrete Web Crypto API `AES-256-GCM` encryption at rest in IndexedDB with 96-bit random IVs and AAD binding. Zero local PIN wrapping. Partitioned dual-track key recovery: Track A for active attempts before deadline; Track B for post-deadline read-only evidence recovery and diagnostic export within `EXAM_EVIDENCE_KEY_RETENTION_PERIOD`. Preserved unacknowledged answers; recovery bundles (`AUDIT_RECOVERY_BUNDLE`) with SHA-256 integrity metadata and server HMACs; institutional kiosk and deep freeze warning documented. | Section 13.3 |
-| **Reconciled submission lifecycle** | Explicit distinction between $T_{\text{ingress}}$ (`submitted_at`), $T_{\text{process}}$, and application transaction recording time `transaction_recorded_at` (persisted in `committed_at`). Exhaustive documentation of all 6 submission scenarios with exact HTTP response codes (200, 409, 410, 502) and transactional row-locking semantics (`SELECT ... FOR UPDATE`). | Section 13.4 & 13.5 |
+| **Reconciled submission lifecycle** | Explicit distinction between $T_{\text{ingress}}$ (`submitted_at`), $T_{\text{process}}$, and application transaction recording time `transaction_recorded_at` (persisted in `committed_at`). Exhaustive documentation of all 12 submission scenarios with exact HTTP response codes (200, 408, 409, 410, 502) and transactional row-locking semantics (`SELECT ... FOR UPDATE`). | Section 13.4 & 13.5 |
 | **XSS defense-in-depth** | Accurate acknowledgement of `HttpOnly` scope (stops raw cookie theft, but does not stop XSS session riding). Defense-in-depth enforced via React JSX default escaping, DOMPurify, strict Content Security Policy (`script-src 'self'`), backend input sanitization, and dependency scanning. | Section 15.2 & 17 |
 | **Explicit FYUGP eligibility** | Eligibility service filters active approved `StudentSubjectEnrollment` for targeted `PaperOffering`. Admin reviews, applies audited overrides, and locks immutable snapshot. | Section 7 & 8 |
 | **Role-based access & private files** | Django permission classes (`IsAdminRole`, `IsFacultyRole`, `IsApprovedStudent`). Private storage outside webroot with authenticated streaming downloads. | Section 4.2 & 11.4 |
@@ -165,7 +161,7 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
    - Residual risks (unmanaged malware, memory dumpers) are mitigated through documented institutional kiosk policies (ephemeral browser sessions, OS Deep Freeze/reboot scripts).
 5. **Audit Trail & Secret Hygiene:**
    - Centralized `AuditLog` records actor, IP address, action, target entity, and before/after state diffs.
-   - Distinct audit events for key recovery: `AuditLog: LIVE_CACHE_KEY_RELEASED`, `AuditLog: EVIDENCE_KEY_RELEASED`, and `AuditLog: EVIDENCE_BUNDLE_EXPORTED`.
+   - Distinct audit events for key recovery and retention: `AuditLog: LIVE_CACHE_KEY_RELEASED`, `AuditLog: EVIDENCE_KEY_RELEASED`, `AuditLog: EVIDENCE_BUNDLE_EXPORTED`, `AuditLog: RETENTION_POLICY_CONFIGURED`, `AuditLog: EVIDENCE_KEY_PURGED`, and `AuditLog: LEGAL_HOLD_RELEASED`.
    - Passwords, plain PINs, and auth tokens are explicitly scrubbed from audit payloads and application logs.
 
 ---
@@ -181,12 +177,11 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
    - Outermost WSGI middleware fallback is restricted strictly to development and testing environments (`ALLOW_WSGI_TIMESTAMP_FALLBACK = True`).
    - Requests arriving before `end_time` at the trusted reverse proxy ($T_{\text{ingress}} \le \text{official\_end\_time}$) are accepted even if internal processing finishes slightly after `end_time`.
    - Requests first received after `end_time` are rejected immediately with HTTP 410 Gone, and attempt is transitioned to `AUTO_CLOSED_DEADLINE`.
-   - Offline answers entered after `end_time` cannot be synchronized upon reconnection; marked `REJECTED_DEADLINE_EXCEEDED` locally for diagnostic appeal, while attempt is finalized using only pre-deadline saved state.
-4. **Reconciled Submission Concurrency & Locking:**
-   - Concurrent autosaves and final submissions serialize on `ExamAttempt` row lock (`SELECT ... FOR UPDATE`).
-   - An autosave arriving after submission finalization fails gracefully with HTTP 409 Conflict (`ATTEMPT_ALREADY_FINALIZED`).
-   - Network retries and duplicate submission clicks return idempotent HTTP 200 responses without triggering duplicate evaluations.
-   - `submitted_at` records $T_{\text{ingress}}$, while `committed_at` records application transaction time `transaction_recorded_at`.
+4. **Race-Free Deadline Finalization Protocol:**
+   - Background supervisor worker will not initiate closure until $T_{\text{now}} \ge \text{official\_end\_time} + \Delta_{\text{ingress\_drain}}$ (15s).
+   - Active in-flight tracking via Redis hash `exam:inflight:{attempt_id}` defers finalization while qualifying requests execute, with a 30s hard ceiling preventing indefinite stalls.
+   - Database row-level locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) serializes concurrent autosaves, manual submissions, and supervisor workers.
+   - Full 12-scenario matrix defines exact behaviors, outcomes, and HTTP status codes.
 5. **Peak Examination Traffic:**
    - Read-heavy live exam questions and configuration can be cached in Redis.
    - Static assets served directly by Nginx.
@@ -201,9 +196,9 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 | :--- | :--- | :--- |
 | **Nginx `$msec` Semantics** | Nginx `$msec` represents user-space variable evaluation time during event loop processing, not a kernel/hardware packet arrival timestamp. | Documented as an acknowledged software stack limitation; system adopts an explicit conservative server-authoritative cutoff policy. |
 | **Production Ingress Header Tampering** | Untrusted clients or misconfigured reverse proxies sending manipulated `X-Request-Arrival-Time` headers. | Strict fail-closed policy: header accepted only from verified `TRUSTED_PROXIES`; missing or invalid headers return HTTP 502 `INGRESS_TIMESTAMP_INVALID` and log security audit event. |
-| **WSGI Fallback Latency** | Standalone WSGI execution without Nginx uses conservative middleware ingress timestamping ($T_{\text{wsgi\_ingress}}$) that may reject requests delayed by WSGI request buffering. | Documented that WSGI fallback is strictly permitted in dev/test; Nginx reverse proxy with `$msec` and fail-closed enforcement is mandatory for production deployments. |
+| **In-Flight Finalization Bounded Wait** | Extreme server worker queueing exceeding the 30-second hard ceiling could theoretically cause a late on-time request to encounter `AUTO_CLOSED_DEADLINE`. | Mitigated by 15s socket drain window + Redis in-flight tracking + worker sizing; uncommitted requests delayed beyond ceiling are logged as `ABANDONED_INFLIGHT_REQUEST` and preserved locally as `REJECTED_DEADLINE_EXCEEDED` for appeal. |
 | **Shared-Device Lab PC Reboot Sanitization** | Workstations running Deep Freeze or reboot-wipe scripts purge IndexedDB on reboot. | Documented mandatory operational rule: candidates experiencing exam disruption on shared lab PCs must export `AUDIT_RECOVERY_BUNDLE` prior to rebooting or leaving the workstation. |
-| **Post-Deadline Evidence Expiry** | Once the configured evidence key retention period (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`) expires, local ciphertext becomes permanently unrecoverable. | Documented policy lifecycle; server deletes DEKs post-retention; candidates must file appeals within institutional retention window. |
+| **Post-Deadline Evidence Expiry** | Once the configured evidence key retention period (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`) expires, local ciphertext becomes permanently unrecoverable. | Documented policy lifecycle; server deletes DEKs post-retention; candidates must file appeals within institutional retention window; production activation gated on configured policy. |
 | **Diagnostic Bundle Verification Limits** | Client-generated timestamps inside `AUDIT_RECOVERY_BUNDLE` are self-reported and cannot cryptographically prove pre-deadline completion. | Documented limitation; bundle accompanied by SHA-256 integrity metadata; server-issued receipts authenticated via server HMAC; evaluation governed by administrative committee review rather than automatic override. |
 | **PIN Delivery Method** | Advance PIN printing on admit cards risks early disclosure; just-in-time delivery risks network/SMS bottlenecks on exam day. | System enforces mandatory configuration (`EXAM_PIN_DELIVERY_METHOD`); PIN generation blocked until college confirms choice. |
 | **Network Loss Across Deadline** | A student disconnected before deadline cannot upload offline answers after `end_time`. | Documented as strict server-authoritative integrity rule; attempt is auto-closed using last synchronized answers; unacknowledged answers preserved in `AUDIT_RECOVERY_BUNDLE` for grievance appeal via Track B. |
@@ -216,7 +211,7 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 
 The following items are documented as proposed baselines and flagged for formal institutional or data modeling confirmation:
 
-1. **Post-Deadline Evidence Key Retention Window (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`):** Institutional confirmation of the duration server-wrapped DEKs are retained for grievance review post-finalization (recommended baseline: 14 to 30 days). Initialized as `UNCONFIGURED`.
+1. **Institutional Evidence Key Retention Approval & Activation Gate:** Confirmation of the institutional retention period (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, recommended baseline 14–30 days) by college administration. System strictly blocks examination publication and activation while unconfigured. Confirmation of administrative workstation sanitization schedules and student evidence export protocols prior to lab PC reboots.
 2. **Shared-Device Lab Sanitization & Diagnostic Appeal Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts in shared college computer labs), proctor procedures for immediate post-exam evidence export, and formal college protocols for evaluating `AUDIT_RECOVERY_BUNDLE` appeal submissions.
 3. **Examination PIN Delivery Policy:** Mandatory college decision selecting between PIN printing on admit cards or just-in-time delivery via SMS/portal/invigilators. PIN issuance blocked until configured.
 4. **Late-Entry Cutoff Duration:** Institutional confirmation of the permitted entry window (`entry_cutoff_time`, e.g., 15 or 30 minutes past `start_time`), after which new attempts cannot be initialized.
@@ -231,7 +226,7 @@ The following items are documented as proposed baselines and flagged for formal 
 ## 10. Final Audit Status
 
 * **Status:** **PASS WITH WARNINGS**
-* **Gate Sign-off:** All Chunk 01 requirements and Round 6 review corrections are fully addressed. All 11 Mermaid diagrams are documented, manually verified, and reconciled. Architectural boundaries, security protocols, technically defensible deadline enforcement ($T_{\text{ingress}}$), fail-closed production ingress verification, Web Crypto AES-256-GCM Dual-Track key lifecycle (Live Resumption vs. Post-Deadline Read-Only Evidence Recovery), diagnostic recovery bundle limits, and reconciled submission semantics are finalized in [`docs/architecture.md`](../architecture.md). Documented non-blocking institutional policies are explicitly flagged for college confirmation.
+* **Gate Sign-off:** All Chunk 01 requirements and Round 1–7 audit corrections are fully addressed. The Two-Stage Deadline Finalization Protocol resolves the in-flight race condition with mathematically bounded guarantees. The Evidence Retention State Machine establishes a hard production activation gate and complete lifecycle controls. All 11 Mermaid diagrams are reconciled and manually verified. Documented non-blocking institutional policies are explicitly flagged for college confirmation.
 * **Next Permitted Chunk:** **CHUNK 02 — DATABASE ARCHITECTURE** (pending explicit user approval).
 
 > **STOP:** All work for Chunk 01 is complete. No application code, packages, or database schemas have been generated. Awaiting explicit user approval before proceeding to Chunk 02.

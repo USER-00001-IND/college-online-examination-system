@@ -441,8 +441,8 @@ flowchart TD
    - The official examination deadline (`end_time`) is strictly server-authoritative and marks the absolute cutoff for answering questions.
    - Write requests (autosave updates and manual submissions) are accepted **only** when their authoritative ingress timestamp ($T_{\text{ingress}}$ evaluated via Nginx `$msec`, or fallback WSGI ingress in dev/test only) is $\le \text{official\_end\_time}$.
    - Requests first received after `end_time` are rejected for write, regardless of any client-side claims or offline timestamps.
-   - Internal processing latency between reverse-proxy receipt and WSGI application completion is accommodated (distinguishing arrival from processing completion), but network transport latency that results in late arrival after `end_time` does **not** permit late writes.
-   - At or immediately following `end_time`, any remaining open attempt is transitioned to `AUTO_CLOSED_DEADLINE`, and all write APIs strictly reject further modifications.
+   - **In-Flight Concurrency Protocol:** Internal processing latency between reverse-proxy receipt and WSGI application completion is accommodated without opening a race condition. The system employs a two-stage finalization protocol (an Ingress Queue Drain Window $\Delta_{\text{ingress\_drain}} = 15\text{s}$ combined with a Redis-backed cross-worker in-flight registry `exam:inflight:{attempt_id}`). The background deadline worker will **never** finalize an attempt while qualifying on-time requests remain in-flight.
+   - Once all in-flight on-time requests have drained (or the hard ceiling timeout elapses), the attempt is transitioned to `AUTO_CLOSED_DEADLINE`, with `submitted_at = T_ingress` for on-time submissions and `closed_at = official_end_time` for auto-closed attempts, while recording `transaction_recorded_at` during the database transaction. All subsequent write APIs strictly reject modifications (HTTP 410).
 4. **Email Delivery Failure:**
    - Failed email attempts are captured in `AdmitCardEmailQueue` with error message.
    - Admin monitor displays failed records; provides single-click "Retry Failed Emails" batch action.
@@ -708,16 +708,20 @@ flowchart LR
 * **Distinction Between Request Arrival and Processing Completion:**
   - If a request arrives at the trusted reverse proxy before the deadline ($T_{\\text{ingress}} \le \text{official\_end\_time}$), but backend worker thread scheduling or database lock contention causes processing to complete slightly after ($T_{\\text{complete}} > \text{official\_end\_time}$), the write is **accepted and committed** because the request was verified to have arrived on time.
   - The internal latency buffer accommodates server processing queues, but **never extends answering time or permits late-arriving requests**.
-* **Exact Handling of Requests at the Deadline:**
-  1. **Autosave Arriving On or Before Deadline ($T_{\\text{ingress}} \le \text{end\_time}$):**
-     - Verified against monotonic sequence version (`incoming_seq > stored_seq`).
+* **Exact Handling of Requests at the Deadline & In-Flight Concurrency Protocol:**
+  1. **Autosave Arriving On or Before Deadline ($T_{\text{ingress}} \le \text{end\_time}$):**
+     - Registered in Redis in-flight tracker upon WSGI entry: `HSET exam:inflight:{attempt_id} {request_uuid} "{T_ingress}:{time}"`.
+     - Verified against monotonic sequence version (`incoming_seq > stored_seq`) under `ExamAttempt` row lock.
      - Answer updated in database; returns HTTP 200 with server timestamp and acknowledged sequence.
-  2. **Autosave Arriving After Deadline ($T_{\\text{ingress}} > \text{end\_time}$):**
+     - De-registered from Redis in-flight tracker in `finally` block.
+  2. **Autosave Arriving After Deadline ($T_{\text{ingress}} > \text{end\_time}$):**
      - Write operation is rejected immediately with HTTP 410 (`EXAMINATION_CLOSED`).
      - Answer payload is discarded. The attempt is transitioned to `AUTO_CLOSED_DEADLINE` if not already finalized.
   3. **Submission Arriving On or Before Deadline ($T_{\text{ingress}} \le \text{end\_time}$):**
-     - Atomic transaction locks attempt, transitions `status = SUBMITTED`, sets `submitted_at = T_ingress`, records application transaction time `transaction_recorded_at = timezone.now()` (persisted in field `committed_at`).
-     - Automatically invokes MCQ auto-grading and returns a signed submission receipt.
+     - Registered in Redis in-flight tracker upon WSGI entry.
+     - Atomic transaction locks attempt (`SELECT ... FOR UPDATE`), transitions `status = SUBMITTED`, sets `submitted_at = T_ingress`, records application transaction time `transaction_recorded_at = timezone.now()` (persisted in field `committed_at`).
+     - De-registers from Redis in-flight tracker.
+     - Automatically invokes idempotent MCQ auto-grading and returns a signed submission receipt.
   4. **Submission Arriving After Deadline ($T_{\text{ingress}} > \text{end\_time}$):**
      - Manual submission write is rejected.
      - Atomic transaction checks attempt state; if `IN_PROGRESS`, transitions `status = AUTO_CLOSED_DEADLINE`, sets `closed_at = official_end_time`, records application transaction time `transaction_recorded_at = timezone.now()` (persisted in field `committed_at`).
@@ -725,7 +729,14 @@ flowchart LR
      - Returns HTTP 410 with auto-closure receipt reflecting that manual submission was rejected for late arrival, and the attempt was auto-closed at the deadline.
   5. **Network Interruptions Across the Deadline:**
      - If a student disconnects before the deadline and reconnects afterward, any answers entered into the local offline cache after `end_time` **cannot be accepted**.
-     - Upon reconnection, the client receives HTTP 410 informing the student that the exam has closed; the attempt is finalized using only the answers synchronized prior to `end_time`.
+     - Upon reconnection, the client receives HTTP 410 informing the student that the exam has closed; the attempt is finalized using only the answers synchronized prior to `end_time`. Preserved unacknowledged answers can be inspected or exported via Track B Post-Deadline Evidence Recovery.
+* **Authoritative In-Flight Request Tracking Mechanism across Gunicorn Workers:**
+  - **Cross-Worker Redis Registry:** Because Gunicorn runs multiple worker processes, in-flight requests cannot be tracked in Python process memory. The system uses a centralized, high-speed Redis hash: `exam:inflight:{attempt_id}`.
+  - **Ingress Queue Drain Window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$):** When the examination reaches `official_end_time`, requests that physically arrived at Nginx prior to the deadline may still be traversing Nginx buffers, the Unix domain socket backlog, or Gunicorn worker dispatch. The supervisor worker enforces a mandatory delay window $\Delta_{\text{ingress\_drain}}$ before initiating finalization.
+  - **Two-Stage Deadline Supervisor Finalization Protocol:**
+    - *Stage 1 (Queue Drain Wait):* The background supervisor worker (`evaluate_examination_deadline_closure`) will **never** initiate attempt closure until: $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{ingress\_drain}}$.
+    - *Stage 2 (In-Flight Registry Verification):* At $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{ingress\_drain}}$, the supervisor queries `HLEN exam:inflight:{attempt_id}`. If active in-flight requests exist (with timestamps younger than the 30s stale threshold), the supervisor yields and reschedules for check after 2 seconds.
+    - *Stage 3 (Hard Ceiling Timeout):* To prevent an abandoned request, broken TCP connection, or crashed worker from delaying finalization indefinitely, a hard ceiling is enforced at $\text{server\_time} = \text{official\_end\_time} + \Delta_{\text{ingress\_drain}} + \Delta_{\text{hard\_ceiling}}$ ($15\text{s} + 15\text{s} = 30\text{s}$). At the hard ceiling, any remaining in-flight entries are logged as `ABANDONED_INFLIGHT_REQUEST` in `AuditLog` and purged, and finalization proceeds unconditionally under database row lock.
 
 ### 13.2 Autosave Strategy & Monotonic Sequence Versioning
 
@@ -891,45 +902,63 @@ The candidate or proctor can export a structured diagnostic bundle (`AUDIT_RECOV
    - The committee compares server-side audit logs, network gateway logs, and pre-deadline synchronized sequence numbers against the bundle.
    - **Late-rejected answers are never silently or automatically treated as valid examination submissions.** Any acceptance or special evaluation requires a formal, recorded administrative committee resolution.
 
-#### 13.3.6 Key Retention, Evidence Lifecycle, and Workstation Sanitization Policy
+#### 13.3.6 Evidence Retention Policy & Operational State Machine
 
-1. **Server-Wrapped DEK Retention Window (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`):**
-   - Server-wrapped DEKs stored in `ExamAttempt.encrypted_cache_dek` are retained for a configurable institutional period following examination finalization.
-   - **Policy Setting:** Configurable via `EXAM_EVIDENCE_KEY_RETENTION_PERIOD`. Initialized as `UNCONFIGURED` (pending formal college confirmation; recommended baseline: 14 to 30 days post-finalization to accommodate statutory grievance filing periods).
-   - Once the retention window expires, a scheduled backend celery task (`purge_expired_evidence_keys`) cryptographically zeroes and deletes `encrypted_cache_dek` from the database record.
+The retention and disposal of server-wrapped Data Encryption Keys (`ExamAttempt.encrypted_cache_dek`) is governed by an explicit institutional configuration state machine. The system strictly enforces that no production examination can be activated without an approved, valid evidence retention policy.
 
-2. **Encrypted Local Records Retention in Browser:**
-   - Encrypted records in IndexedDB persist across browser sessions under status `SYNC_PENDING`, `REJECTED_DEADLINE_EXCEEDED`, or `EXPIRED_STALE`.
-   - Configurable parameter `LOCAL_EVIDENCE_CACHE_MAX_AGE_DAYS` (recommended 30 days) prompts client-side cleanup of stale attempts.
-   - Synchronized answers are purged immediately upon confirmed submission or auto-close acknowledgement.
+1. **Configuration State Machine:**
+   The evidence retention policy operates under four formal states:
+   - **`UNCONFIGURED` (Initial / Default State):** The institutional retention duration has not been formally approved or entered by college administration. In this state, the system enforces a **Hard Production Activation Gate**: any attempt to publish, schedule, or activate an examination is **strictly blocked** by Django system checks and administrative validation.
+   - **`CONFIGURED` (Active Operational State):** An authorized institutional administrator (`IsCollegeSuperAdmin`) has configured a valid integer retention period (in days, e.g., 14, 30, or 60 days) and signed the policy configuration action. Emits `AuditLog: RETENTION_POLICY_CONFIGURED`. Scheduled examinations can now be published and activated.
+   - **`EXPIRED` (Purged State):** The retention period for a finalized examination attempt has elapsed. The scheduled key-deletion worker zeroes and deletes the wrapped DEK from the database. The client UI transitions to `KEY_PURGED_UNRECOVERABLE`.
+   - **`LEGAL_HOLD / GRIEVANCE_PENDING` (Suspended State):** An administrative override applied to specific examination attempts subject to formal grievance appeals, legal scrutiny, or disciplinary review. While active, scheduled key deletion is strictly suspended, and keys remain preserved until the dispute is formally resolved.
 
-3. **Key Deletion & Ciphertext Purging:**
-   - Once the server deletes `encrypted_cache_dek` post-retention, any remaining local ciphertext in IndexedDB becomes permanently unrecoverable (`PERMANENTLY_UNRECOVERABLE_KEY_PURGED`).
-   - The client UI transitions cache state to `KEY_PURGED_UNRECOVERABLE` and offers a manual cleanup button to remove orphaned ciphertext.
+2. **Production Examination Activation Gate (Hard Blocker):**
+   - **Mandatory Pre-Condition:** Setting an examination to `SCHEDULED` or `ACTIVE` requires a valid, institution-approved retention policy (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD != 'UNCONFIGURED'`).
+   - Attempting to schedule or activate an examination while unconfigured raises a validation error: `ValidationError('EXAM_ACTIVATION_BLOCKED: Institutional evidence key retention period is UNCONFIGURED.')`.
+   - Safe operational baseline: College administrators must explicitly configure an approved integer retention period prior to examination scheduling.
 
-4. **Device Switching & Browser Storage Clearing:**
-   - IndexedDB is strictly tied to the physical workstation and browser profile.
-   - If a candidate switches computers, clears browser cookies/storage, or uses a new browser profile, locally preserved unsynchronized answers are permanently lost.
-   - The database records on the server (`Answer` table) remain the sole authoritative record of on-time synchronized answers.
+3. **Institutional Approval & Role Authorization:**
+   - Modifying the institutional retention policy is strictly restricted to the college super-administrator role (`IsCollegeSuperAdmin`).
+   - Individual faculty, department heads, or exam coordinators cannot alter or bypass this policy.
+   - Every policy update requires mandatory written justification and generates a high-severity audit record: `AuditLog: RETENTION_POLICY_CONFIGURED` recording the administrator ID, old value, new value, client IP, and approval timestamp.
 
-5. **Distinguishing Synchronized Data from Unsynchronized Evidence:**
-   - *Synchronized Answers:* Committed in MySQL `Answer` records with server-authoritative timestamps, version sequences, and status `COMMITTED`.
-   - *Unsynchronized Evidence:* Exists exclusively in client-side IndexedDB with `sync_status = 'SYNC_PENDING'` or `'REJECTED_DEADLINE_EXCEEDED'`, tagged with self-reported `client_recorded_at`.
+4. **Immutable Snapshot per Examination and Attempt:**
+   - When an examination is scheduled/published, the active institutional retention policy is captured as an **immutable snapshot** on the `Examination` record:
+     `Examination.evidence_key_retention_days = Config.EXAM_EVIDENCE_KEY_RETENTION_PERIOD`
+   - When an attempt is finalized (`SUBMITTED` or `AUTO_CLOSED_DEADLINE`), the exact expiry instant is computed and stored immutably on `ExamAttempt`:
+     `ExamAttempt.evidence_key_expires_at = attempt.finalized_at + timedelta(days=examination.evidence_key_retention_days)`
+   - **Non-Retroactivity:** Subsequent modifications to the institutional retention setting apply only to future examinations. They **never** retroactively alter the expiry date or retention rights of active or already-finalized examination attempts.
 
-6. **Evidence Export Acknowledgement & Audit:**
-   - Upon exporting `AUDIT_RECOVERY_BUNDLE`, the client computes the SHA-256 integrity hash of the export payload.
-   - The client transmits telemetry via `POST /api/attempts/{attemptId}/acknowledge-evidence-export/` with bundle hash and timestamp.
-   - Backend logs `AuditLog: EVIDENCE_BUNDLE_EXPORTED` with the SHA-256 hash, attempt ID, and timestamp, issuing a signed export receipt acknowledging submission.
+5. **Retention Countdown & Expiry Determination:**
+   - The retention countdown begins at the exact instant the attempt transitions to a finalized state: `finalized_at` (`submitted_at` for manual submissions, `closed_at` for deadline auto-closures).
+   - Expiry is determined server-authoritatively: `server_time > attempt.evidence_key_expires_at`.
+   - At request time, if `server_time > attempt.evidence_key_expires_at`, any call to `POST /api/attempts/{attemptId}/recover-evidence-key/` is immediately rejected with HTTP 410 (`EVIDENCE_RETENTION_EXPIRED`), regardless of whether the physical database record has been purged by the scheduled batch worker.
 
-7. **Administrative Access Controls & Forensic Dual-Authorization:**
-   - College administrators, faculty, or grievance committee members CANNOT silently inspect or dump student local storage.
-   - Administrators only review evidence submitted by the candidate through the official grievance portal.
-   - If forensic scrutiny requires server-side DEK access to verify submitted ciphertext, access is gated by `IsExamGrievanceCommitteeRole`, requires dual-authorization (two committee members), and emits `AuditLog: ADMIN_EVIDENCE_DEK_ACCESS`.
+6. **Scheduled Key-Deletion Job Behavior:**
+   - Scheduled Celery beat task `purge_expired_evidence_keys` executes daily during off-peak hours (e.g., 02:00 AM).
+   - Queries attempts where `evidence_key_expires_at < timezone.now()`, `encrypted_cache_dek IS NOT NULL`, and `is_under_legal_hold == False`.
+   - Cryptographically zeroes the `encrypted_cache_dek` field, updates it to `NULL`, and sets `evidence_key_purged_at = timezone.now()`.
 
-8. **Interaction with Institutional Workstation Sanitization (Lab Deep Freeze Warning):**
-   - Shared college computer labs frequently employ Deep Freeze, reboot-restore scripts, or ephemeral guest profiles that purge user data upon reboot or logout.
-   - **Operational Rule for Candidates:** If an examination disruption occurs on a shared college lab machine, the candidate **must perform Post-Deadline Evidence Recovery and export the `AUDIT_RECOVERY_BUNDLE` prior to rebooting or leaving the workstation**.
-   - If the computer reboots before export, local IndexedDB is wiped by OS sanitization scripts, rendering unacknowledged local evidence permanently unrecoverable. Proctors and lab administrators must be trained on this requirement.
+7. **Audit Trail for Key Deletion:**
+   - Each purged key emits a security audit record: `AuditLog: EVIDENCE_KEY_PURGED` capturing `attempt_id`, `student_id`, `examination_id`, and `purged_at`.
+
+8. **Handling Key-Deletion Job Failures:**
+   - If the database write fails or a worker crashes during key purging, the transaction rolls back.
+   - The failure is logged as `AuditLog: EVIDENCE_KEY_PURGE_FAILED` and alerts systems administrators.
+   - Because the recovery API strictly checks `now() > evidence_key_expires_at` on every request, an unpurged expired key **will never be released to a client**, preserving confidentiality even if the deletion task encounters a transient database error.
+
+9. **Legal Holds & Formal Grievance Appeals:**
+   - If a candidate files a formal academic grievance or appeal before `evidence_key_expires_at`, an authorized examination committee member flags the attempt: `ExamAttempt.is_under_legal_hold = True` with mandatory `legal_hold_reason = "Formal Grievance #GR-2026-XXX"`.
+   - While `is_under_legal_hold == True`, scheduled deletion jobs strictly skip this record.
+   - Evidence key recovery remains accessible to authorized committee members and the candidate throughout the formal grievance review process.
+   - Once the committee issues a final resolution, the legal hold is released with audited resolution metadata (`AuditLog: LEGAL_HOLD_RELEASED`), and normal retention expiry resumes.
+
+10. **Interaction with Local Browser Cache & Lab Workstation Sanitization:**
+    - Local browser storage (IndexedDB) is device-specific and decoupled from the server database.
+    - Workstations in shared college computer labs frequently run Deep Freeze or reboot-restore scripts that purge temporary profiles and browser storage upon reboot.
+    - **Mandatory Procedural Rule:** If a student experiences an examination disruption on a shared college lab machine, the candidate **must perform Track B Post-Deadline Evidence Recovery and export the `AUDIT_RECOVERY_BUNDLE` prior to rebooting or leaving the workstation**.
+    - If the computer reboots before export, local IndexedDB is wiped by OS sanitization scripts, rendering unacknowledged local evidence permanently unrecoverable. Proctors and lab administrators must be trained on this requirement.
 
 #### 13.3.7 Residual Risks & Required Institutional Policies
 - **Residual Risks on Unmanaged Devices:** Hardware keyloggers, screen recording malware, or root-level compromise on commercial cyber cafe machines cannot be fully mitigated by browser-level cryptography.
@@ -937,7 +966,7 @@ The candidate or proctor can export a structured diagnostic bundle (`AUDIT_RECOV
   - High-stakes examinations should be conducted on college-controlled workstations configured in **Kiosk Mode** (locked down full-screen browser, disabled DevTools via Group Policy, extension installation blocked).
   - Regular automated workstation sanitization: nightly deep-freeze or reboot scripts wiping temporary profiles and browser storage.
 
-### 13.4 Idempotent Submissions & Submission Lifecycle
+### 13.4 Idempotent Submissions, Locking Order & 12-Scenario Concurrency Analysis
 
 #### 13.4.1 Accurate Timestamp Definitions for Submissions
 To resolve lifecycle ambiguity and maintain technical precision, the architecture defines three distinct timestamps:
@@ -946,64 +975,32 @@ To resolve lifecycle ambiguity and maintain technical precision, the architectur
 * **Application Transaction Recording Time (`transaction_recorded_at`):** The application server timestamp captured during the database transaction block (`django.utils.timezone.now()`), persisted in the model field `committed_at`.
   - **Technical Precision Note:** The architecture explicitly distinguishes between application transaction recording time and the actual database engine transaction commit instant. The hardware/engine commit completion instant is an internal MySQL InnoDB event (write-ahead log / redo log flush) that cannot be directly observed by the Python application layer without specialized database binary log hooks. The field `committed_at` therefore accurately records the application-evaluated transaction execution timestamp.
 
-#### 13.4.2 Behavior Across All Six Submission Scenarios
+#### 13.4.2 Transaction Boundaries & Row-Lock Acquisition Order
+To prevent deadlocks and race conditions across concurrent autosaves, manual submissions, and the background deadline worker, **all write operations adhere to a strict, universal row-lock acquisition order**:
+1. **Acquire Exclusive Row Lock:** Execute atomic `SELECT * FROM ExamAttempt WHERE id = :attempt_id FOR UPDATE`.
+2. **Evaluate In-Flight Registry:** Validate that active in-flight requests for this attempt are de-registered upon completion.
+3. **Inspect Attempt Status & Timestamp:**
+   - If `status == IN_PROGRESS` and $T_{\text{ingress}} \le \text{official\_end\_time}$: execute update (Answer or Submission), commit transaction, release row lock.
+   - If `status == SUBMITTED`: reject writes with HTTP 409 Conflict (`ATTEMPT_ALREADY_FINALIZED`), or return cached submission receipt if duplicate submission.
+   - If `status == AUTO_CLOSED_DEADLINE`: reject writes with HTTP 410 Gone (`EXAMINATION_CLOSED`).
+4. **Mcq Grading Execution:** Triggered asynchronously **only after** the final transactional state has committed to the database, ensuring zero grading runs on intermediate or uncommitted data.
 
-1. **Scenario 1: On-Time Manual Submission ($T_{\text{ingress}} \le \text{official\_end\_time}$):**
-   - Acquire atomic row lock on `ExamAttempt` (`SELECT ... FOR UPDATE`).
-   - Verify `status == IN_PROGRESS`.
-   - Update attempt:
-     - `status = SUBMITTED`
-     - `submitted_at = T_ingress`
-     - `committed_at = transaction_recorded_at`
-     - `submission_type = MANUAL_STUDENT`
-     - `submission_uuid = payload.submission_uuid`
-   - Commit transaction and release row lock.
-   - Trigger idempotent MCQ auto-evaluation pipeline.
-   - Return **HTTP 200 (OK)** with signed submission receipt (`status: "SUBMITTED"`, `submitted_at: T_ingress`, `receipt_uuid`).
-2. **Scenario 2: Late Manual Submission ($T_{\text{ingress}} > \text{official\_end\_time}$):**
-   - Manual submission write is **strictly rejected**.
-   - Acquire atomic row lock on `ExamAttempt`.
-   - If attempt is `IN_PROGRESS`:
-     - Transition `status = AUTO_CLOSED_DEADLINE`
-     - `closed_at = official_end_time`
-     - `committed_at = transaction_recorded_at`
-     - `submission_type = AUTO_DEADLINE`
-     - Trigger idempotent MCQ auto-evaluation scoring **only** answers validly committed on or before `official_end_time`.
-   - If already finalized, read existing closure state.
-   - Commit transaction and release row lock.
-   - Return **HTTP 410 (Gone / Examination Closed)** with auto-closure receipt reflecting that manual submission was rejected for late arrival, and the attempt was auto-closed at the deadline.
-   - **Never** represent a rejected late submission as a successful manual submission!
-3. **Scenario 3: Automatic Deadline Closure:**
-   - Triggered by background supervisor worker or by the first incoming request after `official_end_time`.
-   - Acquire atomic row lock on `ExamAttempt`.
-   - If attempt is `IN_PROGRESS`:
-     - `status = AUTO_CLOSED_DEADLINE`
-     - `closed_at = official_end_time`
-     - `committed_at = transaction_recorded_at`
-     - `submission_type = AUTO_DEADLINE`
-     - Trigger MCQ auto-evaluation on answers committed on or before `official_end_time`.
-   - Commit transaction.
-4. **Scenario 4: Duplicate Submission (Rapid double-click):**
-   - Acquire atomic row lock on `ExamAttempt`.
-   - Check state: attempt is already `SUBMITTED`.
-   - Verify `submission_uuid`: matches existing attempt.
-   - Return existing submission receipt immediately without re-modifying timestamps or re-running grading.
-   - Return **HTTP 200 (OK)** with `status: "SUBMITTED"`, original `submitted_at`, and `idempotency: "ALREADY_SUBMITTED"`.
-5. **Scenario 5: Retried Submission After Lost Network Response:**
-   - Client experienced network timeout after sending submit; retries with same `submission_uuid`.
-   - Backend matches `submission_uuid` on `ExamAttempt`.
-   - Returns original submission receipt immediately (HTTP 200).
-6. **Scenario 6: Autosave Arriving Concurrently with Submission:**
-   - Database row-level locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) serializes operations.
-   - **Case A (Autosave acquires row lock first):**
-     - Autosave verifies attempt is `IN_PROGRESS` and $T_{\\text{ingress}} \le \text{official\_end\_time}$.
-     - Updates answer with monotonic version sequence, commits, releases lock.
-     - Submission then acquires lock, sees updated answer, marks `SUBMITTED`, commits. Both succeed cleanly.
-   - **Case B (Submission acquires row lock first):**
-     - Submission acquires lock, marks attempt `SUBMITTED`, commits, releases lock.
-     - Autosave then acquires lock, inspects attempt state, sees `status == SUBMITTED` (or `AUTO_CLOSED_DEADLINE`).
-     - Autosave write is **immediately rejected** with **HTTP 409 (Conflict / Attempt Finalized)**.
-     - Zero writes permitted after submission or auto-close!
+#### 13.4.3 Scenario-by-Scenario Concurrency Analysis (12 Scenarios)
+
+| # | Scenario Description | Ingress Timestamp & Conditions | Execution Path & Lock Serialization | Authoritative Outcome & HTTP Response |
+| :-: | :--- | :--- | :--- | :--- |
+| **1** | **Autosave arrives before deadline and commits before deadline** | $T_{\text{ingress}} \le \text{end\_time}$; processed while $T_{\text{process}} \le \text{end\_time}$. | Registers in Redis tracker; acquires row lock on `ExamAttempt` (`status == IN_PROGRESS`); updates `Answer` row (`WHERE version_sequence < incoming_seq`); commits; de-registers. | **HTTP 200 (OK)**<br>`{ status: "SAVED", seq: N, timestamp: T_server }` |
+| **2** | **Autosave arrives before deadline but reaches Django after deadline** | $T_{\text{ingress}} \le \text{end\_time}$; buffered in Unix socket backlog; reaches Django at $T_{\text{process}} > \text{end\_time}$. | Registers in Redis tracker; supervisor is held in Stage 1 queue drain window ($\Delta_{\text{ingress\_drain}}$); request acquires row lock on `ExamAttempt` (`status == IN_PROGRESS`); verifies $T_{\text{ingress}} \le \text{end\_time}$; commits answer; de-registers. | **HTTP 200 (OK)**<br>Answer accepted because ingress arrival was verified on-time before deadline. |
+| **3** | **Manual submission arrives before deadline but waits behind an autosave** | Both requests arrive at $T_{\text{ingress}} \le \text{end\_time}$; autosave enters view first. | Autosave acquires row lock first, updates answer, commits, releases lock. Submission then acquires row lock, sees updated answer, transitions `status = SUBMITTED`, `submitted_at = T_ingress`, commits, enqueues grading. | **HTTP 200 (OK)**<br>Submission succeeds cleanly with signed receipt; all pre-deadline answers included. |
+| **4** | **Autosave arrives before deadline but waits behind manual submission** | Both requests arrive at $T_{\text{ingress}} \le \text{end\_time}$; submission enters view first. | Submission acquires row lock first, marks `status = SUBMITTED`, commits, releases lock. Autosave then acquires row lock, inspects attempt state, sees `status == SUBMITTED`. | **HTTP 409 (Conflict)**<br>`{ error: "ATTEMPT_ALREADY_FINALIZED" }`<br>Zero writes permitted post-submission. |
+| **5** | **Multiple on-time requests arrive out of processing order** | Request A (seq=5, $T_1$), Request B (seq=6, $T_2$) where $T_1 < T_2 \le \text{end\_time}$; worker thread scheduling causes B to reach DB before A. | Request B acquires lock, updates answer with seq=6 (`WHERE seq < 6`). Request A acquires lock next; update query condition `WHERE seq < 5` fails against stored seq=6; zero rows modified. | **Request B: HTTP 200 (Saved)**<br>**Request A: HTTP 200 (Stale Sequence Ignored)**<br>Database state deterministically preserves latest monotonic answer. |
+| **6** | **Request reaches Nginx before deadline but body finishes uploading afterward** | TCP stream starts before deadline; Nginx evaluates `$msec$ at header read; body transmission is slow. | Nginx enforces `client_body_timeout 10s`. If body transfer completes within timeout, request forwards with $T_{\text{ingress}} \le \text{end\_time}$ and executes within drain window. If transfer stalls past body timeout, Nginx aborts connection. | **HTTP 408 (Request Timeout)** or **HTTP 200 (if completed within timeout)**.<br>Zero partial or corrupted request bodies committed. |
+| **7** | **Deadline worker executes while requests remain queued** | Background supervisor runs at $T_{\text{now}} > \text{end\_time}$; valid requests are queued in socket backlog or in-flight in Gunicorn. | Supervisor enforces Stage 1 wait ($T_{\text{now}} \ge \text{end\_time} + \Delta_{\text{ingress\_drain}}$) and Stage 2 check (`HLEN exam:inflight:{id} == 0`). Supervisor yields and defers closure until in-flight requests complete. | **Queued Requests: HTTP 200 (Processed)**<br>Supervisor finalization deferred until queue drains; prevents premature auto-close. |
+| **8** | **Gunicorn worker crashes after request acceptance** | Request accepted by Nginx; Gunicorn worker crashes (`SIGSEGV` / OOM) before commit. | Database transaction rolls back automatically (MySQL connection termination); Redis in-flight entry expires via TTL (60s); client detects network drop / HTTP 502 and initiates retry. | **HTTP 502 (Bad Gateway)** to client.<br>Client retries with same sequence / submission UUID; supervisor finalizes cleanly after hard ceiling. |
+| **9** | **Network disconnects during a pending request** | Client sends request; connection drops while Django is executing or returning response. | If dropped before body upload finishes, Nginx logs HTTP 499 and aborts. If dropped during Django execution, Django commits transaction; client reconnects and retries with same sequence / submission UUID. | **Client Reconnects & Retries**:<br>Monotonic versioning or submission idempotency returns existing committed state cleanly. |
+| **10** | **Retry arrives after deadline** | Client retries request after `official_end_time` following a client-side timeout. | Case A (Autosave retry): $T_{\text{ingress}} > \text{end\_time}$; rejected immediately with HTTP 410.<br>Case B (Submission retry): $T_{\text{ingress}} > \text{end\_time}$, but `submission_uuid` matches existing attempt already `SUBMITTED`; returns cached receipt. | **Case A: HTTP 410 (Examination Closed)**<br>**Case B: HTTP 200 (OK / Idempotent Receipt)**<br>Late autosaves rejected; existing on-time submissions verified idempotently. |
+| **11** | **Two deadline workers attempt finalization simultaneously** | Multiple Celery worker instances attempt to finalize the same expired attempt. | Both execute `SELECT * FROM ExamAttempt WHERE id = :id FOR UPDATE`. Worker 1 acquires lock, transitions to `AUTO_CLOSED_DEADLINE`, commits, enqueues grading. Worker 2 acquires lock next, inspects state, sees `AUTO_CLOSED_DEADLINE`. | **Worker 1: Commits Finalization**<br>**Worker 2: Idempotent No-Op Exit**<br>Zero duplicate auto-closures or conflicting states. |
+| **12** | **MCQ grading job is triggered more than once** | Duplicate Celery message or concurrent submit/auto-close triggers `evaluate_mcq_attempt`. | Grading task acquires row lock on `EvaluationResult` or checks `is_evaluated` flag under transaction. Task 1 computes scores and commits result. Task 2 acquires lock, sees `is_evaluated == True`, and skips computation. | **Exactly One Evaluation Record**<br>Zero score alteration or duplicate result entries. |
 
 ### 13.5 Examination Attempt and Submission Sequence
 
@@ -1164,6 +1161,8 @@ To defend against XSS and protect session integrity, the architecture enforces m
 | **Hashed Exam PINs** | Plaintext PINs in DB | If the database is compromised, plaintext PINs would allow unauthorized exam access. Hashing ensures zero-knowledge security. |
 | **Private File Storage** | Public S3 / Media root | Descriptive answer scripts and admit cards contain private student academic data; public URLs present severe privacy violations. |
 | **Encrypted Offline Cache & Dual-Track Key Recovery** | Plaintext IndexedDB / localStorage | Plaintext browser storage fails the shared-device threat model. AES-256-GCM at rest protects answers against extraction via browser DevTools on shared workstations. In-memory DEK is zeroed on tab close/logout. Dual-track key recovery separates active live exam resumption (Track A, server time $\le$ deadline, write-enabled) from post-deadline read-only evidence recovery (Track B, within configurable retention period, read-only). Zero credentials or PINs are stored locally as wrapping secrets. |
+| **Two-Stage Deadline Finalization Protocol** | Immediate background auto-close at deadline | Immediate auto-closure creates a race condition that prematurely rejects valid on-time requests waiting in socket backlogs or Gunicorn workers. The two-stage protocol (Queue Drain Window $\Delta_{\text{ingress\_drain}} = 15\text{s}$ + Redis in-flight registry `exam:inflight:{id}`) guarantees all qualifying on-time requests drain before finalization, with a hard ceiling (30s) preventing indefinite stalls. |
+| **Evidence Retention State Machine & Activation Gate** | Unrestricted / unconfigured default retention | Unconfigured retention periods leave key lifecycle undefined. The four-state configuration machine (`UNCONFIGURED` -> `CONFIGURED` -> `EXPIRED` / `LEGAL_HOLD`) enforces a hard production activation gate: no examination can be published or scheduled until college administration explicitly approves and signs an integer retention policy. |
 
 ---
 
@@ -1176,5 +1175,5 @@ The following policy and configuration items are flagged for institutional/colle
 4. **Descriptive Answer Upload Quotas:** Confirmation of provisional defaults (maximum 3 files, 5 MB per file, PDF/JPEG/PNG) or college-specific size/count limits.
 5. **Answer Script Data Retention Schedule:** Confirmation of the duration scripts are retained in active storage post-result publication before archival or purging (recommended: 6 to 12 months).
 6. **Grading & GPA Scale:** Raw component scores are implemented as the baseline; 10-point letter grade conversions (O, A+, A, etc.) and SGPA/CGPA formulas will be added upon confirmation of official GU tables.
-7. **Unsynchronized / Rejected Offline Answers Retention & Review Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts in shared college computer labs), configurable post-deadline evidence key retention window (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, recommended baseline 14–30 days), local diagnostic bundle retention periods, and formal college protocols for evaluating `AUDIT_RECOVERY_BUNDLE` appeal submissions.
+7. **Institutional Evidence Key Retention Approval & Activation Gate:** Confirmation of the institutional retention period (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, recommended baseline 14–30 days) by college administration. System strictly blocks examination publication and activation while unconfigured. Confirmation of administrative workstation sanitization schedules and student evidence export protocols prior to lab PC reboots.
 8. **Optional High-Entropy Offline Encryption Recovery Secret (Unresolved Design Decision):** Documenting the trade-off of generating an optional, separate high-entropy recovery secret (e.g., 128-bit random alphanumeric passphrase or base58 recovery token) printed or physically distributed by proctors to allow offline DEK unwrapping during total server outages. Due to substantial operational overhead in generating, securely distributing, proctor tracking, and managing lost secrets across thousands of candidates, this is NOT implemented by default; server-assisted key release remains the standard baseline.

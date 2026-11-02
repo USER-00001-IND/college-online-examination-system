@@ -1,7 +1,7 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-03 (Round 6 Revision)  
+**Last Updated:** 2026-11-03 (Round 7 Revision)  
 
 ---
 
@@ -10,7 +10,7 @@
 * **Current Active Chunk:** **CHUNK 01 — SYSTEM ARCHITECTURE**
 * **Project Phase:** Architecture & Specification
 * **Implementation Permission:** **NOT GRANTED** (Application initialization, dependencies, and code remain gated)
-* **Next Permitted Action:** User review and authorization of Chunk 01 Architecture Audit (Round 6 Revision)
+* **Next Permitted Action:** User review and authorization of Chunk 01 Architecture Audit (Round 7 Revision)
 
 ---
 
@@ -46,8 +46,9 @@
 4. **PIN Delivery Gate:** Explicit institutional configuration (`EXAM_PIN_DELIVERY_METHOD`), initialized as unconfigured; PIN issuance strictly gated until approved.
 5. **Roll Number Architecture:** Configurable pattern-based generator supporting college/GU conventions once finalized (template illustrative only).
 6. **PDF Engine:** Pure-Python `ReportLab` for zero-OS-dependency portable admit card generation.
-7. **Deadline Enforcement & Ingress Timestamping ($T_{\text{ingress}}$):** Unified $T_{\text{ingress}}$ terminology across all sections and diagrams; server-authoritative cutoff using high-precision Nginx `$msec` arrival timestamping (`X-Request-Arrival-Time`) unconditionally overwritten by reverse proxy; accepted strictly from configured `TRUSTED_PROXIES`; direct backend access prevented via Unix socket/firewall; mandatory fail-closed behavior on missing/invalid timestamps in production (HTTP 502 `INGRESS_TIMESTAMP_INVALID`); outermost WSGI middleware ingress fallback ($T_{\text{wsgi\_ingress}}$) restricted strictly to development/testing environments (`ALLOW_WSGI_TIMESTAMP_FALLBACK = True`); zero trust in client timestamps.
+7. **Deadline Enforcement, Ingress Timestamping ($T_{\text{ingress}}$) & Concurrency Protocol:** Unified $T_{\text{ingress}}$ terminology across all sections and diagrams; server-authoritative cutoff using high-precision Nginx `$msec` arrival timestamping (`X-Request-Arrival-Time`) unconditionally overwritten by reverse proxy; accepted strictly from configured `TRUSTED_PROXIES`; direct backend access prevented via Unix socket/firewall; mandatory fail-closed behavior on missing/invalid timestamps in production (HTTP 502 `INGRESS_TIMESTAMP_INVALID`); outermost WSGI middleware ingress fallback ($T_{\text{wsgi\_ingress}}$) restricted strictly to development/testing environments (`ALLOW_WSGI_TIMESTAMP_FALLBACK = True`). Race-free two-stage deadline finalization protocol: Ingress Queue Drain Window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$) + Redis cross-worker in-flight registry `exam:inflight:{attempt_id}` + 30s hard ceiling; universal row-lock acquisition order (`SELECT ... FOR UPDATE` on `ExamAttempt`); exhaustive 12-scenario concurrency analysis documented.
 8. **Encrypted Shared-Device Offline Cache & Dual-Track Key Recovery:** Web Crypto API `AES-256-GCM` encryption at rest in IndexedDB with 96-bit random IVs and AAD binding `(student_id, examination_id, attempt_id)`; ephemeral in-memory DEK; zero credentials or PINs stored locally as wrapping keys; Dual-Track key recovery separating Track A (Live Exam Recovery, active `IN_PROGRESS`, $T \le \text{deadline}$, write-enabled) from Track B (Post-Deadline Read-Only Evidence Recovery, finalized attempts within configurable `EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, strictly read-only); diagnostic recovery bundles (`AUDIT_RECOVERY_BUNDLE`) with SHA-256 integrity metadata and server HMACs; institutional kiosk and lab Deep Freeze reboot export rules documented.
-9. **Submission Lifecycle Reconciliation:** Explicit distinction between $T_{\text{ingress}}$ (`submitted_at`), $T_{\text{process}}$, and application transaction recording time `transaction_recorded_at` (persisted in `committed_at`); comprehensive handling of all 6 submission scenarios with exact HTTP response codes (200, 409, 410, 502); transactional row locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) to serialize concurrent autosaves and final submissions; idempotent duplicate submission processing.
-10. **XSS Defense-in-Depth:** Acknowledged `HttpOnly` scope (prevents raw cookie theft, but requires defense-in-depth via React JSX escaping, DOMPurify, strict CSP, and backend input validation).
-11. **Background Worker:** `Celery` + `Redis` for production batch operations (PDFs, emails, dead-letter supervision), with an abstracted service layer for test execution.
+9. **Evidence Retention State Machine & Hard Production Gate:** Formal 4-state operational machine (`UNCONFIGURED` -> `CONFIGURED` -> `EXPIRED` / `LEGAL_HOLD`); Hard production activation gate strictly blocking examination scheduling and activation while `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` remains `UNCONFIGURED`; institutional approval requirement (`IsCollegeSuperAdmin`); immutable snapshots captured on `Examination` and `ExamAttempt`; scheduled daily deletion (`purge_expired_evidence_keys`) with security audit logging; legal hold suspension mechanics for active grievance appeals.
+10. **Submission Lifecycle Reconciliation:** Explicit distinction between $T_{\text{ingress}}$ (`submitted_at`), $T_{\text{process}}$, and application transaction recording time `transaction_recorded_at` (persisted in `committed_at`); comprehensive handling of all 12 submission scenarios with exact HTTP response codes (200, 408, 409, 410, 502); transactional row locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) to serialize concurrent autosaves and final submissions; idempotent duplicate submission processing.
+11. **XSS Defense-in-Depth:** Acknowledged `HttpOnly` scope (prevents raw cookie theft, but requires defense-in-depth via React JSX escaping, DOMPurify, strict CSP, and backend input validation).
+12. **Background Worker:** `Celery` + `Redis` for production batch operations (PDFs, emails, dead-letter supervision), with an abstracted service layer for test execution.
