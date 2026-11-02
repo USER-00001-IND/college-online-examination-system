@@ -434,9 +434,9 @@ flowchart TD
    - If network reconnects *after* the official deadline, any answers cached offline cannot be accepted for write. The server rejects them with HTTP 410 (`EXAMINATION_CLOSED`), and the client marks them locally as `REJECTED_DEADLINE_EXCEEDED` (preserved in a diagnostic recovery bundle for administrative appeal, but never treated as synchronized). The attempt is closed based strictly on the valid answers received by the server on or before `end_time`.
 2. **Accidental Tab Close / System Restart:**
    - Student navigates back to exam URL.
-   - Backend recognizes active `ExamAttempt` (`status == IN_PROGRESS`); resumes existing attempt only if server time is $\le \text{end\_time}$.
-   - Countdown timer reflects remaining server time (no time lost, no timer reset).
-   - In-memory Data Encryption Key (DEK) is securely restored via authenticated server-assisted key release over TLS after verifying student identity, active attempt ownership, session token validity, and deadline compliance. (Note: Encrypted cached answers are temporarily inaccessible while the workstation remains completely offline until server re-authentication succeeds; no examination credentials or short PINs are stored locally as wrapping secrets). Previously saved answers load immediately into the UI.
+   - **During Active Exam Window (Server Time $\le \text{end\_time}$):** Backend recognizes active `ExamAttempt` (`status == IN_PROGRESS`). In-memory Data Encryption Key (DEK) is securely restored via **Live Examination Key Recovery** over TLS after verifying student identity, active attempt ownership, session token validity, and deadline compliance. Countdown timer reflects remaining server time; previously saved answers load immediately into the UI.
+   - **After Examination Deadline (Server Time $> \text{end\_time}$ or Finalized):** Attempt cannot be resumed for answering. The student can access the **Post-Deadline Read-Only Evidence Recovery** workflow to restore the DEK strictly in read-only mode, decrypt locally preserved unsynchronized answers, and export an `AUDIT_RECOVERY_BUNDLE` for formal grievance appeal.
+   - *(Note: Encrypted cached answers are temporarily inaccessible while the workstation remains completely offline until server re-authentication succeeds; no examination credentials or short PINs are stored locally as wrapping secrets).*
 3. **Deadline Reached & Strict Server-Authoritative Enforcement:**
    - The official examination deadline (`end_time`) is strictly server-authoritative and marks the absolute cutoff for answering questions.
    - Write requests (autosave updates and manual submissions) are accepted **only** when their authoritative ingress timestamp ($T_{\text{ingress}}$ evaluated via Nginx `$msec`, or fallback WSGI ingress in dev/test only) is $\le \text{official\_end\_time}$.
@@ -772,7 +772,9 @@ In college deployments, students frequently access online examinations from unma
   ```
 * **Binding via AAD:** Authenticated Additional Data binds candidate and attempt metadata to the ciphertext, preventing ciphertext-swapping attacks between questions or attempts.
 
-#### 13.3.4 Secure Key-Management Lifecycle (Authenticated Server-Assisted Key Recovery)
+#### 13.3.4 Dual-Track Key-Management Lifecycle (Live Examination vs. Post-Deadline Evidence Recovery)
+
+To resolve the tension between strict examination deadline enforcement and post-deadline grievance appeal rights, the architecture establishes a **Dual-Track Key-Management Lifecycle**. Key recovery is strictly partitioned into two distinct operations with separate authorization contracts, endpoints, and security guarantees.
 
 1. **Removal of Examination PIN as Local Encryption Secret:**
    - **NO Examination PIN, student password, or short credential is ever used to derive local encryption wrapping keys, nor is any wrapped DEK stored in IndexedDB.**
@@ -796,30 +798,63 @@ In college deployments, students frequently access online examinations from unma
    - The server stores the wrapped DEK in the `ExamAttempt.encrypted_cache_dek` database field.
    - At rest in the database, the DEK is cryptographically protected by the server key; in transit, it is protected by TLS 1.3.
 
-4. **Authorization Checks for Key Release:**
-   When a student reopens the exam after an accidental tab close, browser crash, or system restart, the client requests key restoration via `POST /api/attempts/{attemptId}/recover-cache-key/`:
-   The backend enforces strict authorization checks before releasing the DEK:
-   1. *Identity Verification:* Authenticated student account must match `attempt.student_id`.
-   2. *Attempt Ownership & State:* Attempt must exist and be in `IN_PROGRESS` status. If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`, key release is rejected (HTTP 403 `EXAM_ATTEMPT_FINALIZED`).
-   3. *Session & PIN Validity:* Active valid session token and verified examination PIN for the attempt.
-   4. *Deadline Boundary:* Server time must be $\le \text{official\_end\_time}$.
-   5. *Rate Limiting & Audit:* Strictly rate-limited (max 3 key-release requests per minute); each key release generates an audited event (`AuditLog: CACHE_KEY_RELEASED`).
-   Upon passing all checks, the backend decrypts the stored DEK and transmits it over TLS to the client, which imports it into volatile memory (`window.crypto.subtle.importKey`).
+4. **Track A: Live Examination Key Recovery (Resumption & Synchronization):**
+   - **Purpose:** Resume an active, in-progress examination and synchronize valid pending answers before the deadline.
+   - **Endpoint:** `POST /api/attempts/{attemptId}/recover-cache-key/`
+   - **Permission Class:** `LiveExamKeyRecoveryPermission`
+   - **Authorization Conditions (All Mandatory):**
+     1. *Student Identity:* Authenticated student account must match `attempt.student_id`.
+     2. *Attempt Status:* Attempt must be in active `IN_PROGRESS` status. If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`, live key release is rejected (HTTP 403 `EXAM_ATTEMPT_FINALIZED`).
+     3. *Session Authorization:* Valid, active `exam_session_token` and verified Examination PIN.
+     4. *Deadline Boundary:* Server-authoritative time must be $\le \text{official\_end\_time}$. If server time has passed the deadline, live key release is rejected (HTTP 410 `EXAMINATION_CLOSED`).
+     5. *Throttling & Audit:* Rate-limited to max 3 requests per minute; emits `AuditLog: LIVE_CACHE_KEY_RELEASED`.
+   - **Permitted Operations:**
+     - Unwraps and transmits DEK over TLS to client volatile memory.
+     - Client decrypts locally cached answers in IndexedDB.
+     - Resumes active live examination interface with countdown timer.
+     - Allows write operations (`PATCH /answers/`, `POST /submit/`) subject strictly to $T_{\text{ingress}} \le \text{official\_end\_time}$.
 
-5. **Lifecycle Behavior Across Session Boundaries:**
-   - *Logout / Tab Close:* The in-memory DEK is immediately zeroed and discarded. The encrypted records remain safely encrypted in IndexedDB.
-   - *Browser Restart:* In-memory DEK is absent. The client cannot read or decrypt the cached records until re-authenticating with the server.
-   - *Session Expiry:* Expired session tokens cannot fetch the DEK from the server.
-   - *Reauthentication:* Re-authenticating with the server restores the DEK over TLS into memory.
+5. **Track B: Post-Deadline Read-Only Evidence Recovery (Grievance & Audit):**
+   - **Purpose:** Allow a candidate (or grievance committee) to inspect and export preserved, unacknowledged local answers for a formal academic appeal after an examination has concluded.
+   - **Endpoint:** `POST /api/attempts/{attemptId}/recover-evidence-key/`
+   - **Permission Class:** `PostDeadlineEvidenceRecoveryPermission`
+   - **Authorization Conditions (All Mandatory):**
+     1. *Student Identity:* Authenticated student account must match original `attempt.student_id`.
+     2. *Finalized State:* Attempt status is finalized as `SUBMITTED` or `AUTO_CLOSED_DEADLINE`, OR server time has exceeded `official_end_time`.
+     3. *Re-authentication:* Re-authentication via student login credentials + Examination PIN verification (or institutional SSO/MFA).
+     4. *Retention Window Compliance:* Request must arrive within the authorized evidence retention window (`server_time <= finalized_at + EXAM_EVIDENCE_KEY_RETENTION_PERIOD`). If retention has expired, request is rejected (HTTP 410 `EVIDENCE_RETENTION_EXPIRED`).
+     5. *Throttling & Audit:* Strictly rate-limited to max 3 requests per 10 minutes; emits mandatory security audit event `AuditLog: EVIDENCE_KEY_RELEASED` logging candidate ID, attempt ID, client IP, and user-agent.
+     6. *Strict Non-Reactivation:* Authorization grants read-only evidence access **only**. It does NOT reactivate examination permissions.
+   - **Permitted Operations:**
+     - Transmits DEK over TLS to client volatile memory scoped strictly to the `ReadOnlyEvidenceView` component.
+     - Decrypts candidate's locally preserved IndexedDB records (`REJECTED_DEADLINE_EXCEEDED` and unacknowledged `SYNC_PENDING`).
+     - Generates and exports structured `AUDIT_RECOVERY_BUNDLE` (`audit_recovery_bundle_{attemptId}.json`).
+     - Displays original local answers in a read-only viewer with a persistent, non-dismissible banner: `⚠️ READ-ONLY EVIDENCE RECOVERY — EXAM CLOSED — NOT SUBMITTED`.
+   - **Strictly Prohibited Operations (Enforced at Backend API & DB Level):**
+     - Reopening the examination (`status` can NEVER transition back to `IN_PROGRESS`).
+     - Modifying submitted answers (all write endpoints `/answers/` reject with HTTP 403 `EXAM_ATTEMPT_FINALIZED`).
+     - Synchronizing rejected late answers as accepted responses.
+     - Altering the official scheduled deadline.
+     - Triggering automated regrading or altering published evaluation scores.
+     - Bypassing the formal college grievance review process.
+
+6. **Summary Comparison: Key Recovery Operations:**
+
+| Dimension | Track A: Live Exam Key Recovery | Track B: Post-Deadline Evidence Recovery |
+| :--- | :--- | :--- |
+| **Endpoint** | `POST /api/attempts/{id}/recover-cache-key/` | `POST /api/attempts/{id}/recover-evidence-key/` |
+| **Attempt Status Required** | `status == IN_PROGRESS` | `status IN [SUBMITTED, AUTO_CLOSED_DEADLINE]` or $T > \text{end}$ |
+| **Time Boundary** | Server time $\le \text{official\_end\_time}$ | Within `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` post-exam |
+| **Write APIs Enabled?** | Yes (subject to $T_{\text{ingress}} \le \text{official\_end\_time}$) | **No. Strictly Read-Only (HTTP 403 / 410 on writes)** |
+| **UI Mode** | Active Live Exam Palette & Timer | Watermarked Read-Only Evidence Viewer |
+| **Primary Output** | Synchronized exam answers | Exported `AUDIT_RECOVERY_BUNDLE` diagnostic archive |
+| **Audit Event** | `AuditLog: LIVE_CACHE_KEY_RELEASED` | `AuditLog: EVIDENCE_KEY_RELEASED` |
+
+7. **Lifecycle Behavior Across Session Boundaries:**
+   - *Logout / Tab Close:* In-memory DEK is immediately zeroed and discarded. Encrypted records remain safely encrypted in IndexedDB.
+   - *Browser Restart:* In-memory DEK is absent. The client cannot decrypt local storage until re-authenticating with the server under Track A (if on-time) or Track B (if finalized).
+   - *Session Expiry:* Expired session tokens cannot fetch the DEK under either track.
    - *Temporary Inaccessibility During Offline Disconnection:* **If a browser restart or tab closure occurs while the device is offline, encrypted cached answers are temporarily inaccessible until server connectivity is restored.** The client cannot decrypt the IndexedDB ciphertext without contacting the server for DEK release.
-
-6. **Key Loss, Failed Key Release, and Unrecoverable Ciphertext:**
-   - If the server is unreachable, session is invalid, or key release fails, ciphertext in IndexedDB remains intact and is **never silently deleted or overwritten**.
-   - The client transitions the local cache state to `LOCKED_KEY_UNAVAILABLE`.
-   - If keys are permanently lost (e.g. database corruption of wrapped DEK), the ciphertext cannot be decrypted; the client flags the records as `UNRECOVERABLE_CIPHERTEXT` and alerts the administrator.
-
-7. **Disposal & Finalization Cleanup:**
-   - Upon confirmed submission (`SUBMITTED`) or auto-close acknowledgement, the in-memory DEK is wiped from RAM, and all synchronized IndexedDB records are deleted.
 
 8. **Limits Against Same-Origin Scripts & Compromised Endpoints:**
    - Marking a Web Crypto key `extractable: false` prevents raw key export, but **does not protect against arbitrary scripts executing within the same origin**. An attacker executing script via XSS or a malicious extension can invoke `crypto.subtle.decrypt()` using the key handle. Robust XSS defenses (CSP, JSX escaping) remain essential.
@@ -829,13 +864,13 @@ In college deployments, students frequently access online examinations from unma
 
 When offline answers are transmitted after `official_end_time`, the server responds with HTTP 410 (`EXAMINATION_CLOSED`). The client **does not** claim these answers were synchronized, and updates their local status to `REJECTED_DEADLINE_EXCEEDED` alongside the server's rejection timestamp.
 
-The candidate or proctor can export a structured diagnostic bundle (`AUDIT_RECOVERY_BUNDLE`) for administrative appeal.
+The candidate or proctor can export a structured diagnostic bundle (`AUDIT_RECOVERY_BUNDLE`) using Track B Post-Deadline Evidence Recovery for administrative appeal.
 
 1. **Exact Bundle Specification:**
    An `AUDIT_RECOVERY_BUNDLE` is a structured JSON diagnostic archive containing two clearly separated sections:
    - **Client-Generated Diagnostic Evidence (Self-Reported / Untrusted):**
      - Client environment: Browser user-agent, OS platform, screen resolution, local system clock time at export.
-     - Local cache records: Question IDs, encrypted answer payloads (base64 ciphertext), random IVs, 128-bit AES-GCM authentication tags, client version sequence numbers, and client-recorded interaction timestamps (`client_recorded_at`).
+     - Local cache records: Question IDs, encrypted answer payloads (base64 ciphertext), decrypted plaintext drafts (for human committee review), random IVs, 128-bit AES-GCM authentication tags, client version sequence numbers, and client-recorded interaction timestamps (`client_recorded_at`).
      - Local network diagnostic log: Timestamps of failed autosave fetch attempts, connection errors, HTTP status codes (e.g. timeouts, HTTP 410), and client online/offline event transitions.
    - **Server-Generated Records & Linked Receipts (Authoritative / Trusted):**
      - Examination attempt metadata: `attempt_id`, `student_id`, `examination_id`, scheduled `start_time`, and `official_end_time`.
@@ -856,7 +891,47 @@ The candidate or proctor can export a structured diagnostic bundle (`AUDIT_RECOV
    - The committee compares server-side audit logs, network gateway logs, and pre-deadline synchronized sequence numbers against the bundle.
    - **Late-rejected answers are never silently or automatically treated as valid examination submissions.** Any acceptance or special evaluation requires a formal, recorded administrative committee resolution.
 
-#### 13.3.6 Residual Risks & Required Institutional Policies
+#### 13.3.6 Key Retention, Evidence Lifecycle, and Workstation Sanitization Policy
+
+1. **Server-Wrapped DEK Retention Window (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`):**
+   - Server-wrapped DEKs stored in `ExamAttempt.encrypted_cache_dek` are retained for a configurable institutional period following examination finalization.
+   - **Policy Setting:** Configurable via `EXAM_EVIDENCE_KEY_RETENTION_PERIOD`. Initialized as `UNCONFIGURED` (pending formal college confirmation; recommended baseline: 14 to 30 days post-finalization to accommodate statutory grievance filing periods).
+   - Once the retention window expires, a scheduled backend celery task (`purge_expired_evidence_keys`) cryptographically zeroes and deletes `encrypted_cache_dek` from the database record.
+
+2. **Encrypted Local Records Retention in Browser:**
+   - Encrypted records in IndexedDB persist across browser sessions under status `SYNC_PENDING`, `REJECTED_DEADLINE_EXCEEDED`, or `EXPIRED_STALE`.
+   - Configurable parameter `LOCAL_EVIDENCE_CACHE_MAX_AGE_DAYS` (recommended 30 days) prompts client-side cleanup of stale attempts.
+   - Synchronized answers are purged immediately upon confirmed submission or auto-close acknowledgement.
+
+3. **Key Deletion & Ciphertext Purging:**
+   - Once the server deletes `encrypted_cache_dek` post-retention, any remaining local ciphertext in IndexedDB becomes permanently unrecoverable (`PERMANENTLY_UNRECOVERABLE_KEY_PURGED`).
+   - The client UI transitions cache state to `KEY_PURGED_UNRECOVERABLE` and offers a manual cleanup button to remove orphaned ciphertext.
+
+4. **Device Switching & Browser Storage Clearing:**
+   - IndexedDB is strictly tied to the physical workstation and browser profile.
+   - If a candidate switches computers, clears browser cookies/storage, or uses a new browser profile, locally preserved unsynchronized answers are permanently lost.
+   - The database records on the server (`Answer` table) remain the sole authoritative record of on-time synchronized answers.
+
+5. **Distinguishing Synchronized Data from Unsynchronized Evidence:**
+   - *Synchronized Answers:* Committed in MySQL `Answer` records with server-authoritative timestamps, version sequences, and status `COMMITTED`.
+   - *Unsynchronized Evidence:* Exists exclusively in client-side IndexedDB with `sync_status = 'SYNC_PENDING'` or `'REJECTED_DEADLINE_EXCEEDED'`, tagged with self-reported `client_recorded_at`.
+
+6. **Evidence Export Acknowledgement & Audit:**
+   - Upon exporting `AUDIT_RECOVERY_BUNDLE`, the client computes the SHA-256 integrity hash of the export payload.
+   - The client transmits telemetry via `POST /api/attempts/{attemptId}/acknowledge-evidence-export/` with bundle hash and timestamp.
+   - Backend logs `AuditLog: EVIDENCE_BUNDLE_EXPORTED` with the SHA-256 hash, attempt ID, and timestamp, issuing a signed export receipt acknowledging submission.
+
+7. **Administrative Access Controls & Forensic Dual-Authorization:**
+   - College administrators, faculty, or grievance committee members CANNOT silently inspect or dump student local storage.
+   - Administrators only review evidence submitted by the candidate through the official grievance portal.
+   - If forensic scrutiny requires server-side DEK access to verify submitted ciphertext, access is gated by `IsExamGrievanceCommitteeRole`, requires dual-authorization (two committee members), and emits `AuditLog: ADMIN_EVIDENCE_DEK_ACCESS`.
+
+8. **Interaction with Institutional Workstation Sanitization (Lab Deep Freeze Warning):**
+   - Shared college computer labs frequently employ Deep Freeze, reboot-restore scripts, or ephemeral guest profiles that purge user data upon reboot or logout.
+   - **Operational Rule for Candidates:** If an examination disruption occurs on a shared college lab machine, the candidate **must perform Post-Deadline Evidence Recovery and export the `AUDIT_RECOVERY_BUNDLE` prior to rebooting or leaving the workstation**.
+   - If the computer reboots before export, local IndexedDB is wiped by OS sanitization scripts, rendering unacknowledged local evidence permanently unrecoverable. Proctors and lab administrators must be trained on this requirement.
+
+#### 13.3.7 Residual Risks & Required Institutional Policies
 - **Residual Risks on Unmanaged Devices:** Hardware keyloggers, screen recording malware, or root-level compromise on commercial cyber cafe machines cannot be fully mitigated by browser-level cryptography.
 - **Required Institutional Policies:**
   - High-stakes examinations should be conducted on college-controlled workstations configured in **Kiosk Mode** (locked down full-screen browser, disabled DevTools via Group Policy, extension installation blocked).
@@ -1088,7 +1163,7 @@ To defend against XSS and protect session integrity, the architecture enforces m
 | **Monolith vs Microservices**| Microservices | Microservices introduce distributed transaction risks and operational overhead inappropriate for a single college deployment. |
 | **Hashed Exam PINs** | Plaintext PINs in DB | If the database is compromised, plaintext PINs would allow unauthorized exam access. Hashing ensures zero-knowledge security. |
 | **Private File Storage** | Public S3 / Media root | Descriptive answer scripts and admit cards contain private student academic data; public URLs present severe privacy violations. |
-| **Encrypted Offline Cache (Web Crypto AES-GCM)** | Plaintext IndexedDB / localStorage | Plaintext browser storage fails the shared-device threat model. AES-256-GCM at rest protects answers against extraction via browser DevTools on shared workstations. In-memory DEK is zeroed on tab close/logout. Server-assisted key release over TLS enables secure recovery without exposing local PINs to offline dictionary attacks. |
+| **Encrypted Offline Cache & Dual-Track Key Recovery** | Plaintext IndexedDB / localStorage | Plaintext browser storage fails the shared-device threat model. AES-256-GCM at rest protects answers against extraction via browser DevTools on shared workstations. In-memory DEK is zeroed on tab close/logout. Dual-track key recovery separates active live exam resumption (Track A, server time $\le$ deadline, write-enabled) from post-deadline read-only evidence recovery (Track B, within configurable retention period, read-only). Zero credentials or PINs are stored locally as wrapping secrets. |
 
 ---
 
@@ -1101,5 +1176,5 @@ The following policy and configuration items are flagged for institutional/colle
 4. **Descriptive Answer Upload Quotas:** Confirmation of provisional defaults (maximum 3 files, 5 MB per file, PDF/JPEG/PNG) or college-specific size/count limits.
 5. **Answer Script Data Retention Schedule:** Confirmation of the duration scripts are retained in active storage post-result publication before archival or purging (recommended: 6 to 12 months).
 6. **Grading & GPA Scale:** Raw component scores are implemented as the baseline; 10-point letter grade conversions (O, A+, A, etc.) and SGPA/CGPA formulas will be added upon confirmation of official GU tables.
-7. **Unsynchronized / Rejected Offline Answers Retention & Review Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts in shared college computer labs), local diagnostic bundle retention periods, and formal college protocols for evaluating `AUDIT_RECOVERY_BUNDLE` appeal submissions.
+7. **Unsynchronized / Rejected Offline Answers Retention & Review Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts in shared college computer labs), configurable post-deadline evidence key retention window (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, recommended baseline 14–30 days), local diagnostic bundle retention periods, and formal college protocols for evaluating `AUDIT_RECOVERY_BUNDLE` appeal submissions.
 8. **Optional High-Entropy Offline Encryption Recovery Secret (Unresolved Design Decision):** Documenting the trade-off of generating an optional, separate high-entropy recovery secret (e.g., 128-bit random alphanumeric passphrase or base58 recovery token) printed or physically distributed by proctors to allow offline DEK unwrapping during total server outages. Due to substantial operational overhead in generating, securely distributing, proctor tracking, and managing lost secrets across thousands of candidates, this is NOT implemented by default; server-assisted key release remains the standard baseline.
