@@ -1,17 +1,72 @@
-# Chunk 02: Database Architecture Audit Report (Round 2 Revision)
+# Chunk 02: Database Architecture Audit Report (Round 3 Revision)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 2 Revision)  
+**Date:** 2026-11-03 (Round 3 Revision)  
 **Assigned Scope:** Chunk 02 — Database Architecture  
-**Status:** **PASS WITH WARNINGS** (Database schema design is complete, normalized to 3NF, fully auditable, and technically verified; documented non-blocking institutional policies are explicitly flagged for college confirmation).
+**Status:** **PASS WITH WARNINGS — Pending Independent Audit Review** (Database schema design is complete, normalized to 3NF, fully auditable, and technically verified; documented non-blocking institutional policies are explicitly flagged for college confirmation).
 
 ---
 
 ## 1. Scope Assigned vs. Completed
 
-* **Assigned Scope:**
-  - Revise the MySQL relational database schema specification to resolve six independent audit findings:
+### 1.1 Round 2 Audit Findings Resolution (Round 3 Corrections)
+The following four findings from the independent Round 2 audit have been formally resolved in [`docs/database-architecture.md`](../database-architecture.md):
+
+1. **Finding A (High — Resolved): Question-Paper Membership Integrity:**
+   - **Defect:** Prior composite foreign keys ensured that `attempts_answer.paper_question_mapping_id` matched `attempts_answer.question_id`, and `selected_option_id` belonged to `question_id`. However, they did not referentially bind the mapping to the specific `paper_version_id` assigned to the `attempts_exam_attempt`. A bug or malicious actor could potentially answer questions from an alternate paper version.
+   - **Resolution:**
+     - Denormalized `paper_version_id BIGINT NOT NULL` onto `attempts_answer`.
+     - Defined `UNIQUE KEY uk_mapping_id_pvid (id, paper_version_id)` on `questions_paper_question_mapping`.
+     - Defined `UNIQUE KEY uk_attempt_id_pvid (id, paper_version_id)` on `attempts_exam_attempt`.
+     - Added composite foreign key `CONSTRAINT fk_ans_attempt_paper FOREIGN KEY (attempt_id, paper_version_id) REFERENCES attempts_exam_attempt(id, paper_version_id) ON DELETE RESTRICT`.
+     - Added composite foreign key `CONSTRAINT fk_ans_map_paper FOREIGN KEY (paper_question_mapping_id, paper_version_id) REFERENCES questions_paper_question_mapping(id, paper_version_id) ON DELETE RESTRICT`.
+     - Preserved `fk_ans_map_q (paper_question_mapping_id, question_id)` and `fk_ans_opt_q (selected_option_id, question_id)`.
+     - **Mathematical Guarantee:** In MySQL InnoDB, an answer row cannot satisfy both `fk_ans_attempt_paper` and `fk_ans_map_paper` unless `paper_question_mapping.paper_version_id == attempts_exam_attempt.paper_version_id`.
+     - Documented the paper version immutability invariant on `attempts_exam_attempt`: once an attempt begins, `paper_version_id` cannot be modified (guaranteed by application state invariants and referentially blocked by foreign key constraints).
+     - Formally documented the 3NF denormalization trade-off in Section 3.2.
+
+2. **Finding B (High — Resolved): Separate Outbox Dispatch from Grading Execution:**
+   - **Defect:** Prior Transaction 9 conflated outbox event claiming, broker publication, MCQ score calculation, and marking outbox completion into a single database transaction. This contradicted Celery message queue architecture, at-least-once delivery semantics, worker acknowledgements, and crash recovery.
+   - **Resolution:**
+     - Formally partitioned the lifecycle into **three distinct operations**:
+       - **Operation 1 (Attempt Finalization Transaction — Tx 7 & 8):** Atomically finalizes the attempt (`status = 'SUBMITTED'` or `'AUTO_CLOSED_DEADLINE'`), writes `attempts_submission_receipt`, and inserts `evaluations_grading_outbox` record with `status = 'PENDING'`. Celery message publication is **strictly excluded** from this transaction.
+       - **Operation 2 (Outbox Dispatcher — Tx 9A):** Polls pending/retry outbox events using `SELECT ... FOR UPDATE SKIP LOCKED`, claims batches (`status = 'CLAIMED'`, sets `claimed_by`, `claimed_at`, `lease_expires_at = NOW(6) + 60s`), commits the claim transaction, pushes the task message to Celery Redis broker outside the DB transaction, and in a second short transaction records publication outcome (`status = 'PUBLISHED'`, `published_at = NOW(6)` or `status = 'RETRY_PENDING'` with exponential backoff).
+       - **Operation 3 (Celery Grading Worker — Tx 9B):** Dequeues task, acquires row lock on `attempts_exam_attempt` (`SELECT ... FOR UPDATE`), verifies finalized state, executes idempotency check (`is_mcq_evaluated == TRUE` skips grading as a no-op), calculates MCQ scores from immutable paper version mappings, persists scores to `attempts_answer` and `attempts_exam_attempt`, records audit log in `evaluations_mcq_evaluation_log`, updates outbox event `status = 'COMPLETED'`, `processed_at = NOW(6)`, commits transaction, and finally sends `basic_ack` to Redis broker.
+     - Documented that dispatcher locks ONLY `evaluations_grading_outbox`, while worker locks `attempts_exam_attempt` first then `evaluations_grading_outbox`, eliminating cross-transaction deadlocks.
+     - Expanded Section 4.3 to an exhaustive **16-scenario crash and recovery matrix** covering broker loss, lost acks, worker crashes, dispatcher crashes, concurrent dispatchers/workers, stale leases, and dead-letter queueing.
+
+3. **Finding C (Medium — Resolved): Answer Payload Mutual Exclusivity & Two-Tier Validation:**
+   - **Defect:** The prior constraint `chk_answer_payload` was tautological, accepting all four null/non-null permutations of `selected_option_id` and `answer_text`, and thus failing to validate answer payload structure.
+   - **Resolution:**
+     - Replaced with MySQL storage engine constraint:
+       ```sql
+       CONSTRAINT chk_answer_payload_exclusivity CHECK (
+           selected_option_id IS NULL OR answer_text IS NULL
+       )
+       ```
+     - **Engine Guarantee:** Forbids corrupted hybrid payloads containing both an MCQ option and descriptive text simultaneously.
+     - Supports valid unanswered drafts (`NULL, NULL`), MCQ selections (`opt, NULL`), and descriptive drafts (`NULL, text`).
+     - Established a clear **two-tier validation model**:
+       - **Tier 1 (MySQL Storage Engine):** Enforces mutual exclusivity (`selected_option_id IS NULL OR answer_text IS NULL`).
+       - **Tier 2 (Django Application Layer under Row Lock):** Validates incoming payload against `question.question_type`:
+         - If `MCQ`: rejects payloads containing `answer_text` (HTTP 422). Enforces `selected_option_id` foreign key. Forbids descriptive file uploads.
+         - If `DESCRIPTIVE`: rejects payloads containing `selected_option_id` (HTTP 422). Accepts typed text in `answer_text` and/or file attachments in `uploads_descriptive_upload`.
+         - Supports draft auto-saves, blank/cleared questions, and text + handwritten file uploads for descriptive answers.
+
+4. **Finding D (Low — Resolved): Corrected PIN Entropy Mathematical Formulation:**
+   - **Defect:** Section 5.1 contained a malformed string expression for the Shannon entropy of a 6-digit numeric PIN caused by backslash unescaping.
+   - **Resolution:**
+     - Formulated cleanly in standard Markdown and LaTeX:
+       $$10^6\text{ possible values.}$$
+       $$\text{Entropy} = \log_2(10^6) \approx 19.93\text{ bits}$$
+     - Reaffirmed the core architectural conclusion: salted hashing protects against precomputed rainbow tables, but cannot compensate for the low intrinsic entropy (~19.93 bits) of short numeric credentials against offline attacks on compromised database dumps. Preserved the 8-layer defense-in-depth model (temporal windows, progressive lockout, single-attempt invalidation, unconfigured delivery gate).
+
+---
+
+### 1.2 Previous Round Findings Matrix
+* **Assigned Scope from Earlier Rounds:**
+  - Revise the MySQL relational database schema specification to resolve initial independent audit findings:
     1. **Finding 1 (High — Resolved): Submission Receipt Timestamp Integrity:**
        - Defined distinct, unambiguous timestamp semantics on `attempts_submission_receipt`:
          - `submitted_at`: Nullable `DATETIME(6) NULL`, populated strictly for valid manual submissions ($T_{\text{ingress}}$).
@@ -121,13 +176,13 @@ The database architecture document contains **7 distinct Mermaid Entity Relation
 
 | # | Diagram Name | Location in `database-architecture.md` | Diagram Type |
 | :-: | :--- | :--- | :--- |
-| 1 | Domain ERD 1: Identity & Access Control | Section 6.1 (Lines 1473–1527) | `erDiagram` |
-| 2 | Domain ERD 2: Academic Structure & FYUGP | Section 6.2 (Lines 1531–1569) | `erDiagram` |
-| 3 | Domain ERD 3: Examination Setup & Eligibility | Section 6.3 (Lines 1573–1625) | `erDiagram` |
-| 4 | Domain ERD 4: Questions & Examination Attempts (Membership Integrity) | Section 6.4 (Lines 1629–1682) | `erDiagram` |
-| 5 | Domain ERD 5: Descriptive Uploads & Evaluation (Outbox Dispatch) | Section 6.5 (Lines 1686–1734) | `erDiagram` |
-| 6 | Domain ERD 6: Evidence Recovery, Security & Audit | Section 6.6 (Lines 1738–1781) | `erDiagram` |
-| 7 | Integrated System Relationship Overview | Section 6.7 (Lines 1785–1808) | `erDiagram` |
+| 1 | Domain ERD 1: Identity & Access Control | Section 6.1 (Lines 1571–1625) | `erDiagram` |
+| 2 | Domain ERD 2: Academic Structure & FYUGP | Section 6.2 (Lines 1629–1667) | `erDiagram` |
+| 3 | Domain ERD 3: Examination Setup & Eligibility | Section 6.3 (Lines 1671–1723) | `erDiagram` |
+| 4 | Domain ERD 4: Questions & Examination Attempts (Membership Integrity) | Section 6.4 (Lines 1727–1781) | `erDiagram` |
+| 5 | Domain ERD 5: Descriptive Uploads & Evaluation (Outbox Dispatch) | Section 6.5 (Lines 1785–1837) | `erDiagram` |
+| 6 | Domain ERD 6: Evidence Recovery, Security & Audit | Section 6.6 (Lines 1841–1884) | `erDiagram` |
+| 7 | Integrated System Relationship Overview | Section 6.7 (Lines 1888–1911) | `erDiagram` |
 
 ### 4.2 Validation Method
 * **Manual Review (Performed):** Complete manual structural and syntactic validation was conducted for all 7 diagrams against official Mermaid ER grammar specifications. Entity relationships, cardinality notations (`||--o{`, `||--||`, `||--o|`), attribute definitions, data types, and key indicators (`PK`, `FK`, `UK`) were verified for structural consistency with the schema dictionary.
@@ -177,8 +232,10 @@ The database architecture document contains **7 distinct Mermaid Entity Relation
      - `(examination_id, student_id, paper_offering_id)` on `eligibility_student_eligibility`.
      - `(examination_id, roll_number)` on `examinations_examination_roll_number`.
      - `(attempt_id, paper_question_mapping_id)` on `attempts_answer`.
-     - `(id, question_id)` on `questions_paper_question_mapping` (enables composite FK).
-     - `(id, question_id)` on `questions_question_option` (enables composite FK).
+     - `(id, paper_version_id)` on `questions_paper_question_mapping` (enables composite FK `fk_ans_map_paper`).
+     - `(id, question_id)` on `questions_paper_question_mapping` (enables composite FK `fk_ans_map_q`).
+     - `(id, question_id)` on `questions_question_option` (enables composite FK `fk_ans_opt_q`).
+     - `(id, paper_version_id)` on `attempts_exam_attempt` (enables composite FK `fk_ans_attempt_paper`).
      - `(examination_paper_id, student_id)` on `attempts_exam_attempt`.
      - `(event_id)` and `(idempotency_key)` on `evaluations_grading_outbox`.
    - B-tree indexes support high-throughput lookup paths:
@@ -195,8 +252,10 @@ The database architecture document contains **7 distinct Mermaid Entity Relation
    - Examination PINs: PBKDF2-SHA256 with random 32-byte per-credential salt (`pin_salt`). Plaintext PIN is never stored or exposed.
    - Session Tokens: SHA-256 hashed at rest; raw token issued only once to authenticated client.
 2. **PIN Threat Model & Entropy Reality:**
-   - Acknowledged that short numeric PINs have limited intrinsic entropy ($\sim 20$ bits).
-   - Mitigated via multi-layer controls: cryptographically secure random generation, configurable length/entropy, per-credential salts, tunable work factors, progressive lockout (5 failed attempts $ightarrow$ 15-minute lockout), temporal entry window, single-attempt invalidation, and unconfigured delivery gate.
+   - Acknowledged that short numeric PINs have limited intrinsic entropy:
+     $$10^6\text{ possible values, }\text{Entropy} = \log_2(10^6) \approx 19.93\text{ bits}$$
+   - Mitigated via multi-layer controls: cryptographically secure random generation (`secrets.SystemRandom`), configurable length/entropy (`EXAM_PIN_FORMAT`), per-credential 32-byte salts (`pin_salt`), tunable work factors (PBKDF2-SHA256 with 600,000 iterations), progressive lockout (5 failed attempts -> 15-minute lock), temporal entry window ($[T_{\text{start}} - 15\text{m}, T_{\text{start}} + \text{cutoff}]$), single-attempt invalidation, and unconfigured delivery gate.
+
 3. **Cryptographic Protection of Offline Evidence:**
    - Local answer drafts are protected at rest via AES-256-GCM.
    - The Data Encryption Key (DEK) is server-wrapped via AES-KeyWrap (RFC 3394) under Master KEK; zero plaintext DEKs are stored in MySQL.
@@ -238,9 +297,9 @@ The following items are documented as proposed baselines in the schema and flagg
 
 ## 10. Final Audit Status
 
-* **Status:** **PASS WITH WARNINGS**
-* **Gate Sign-off:** The database architecture specification is complete, normalized to 3NF, fully auditable, and satisfies all Chunk 00 and Chunk 01 requirements. The 52 relational entities, Transactional Outbox pattern, composite foreign key membership integrity, signed `BIGINT` compatibility, realistic PIN security model, and 7 Mermaid ER diagrams are technically verified. Documented non-blocking institutional policies are explicitly flagged for college confirmation.
-* **Stage Status Declaration:** **Chunk 02 is IN PROGRESS / IN REVIEW (Pending Independent Audit).**
+* **Status:** **PASS WITH WARNINGS (Round 3 Revision)**
+* **Gate Sign-off:** The database architecture specification is complete, normalized to 3NF with 6 formally justified denormalizations, fully auditable, and satisfies all Chunk 00, Chunk 01, and Chunk 02 requirements. The 52 relational entities, Transactional Outbox pattern with decoupled dispatcher and grading worker (16 recovery scenarios), question-paper membership integrity composite foreign keys, signed `BIGINT` compatibility, two-tier answer payload validation, realistic PIN security model, and 7 reconciled Mermaid ER diagrams are technically verified.
+* **Stage Status Declaration:** **Chunk 02 is IN REVIEW — PENDING INDEPENDENT AUDIT.**
 * **Next Permitted Chunk:** **CHUNK 03 — PROJECT INITIALIZATION** (gated; strictly awaiting independent audit review and explicit user approval).
 
 > **STOP:** All work for Chunk 02 documentation is complete. No application code, packages, Django models, or database tables have been generated. Awaiting independent review and user authorization before proceeding to Chunk 03.

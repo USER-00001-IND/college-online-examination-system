@@ -710,7 +710,7 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   - `UNIQUE (examination_paper_id, version_code)`
 
 #### Table 36: `questions_paper_question_mapping`
-* **Purpose:** Maps specific questions into a paper version with question numbering and sectioning.
+* **Purpose:** Maps specific questions into a paper version with question numbering, sectioning, and marks.
 * **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
@@ -720,14 +720,15 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
   | `question_number` | SMALLINT UNSIGNED| No | None | Display number (1, 2, 3...) |
   | `section_name` | VARCHAR(50) | No | 'Section A' | e.g. `Section A (MCQ)`, `Section B (Long Answer)` |
-  | `marks` | DECIMAL(5,2) | No | 1.00 | Allocated marks for this exam |
-  | `negative_marks` | DECIMAL(5,2) | No | 0.00 | Negative deduction for this exam |
+  | `marks` | DECIMAL(5,2) | No | 1.00 | Allocated marks for this question |
+  | `negative_marks` | DECIMAL(5,2) | No | 0.00 | Negative deduction for this question |
   | `is_mandatory` | BOOLEAN | No | TRUE | Mandatory answering requirement |
   | `display_order` | SMALLINT UNSIGNED| No | 1 | Sort order |
 * **Indexes & Constraints:**
   - `UNIQUE (paper_version_id, question_number)`
   - `UNIQUE (paper_version_id, question_id)`
-  - `UNIQUE KEY uk_mapping_id_qid (id, question_id)`: Enables composite foreign key reference from `attempts_answer`
+  - `UNIQUE KEY uk_mapping_id_pvid (id, paper_version_id)`: Enables composite foreign key reference from `attempts_answer` to enforce question-paper version membership.
+  - `UNIQUE KEY uk_mapping_id_qid (id, question_id)`: Enables composite foreign key reference from `attempts_answer` to enforce question membership.
 
 ---
 ### DOMAIN E: Examination Attempts, Answers & Concurrency
@@ -741,7 +742,7 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   | `id` | BIGINT | No | AUTO | Primary Key (Django `BigAutoField`) |
   | `examination_paper_id`| BIGINT | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
   | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `paper_version_id` | BIGINT | No | None | FK -> `questions_question_paper_version.id` (`ON DELETE RESTRICT`) |
+  | `paper_version_id` | BIGINT | No | None | FK -> `questions_question_paper_version.id` (`ON DELETE RESTRICT`). **Immutable once attempt begins.** |
   | `status` | VARCHAR(30) | No | 'IN_PROGRESS'| Enum: `IN_PROGRESS`, `SUBMITTED`, `AUTO_CLOSED_DEADLINE`, `ABANDONED`, `DISQUALIFIED` |
   | `submission_uuid` | VARCHAR(64) | Yes | NULL | Client-generated UUID4 for idempotent manual submissions (`UNIQUE`) |
   | `started_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Ingress timestamp of attempt start |
@@ -761,22 +762,25 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
 * **Indexes & Constraints:**
   - `UNIQUE (examination_paper_id, student_id)`
   - `UNIQUE (submission_uuid)`
+  - `UNIQUE KEY uk_attempt_id_pvid (id, paper_version_id)`: Enables composite foreign key reference from `attempts_answer` to enforce attempt paper version ownership.
   - `INDEX idx_attempt_concurrency (status, examination_paper_id)`
   - `INDEX idx_evidence_retention (evidence_key_expires_at, is_under_legal_hold, evidence_key_purged_at)`
+* **Immutability Invariant:** `paper_version_id` is assigned at attempt initialization and is strictly immutable thereafter. Modifying `paper_version_id` is prevented by application state invariants and referentially blocked by foreign key constraints from `attempts_answer`.
 * **Sensitive Classification:** `encrypted_cache_dek`. Plaintext DEK is never stored.
 
 #### Table 38: `attempts_answer`
-* **Purpose:** Persisted student answers with strictly enforced question and option membership integrity.
+* **Purpose:** Persisted student answers with strictly enforced question-paper, question, and option membership integrity.
 * **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
   | `id` | BIGINT | No | AUTO | Primary Key |
   | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `paper_version_id` | BIGINT | No | None | FK -> `questions_question_paper_version.id` (`ON DELETE RESTRICT`). Denormalized to enable composite FK verification. |
   | `paper_question_mapping_id`| BIGINT | No | None | FK -> `questions_paper_question_mapping.id` (`ON DELETE RESTRICT`) |
-  | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
-  | `selected_option_id`| BIGINT | Yes | NULL | FK -> `questions_question_option.id` (`ON DELETE RESTRICT`) |
-  | `answer_text` | MEDIUMTEXT | Yes | NULL | Typed descriptive draft/answer text |
+  | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`). Denormalized to enable composite FK verification. |
+  | `selected_option_id`| BIGINT | Yes | NULL | FK -> `questions_question_option.id` (`ON DELETE RESTRICT`). Nullable for descriptive or unanswered. |
+  | `answer_text` | MEDIUMTEXT | Yes | NULL | Typed descriptive draft/answer text. Nullable for MCQ or upload-only answers. |
   | `version_sequence` | INT UNSIGNED | No | 1 | Monotonic sequence counter (`WHERE seq < incoming_seq`) |
   | `ingress_timestamp`| DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Reverse-proxy $T_{\text{ingress}}$ of this update |
   | `is_evaluated` | BOOLEAN | No | FALSE | Evaluation completion flag |
@@ -786,9 +790,13 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   | `updated_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Last update timestamp |
 * **Indexes & Constraints:**
   - `UNIQUE KEY uk_attempt_mapping (attempt_id, paper_question_mapping_id)`: Exactly one answer per mapped question per attempt.
+  - `CONSTRAINT fk_ans_attempt_paper FOREIGN KEY (attempt_id, paper_version_id) REFERENCES attempts_exam_attempt(id, paper_version_id) ON DELETE RESTRICT`: **Enforces attempt ownership and binds the answer strictly to the attempt's assigned paper version.**
+  - `CONSTRAINT fk_ans_map_paper FOREIGN KEY (paper_question_mapping_id, paper_version_id) REFERENCES questions_paper_question_mapping(id, paper_version_id) ON DELETE RESTRICT`: **Enforces question-paper membership integrity: the mapped question MUST belong to the attempt's assigned paper version.**
   - `CONSTRAINT fk_ans_map_q FOREIGN KEY (paper_question_mapping_id, question_id) REFERENCES questions_paper_question_mapping(id, question_id) ON DELETE RESTRICT`: **Enforces that `question_id` matches the exact question mapped to `paper_question_mapping_id`**.
-  - `CONSTRAINT fk_ans_opt_q FOREIGN KEY (selected_option_id, question_id) REFERENCES questions_question_option(id, question_id) ON DELETE RESTRICT`: **Enforces that `selected_option_id` belongs to the exact `question_id` being answered**.
-  - `CONSTRAINT chk_answer_payload CHECK ((selected_option_id IS NOT NULL AND answer_text IS NULL) OR (selected_option_id IS NULL AND answer_text IS NOT NULL) OR (selected_option_id IS NOT NULL AND answer_text IS NOT NULL) OR (selected_option_id IS NULL AND answer_text IS NULL))`: Validates allowed answer modes.
+  - `CONSTRAINT fk_ans_opt_q FOREIGN KEY (selected_option_id, question_id) REFERENCES questions_question_option(id, question_id) ON DELETE RESTRICT`: **Enforces that `selected_option_id` belongs to the exact `question_id` being answered (when non-null)**.
+  - `CONSTRAINT chk_answer_payload_exclusivity CHECK (selected_option_id IS NULL OR answer_text IS NULL)`: **Enforces mutual exclusivity between MCQ option selection and descriptive typed text at the storage engine level.**
+  - `INDEX idx_answer_attempt_ver (attempt_id, version_sequence)`
+  - `INDEX idx_answer_paper_ver (paper_version_id)`
   - `INDEX idx_answer_eval (attempt_id, is_evaluated)`
 
 #### Table 39: `attempts_submission_receipt`
@@ -962,7 +970,7 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   | `error_message` | TEXT | Yes | NULL | Error diagnostics if failed |
 
 #### Table 47: `evaluations_grading_outbox`
-* **Purpose:** **Transactional Outbox Table**. Guarantees durable, atomic, and recoverable post-finalization grading dispatch, surviving process and network crashes.
+* **Purpose:** **Transactional Outbox Table**. Decouples attempt finalization from Celery message broker publication and asynchronous grading worker execution, guaranteeing at-least-once durable dispatch intent surviving process, network, and broker failures.
 * **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
@@ -973,19 +981,21 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
   | `event_type` | VARCHAR(50) | No | 'EVALUATE_MCQ_ATTEMPT'| Event classification code |
   | `payload_json` | JSON | No | None | Serialized attempt metadata, paper version, and student ID |
   | `idempotency_key` | VARCHAR(128) | No | None | Deterministic key `attempt_{attempt_id}_mcq_grading` (`UNIQUE`) |
-  | `status` | VARCHAR(20) | No | 'PENDING' | Enum: `PENDING`, `DISPATCHED`, `COMPLETED`, `FAILED`, `DEAD_LETTER` |
+  | `status` | VARCHAR(20) | No | 'PENDING' | Enum: `PENDING`, `CLAIMED`, `PUBLISHED`, `PROCESSING`, `COMPLETED`, `RETRY_PENDING`, `FAILED`, `DEAD_LETTER` |
   | `retry_count` | TINYINT | No | 0 | Number of dispatch/execution attempts |
   | `max_retries` | TINYINT | No | 5 | Maximum retry attempts before transitioning to `DEAD_LETTER` |
   | `next_retry_at` | DATETIME(6) | Yes | NULL | Timestamp for exponential backoff retry |
-  | `claimed_by` | VARCHAR(100) | Yes | NULL | Hostname / Worker ID that claimed this event |
-  | `claimed_at` | DATETIME(6) | Yes | NULL | Timestamp when claimed |
-  | `last_error` | TEXT | Yes | NULL | Stack trace / error message from failed dispatch |
+  | `claimed_by` | VARCHAR(100) | Yes | NULL | Hostname / Worker ID of dispatcher claiming event |
+  | `claimed_at` | DATETIME(6) | Yes | NULL | Timestamp when claimed by dispatcher |
+  | `lease_expires_at` | DATETIME(6) | Yes | NULL | Dispatcher lease expiry timestamp (`claimed_at + 60s`) for crash recovery |
+  | `published_at` | DATETIME(6) | Yes | NULL | Timestamp when Celery broker successfully confirmed message enqueue |
+  | `last_error` | TEXT | Yes | NULL | Stack trace / error message from failed dispatch or execution |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Creation timestamp (inserted inside finalization transaction) |
-  | `processed_at` | DATETIME(6) | Yes | NULL | Completion timestamp |
+  | `processed_at` | DATETIME(6) | Yes | NULL | Completion timestamp when Celery worker committed grades |
 * **Indexes & Constraints:**
   - `UNIQUE (event_id)`
   - `UNIQUE (idempotency_key)`
-  - `INDEX idx_outbox_claim (status, next_retry_at, created_at)`
+  - `INDEX idx_outbox_claim (status, next_retry_at, lease_expires_at, created_at)`
   - `INDEX idx_outbox_attempt (attempt_id)`
 
 #### Table 48: `results_student_paper_result`
@@ -1117,24 +1127,30 @@ The schema is partitioned into nine cohesive domain modules comprising **52 rela
    - Transitive dependencies are removed across core academic entities. Student profiles link to programmes, programmes link to colleges, eliminating redundant institutional names.
 
 ### 3.2 Explicitly Justified Denormalizations
-To balance pure theoretical relational normalization with real-world database engine constraints, historical immutability, and sub-millisecond live examination query performance, five specific denormalizations are introduced with formal architectural justification:
+To balance pure theoretical relational normalization with real-world database engine constraints, historical immutability, and sub-millisecond live examination query performance, six specific denormalizations are introduced with formal architectural justification:
 
-1. **`attempts_answer.question_id` (Composite Foreign Key Trade-Off):**
-   - *Normalization Status:* Denormalized. `question_id` is already functionally determined by `paper_question_mapping_id` (since each mapping row uniquely points to a specific `question_id`).
-   - *Architectural Justification:* MySQL InnoDB requires all columns in a foreign key reference to exist directly on the referencing table. Storing `question_id` alongside `paper_question_mapping_id` on `attempts_answer` enables two vital composite foreign keys:
+1. **`attempts_answer.paper_version_id` (Composite Foreign Key Trade-Off for Question-Paper Version Membership):**
+   - *Normalization Status:* Denormalized transitive dependency. `paper_version_id` is functionally determined both by `attempt_id` (via `attempts_exam_attempt.paper_version_id`) and by `paper_question_mapping_id` (via `questions_paper_question_mapping.paper_version_id`).
+   - *Architectural Justification:* MySQL InnoDB requires all referenced columns in a foreign key constraint to exist directly on the referencing table. Storing `paper_version_id` directly on `attempts_answer` enables two essential composite foreign keys:
+     - `FOREIGN KEY (attempt_id, paper_version_id) REFERENCES attempts_exam_attempt(id, paper_version_id)`
+     - `FOREIGN KEY (paper_question_mapping_id, paper_version_id) REFERENCES questions_paper_question_mapping(id, paper_version_id)`
+   - *Engine-Level Guarantee:* This denormalization mechanically forces `paper_question_mapping_id` to belong to the exact `paper_version_id` assigned to the candidate's attempt. It is mathematically impossible in MySQL InnoDB for an answer to reference a question mapping from a different paper version.
+2. **`attempts_answer.question_id` (Composite Foreign Key Trade-Off for Option Membership):**
+   - *Normalization Status:* Denormalized. `question_id` is functionally determined by `paper_question_mapping_id` (since each mapping row uniquely points to a specific `question_id`).
+   - *Architectural Justification:* Storing `question_id` alongside `paper_question_mapping_id` on `attempts_answer` enables two critical composite foreign keys:
      - `FOREIGN KEY (paper_question_mapping_id, question_id) REFERENCES questions_paper_question_mapping(id, question_id)`
      - `FOREIGN KEY (selected_option_id, question_id) REFERENCES questions_question_option(id, question_id)`
-   - Without this intentional denormalization, MySQL could not physically prevent a student from submitting an option belonging to Question 5 as the answer to Question 10. The 3NF trade-off is strictly justified to achieve hardware-level integrity enforcement.
-2. **`attempts_submission_receipt.receipt_payload_json`:**
+   - *Engine-Level Guarantee:* Physically prevents cross-question option corruption (e.g. submitting Option B of Question 5 as the answer to Question 10) at the MySQL storage engine level.
+3. **`attempts_submission_receipt.receipt_payload_json`:**
    - *Normalization Status:* Denormalized JSON snapshot.
    - *Architectural Justification:* Provides an immutable, self-contained snapshot of student submission state accompanied by a cryptographic HMAC. Normalizing this would require querying across 10 tables years later; if questions or options are subsequently edited in the question bank, historical legal proof of what the candidate submitted would be corrupted.
-3. **`results_student_paper_result` (`marks_internal`, `marks_external_mcq`, `total_marks_obtained`):**
+4. **`results_student_paper_result` (`marks_internal`, `marks_external_mcq`, `total_marks_obtained`):**
    - *Normalization Status:* Denormalized aggregate marks.
    - *Architectural Justification:* Final approved grades must remain permanently frozen once published. Deriving scores on-the-fly via real-time sums across thousands of individual answer rows introduces vulnerability to retroactive edits and severe performance degradation on student grade sheet generation.
-4. **`eligibility_student_eligibility` (`attendance_percentage` snapshot):**
+5. **`eligibility_student_eligibility` (`attendance_percentage` snapshot):**
    - *Normalization Status:* Denormalized attendance snapshot.
    - *Architectural Justification:* Freezes candidate attendance and enrollment eligibility at the moment examination admit cards are locked, isolating examination eligibility from post-hoc changes in college attendance registers.
-5. **`examinations_examination.evidence_key_retention_days`:**
+6. **`examinations_examination.evidence_key_retention_days`:**
    - *Normalization Status:* Denormalized configuration snapshot.
    - *Architectural Justification:* Captures an immutable snapshot of the institutional retention policy at examination scheduling time, ensuring that future college policy modifications never retroactively alter the retention lifecycle of past examination attempts.
 
@@ -1244,7 +1260,7 @@ The application and database layers enforce a **comprehensive deadlock handling 
   - Commit transaction.
 
 #### Transaction 6: Autosave with Membership Integrity & Monotonic Sequence Enforcement
-* **Trigger:** Student inputs answer in browser (`PATCH /api/attempts/{id}/answers/`).
+* **Trigger:** Student inputs or updates an answer in browser (`PATCH /api/attempts/{id}/answers/`).
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
   1. `SELECT * FROM attempts_exam_attempt WHERE id = :attempt_id FOR UPDATE`
@@ -1252,26 +1268,36 @@ The application and database layers enforce a **comprehensive deadlock handling 
   - **Verify Dual Conditions:**
     - Verify ingress timestamp: $T_{\text{ingress}} \le \text{official\_end\_time}$.
     - Verify attempt status: `status == 'IN_PROGRESS'`.
-  - **Application Verification:**
-    - Verify `paper_question_mapping.paper_version_id == attempt.paper_version_id`.
-  - If verified:
+  - **Two-Tier Answer Payload Validation:**
+    - **Tier 1 (MySQL Storage Engine):** `chk_answer_payload_exclusivity` enforces that `selected_option_id` and `answer_text` cannot both be non-null. Unanswered drafts (`NULL, NULL`), MCQ selections (`opt, NULL`), and descriptive drafts (`NULL, text`) are accepted.
+    - **Tier 2 (Django Application Layer under Row Lock):**
+      - Inspect `question.question_type`:
+        - If `question_type == 'MCQ'`: rejects payloads with `answer_text` (HTTP 422). If `selected_option_id` is supplied, validates option belongs to question (referentially enforced by `fk_ans_opt_q`).
+        - If `question_type == 'DESCRIPTIVE'`: rejects payloads with `selected_option_id` (HTTP 422). Accepts `answer_text` (typed answer). File uploads are managed via `uploads_descriptive_upload`.
+  - **Execute Atomic Upsert with Full Membership Integrity:**
     ```sql
     INSERT INTO attempts_answer 
-      (attempt_id, paper_question_mapping_id, question_id, selected_option_id, answer_text, version_sequence, ingress_timestamp)
+      (attempt_id, paper_version_id, paper_question_mapping_id, question_id, 
+       selected_option_id, answer_text, version_sequence, ingress_timestamp)
     VALUES 
-      (:attempt_id, :mapping_id, :qid, :opt_id, :text, :seq, :T_ingress)
+      (:attempt_id, :attempt_paper_version_id, :mapping_id, :qid, 
+       :opt_id, :text, :seq, :T_ingress)
     ON DUPLICATE KEY UPDATE
       selected_option_id = IF(version_sequence < VALUES(version_sequence), VALUES(selected_option_id), selected_option_id),
       answer_text = IF(version_sequence < VALUES(version_sequence), VALUES(answer_text), answer_text),
       ingress_timestamp = IF(version_sequence < VALUES(version_sequence), VALUES(ingress_timestamp), ingress_timestamp),
       version_sequence = IF(version_sequence < VALUES(version_sequence), VALUES(version_sequence), version_sequence);
     ```
-  - Note: Composite foreign keys physically verify that `:qid` matches `:mapping_id` and `:opt_id` belongs to `:qid`.
+  - **Hardware Engine Invariants Verified:**
+    - `fk_ans_attempt_paper`: Verifies `(:attempt_id, :attempt_paper_version_id)` matches `attempts_exam_attempt(id, paper_version_id)`.
+    - `fk_ans_map_paper`: Verifies `(:mapping_id, :attempt_paper_version_id)` matches `questions_paper_question_mapping(id, paper_version_id)`. **An answer for a question mapping from a different paper version is physically rejected by MySQL.**
+    - `fk_ans_map_q`: Verifies `(:mapping_id, :qid)` matches `questions_paper_question_mapping(id, question_id)`.
+    - `fk_ans_opt_q`: Verifies `(:opt_id, :qid)` matches `questions_question_option(id, question_id)`.
   - Commit transaction and release row lock.
   - Return HTTP 200 `{ status: "SAVED", sequence: :seq }`.
   - If attempt already finalized: rollback and return HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`).
 
-#### Transaction 7: Manual Submission with Idempotency & Outbox Event Insertion
+#### Transaction 7: Manual Submission with Idempotency & Outbox Event Insertion (Operation 1: Finalization)
 * **Trigger:** Student clicks "Submit Examination" (`POST /api/attempts/{id}/submit/`).
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1287,8 +1313,8 @@ The application and database layers enforce a **comprehensive deadlock handling 
     SET status = 'SUBMITTED',
         submission_uuid = :incoming_uuid,
         submitted_at = :T_ingress,
-        committed_at = NOW(),
-        evidence_key_expires_at = DATE_ADD(NOW(), INTERVAL :retention_days DAY)
+        committed_at = NOW(6),
+        evidence_key_expires_at = DATE_ADD(NOW(6), INTERVAL :retention_days DAY)
     WHERE id = :attempt_id;
     ```
   - Insert signed `attempts_submission_receipt` (`submitted_at = :T_ingress`, `submission_uuid = :incoming_uuid`, `closed_at = NULL`).
@@ -1297,12 +1323,14 @@ The application and database layers enforce a **comprehensive deadlock handling 
     INSERT INTO evaluations_grading_outbox 
       (event_id, attempt_id, event_type, payload_json, idempotency_key, status, created_at)
     VALUES 
-      (:uuid4, :attempt_id, 'EVALUATE_MCQ_ATTEMPT', :payload_json, CONCAT('attempt_', :attempt_id, '_mcq_grading'), 'PENDING', NOW());
+      (:uuid4, :attempt_id, 'EVALUATE_MCQ_ATTEMPT', :payload_json, 
+       CONCAT('attempt_', :attempt_id, '_mcq_grading'), 'PENDING', NOW(6));
     ```
   - Commit transaction and release row lock.
+  - **Notice:** Celery message publication is **NOT** executed inside this transaction.
   - Return HTTP 200 with signed receipt.
 
-#### Transaction 8: Deadline Supervisor Finalization & Outbox Insertion
+#### Transaction 8: Deadline Supervisor Finalization & Outbox Insertion (Operation 1: Finalization)
 * **Trigger:** Celery beat worker checks expired examination papers.
 * **Isolation Level:** `READ COMMITTED`
 * **Wait Boundary:** Strictly executes only when $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$ (15s).
@@ -1314,8 +1342,8 @@ The application and database layers enforce a **comprehensive deadlock handling 
     UPDATE attempts_exam_attempt 
     SET status = 'AUTO_CLOSED_DEADLINE',
         closed_at = :official_end_time,
-        committed_at = NOW(),
-        evidence_key_expires_at = DATE_ADD(NOW(), INTERVAL :retention_days DAY)
+        committed_at = NOW(6),
+        evidence_key_expires_at = DATE_ADD(NOW(6), INTERVAL :retention_days DAY)
     WHERE id = :attempt_id;
     ```
     - Insert `attempts_submission_receipt` (`submitted_at = NULL`, `submission_uuid = NULL`, `official_end_time = :official_end_time`, `closed_at = :official_end_time`).
@@ -1324,25 +1352,88 @@ The application and database layers enforce a **comprehensive deadlock handling 
       INSERT INTO evaluations_grading_outbox 
         (event_id, attempt_id, event_type, payload_json, idempotency_key, status, created_at)
       VALUES 
-        (:uuid4, :attempt_id, 'EVALUATE_MCQ_ATTEMPT', :payload_json, CONCAT('attempt_', :attempt_id, '_mcq_grading'), 'PENDING', NOW());
+        (:uuid4, :attempt_id, 'EVALUATE_MCQ_ATTEMPT', :payload_json, 
+         CONCAT('attempt_', :attempt_id, '_mcq_grading'), 'PENDING', NOW(6));
       ```
     - Commit transaction and release row lock.
+    - **Notice:** Celery message publication is **NOT** executed inside this transaction.
   - If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`: rollback / release lock (idempotent no-op).
 
-#### Transaction 9: Outbox Dispatcher & Idempotent MCQ Evaluation
-* **Trigger:** Outbox dispatcher process polling `evaluations_grading_outbox`.
+#### Transaction 9A: Outbox Dispatcher Claiming & Celery Broker Publication (Operation 2: Outbox Dispatcher)
+* **Trigger:** Dedicated background dispatcher process running on polling schedule (every 1 second) or triggered by post-commit signal.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
-  1. `SELECT * FROM evaluations_grading_outbox WHERE status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= NOW()) ORDER BY created_at ASC LIMIT 10 FOR UPDATE SKIP LOCKED`
-  2. `SELECT * FROM attempts_exam_attempt WHERE id = :attempt_id FOR UPDATE`
-* **Operations:**
-  - Mark outbox event `status = 'DISPATCHED'`, `claimed_by = :worker_id`, `claimed_at = NOW()`.
-  - Check attempt `is_mcq_evaluated`: if TRUE, update outbox `status = 'COMPLETED'` and exit.
-  - Compute scores by comparing `attempts_answer.selected_option_id` against `questions_question_option.is_correct`.
-  - Update `attempts_exam_attempt` set `total_score_mcq = :total_mcq`, `is_mcq_evaluated = TRUE`.
-  - Insert audit record into `evaluations_mcq_evaluation_log`.
-  - Update outbox event set `status = 'COMPLETED'`, `processed_at = NOW()`.
-  - Commit transaction and release row locks.
+  1. `SELECT * FROM evaluations_grading_outbox WHERE (status IN ('PENDING', 'RETRY_PENDING') AND (next_retry_at IS NULL OR next_retry_at <= NOW(6))) OR (status = 'CLAIMED' AND lease_expires_at <= NOW(6)) ORDER BY created_at ASC LIMIT 50 FOR UPDATE SKIP LOCKED`
+* **Operations (Step-by-Step):**
+  1. **Claim Outbox Batch:** For each acquired row, update status to `CLAIMED`, record dispatcher identity, and grant a 60-second lease:
+     ```sql
+     UPDATE evaluations_grading_outbox 
+     SET status = 'CLAIMED',
+         claimed_by = :dispatcher_node_id,
+         claimed_at = NOW(6),
+         lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND)
+     WHERE id = :outbox_id;
+     ```
+  2. **Commit Claim Transaction:** The claim transaction commits immediately, releasing row locks on the outbox table.
+  3. **Publish to Celery Broker (Outside DB Transaction):**
+     - Dispatcher pushes message to Celery queue (`queue='grading_queue'`) with payload `{ "event_id": :event_id, "attempt_id": :attempt_id }`.
+  4. **Record Publication Outcome (New Short DB Transaction):**
+     - If broker enqueue succeeds:
+       ```sql
+       UPDATE evaluations_grading_outbox 
+       SET status = 'PUBLISHED',
+           published_at = NOW(6)
+       WHERE id = :outbox_id;
+       ```
+     - If broker enqueue fails (network error, Redis down):
+       ```sql
+       UPDATE evaluations_grading_outbox 
+       SET status = IF(retry_count + 1 >= max_retries, 'DEAD_LETTER', 'RETRY_PENDING'),
+           retry_count = retry_count + 1,
+           next_retry_at = DATE_ADD(NOW(6), INTERVAL LEAST(300, POW(2, retry_count) * 5) SECOND),
+           last_error = :exception_traceback
+       WHERE id = :outbox_id;
+       ```
+  - **Guarantees:** Broker publication never implies grading completion. Crashes between claiming and publication are recovered automatically when `lease_expires_at` lapses.
+
+#### Transaction 9B: Celery Grading Worker Idempotent MCQ Evaluation (Operation 3: Celery Grading Worker)
+* **Trigger:** Celery worker dequeues task `{ "event_id": :event_id, "attempt_id": :attempt_id }` from `grading_queue`.
+* **Isolation Level:** `READ COMMITTED`
+* **Locking Order (Global Lock Hierarchy):**
+  1. `SELECT * FROM attempts_exam_attempt WHERE id = :attempt_id FOR UPDATE`
+  2. `SELECT * FROM evaluations_grading_outbox WHERE event_id = :event_id FOR UPDATE`
+* **Operations (Step-by-Step):**
+  1. **Attempt Validation & Idempotency Check:**
+     - Verify attempt status is finalized (`SUBMITTED` or `AUTO_CLOSED_DEADLINE`). If not finalized, log warning and reject.
+     - Check `is_mcq_evaluated`:
+       - If `is_mcq_evaluated == TRUE`: MCQ grading has already completed (duplicate delivery). Skip grading calculation, update outbox `status = 'COMPLETED'`, `processed_at = NOW(6)`, commit transaction, and acknowledge message.
+  2. **Calculate MCQ Marks:**
+     - Query answers, paper mappings, and question options:
+       ```sql
+       SELECT a.id, a.selected_option_id, m.marks, m.negative_marks, o.is_correct
+       FROM attempts_answer a
+       JOIN questions_paper_question_mapping m ON a.paper_question_mapping_id = m.id
+       LEFT JOIN questions_question_option o ON a.selected_option_id = o.id
+       WHERE a.attempt_id = :attempt_id AND o.id IS NOT NULL;
+       ```
+     - Compute awarded marks for each question:
+       - If `o.is_correct == TRUE`: `marks`
+       - If `o.is_correct == FALSE`: `-1 * negative_marks`
+       - If unanswered: `0.00`
+  3. **Persist Scores & Audit Logs:**
+     - Update each `attempts_answer` row with `awarded_marks = :score, is_evaluated = TRUE`.
+     - Update `attempts_exam_attempt` set `total_score_mcq = :total_mcq, is_mcq_evaluated = TRUE`.
+     - Insert detailed audit row into `evaluations_mcq_evaluation_log`.
+  4. **Update Outbox Status to COMPLETED:**
+     ```sql
+     UPDATE evaluations_grading_outbox 
+     SET status = 'COMPLETED',
+         processed_at = NOW(6)
+     WHERE event_id = :event_id;
+     ```
+  5. **Commit Database Transaction:** Commits all score updates and outbox status atomically.
+  6. **Acknowledge Celery Message:** Send Celery `basic_ack` to Redis broker.
+  - **Deadlock Immunity:** Lock hierarchy acquires `attempts_exam_attempt` before `evaluations_grading_outbox`. Since dispatcher (Tx 9A) never accesses `attempts_exam_attempt`, cross-transaction deadlocks between dispatcher and grading worker are structurally impossible.
 
 #### Transaction 10: Faculty Descriptive Grading
 * **Trigger:** Faculty evaluator submits score for descriptive question.
@@ -1397,24 +1488,28 @@ The application and database layers enforce a **comprehensive deadlock handling 
 
 ---
 
-### 4.3 Transactional Outbox Failure Scenario Analysis (12 Scenarios)
+### 4.3 Transactional Outbox Failure Scenario Analysis (16 Scenarios)
 
-The Transactional Outbox pattern guarantees **at-least-once durable dispatch intent**. All downstream grading logic is strictly idempotent:
+The Transactional Outbox pattern guarantees **at-least-once durable dispatch intent**. Downstream grading worker execution is strictly idempotent. The system handles all 16 failure scenarios without data loss, stranded events, or score duplication:
 
 | # | Failure Scenario | Failure Timing & System State | Recovery Mechanism & Invariant Preserved |
 | :-: | :--- | :--- | :--- |
-| **1** | **Crash before commit** | Web worker crashes during submission transaction before MySQL commit. | MySQL detects connection loss and rolls back attempt status, receipt, and outbox event cleanly. Client retries with identical UUID; zero orphaned state. |
-| **2** | **Crash immediately after commit** | Worker crashes after MySQL transaction commits but before responding to client. | Attempt status is durably `SUBMITTED`, receipt exists, and outbox event is persisted. Outbox dispatcher picks up event on schedule. Client retry receives cached receipt (HTTP 200). |
-| **3** | **Crash before Celery publication** | Outbox dispatcher claims event (`SKIP LOCKED`), marks `DISPATCHED`, then dies before pushing task to broker. | Periodic outbox reconciliation beat worker detects events in `DISPATCHED` state older than 5 minutes with no running task, and resets status to `PENDING` with retry increment. |
-| **4** | **Crash after publication before ack** | Celery task enqueued, but dispatcher crashes before updating outbox event status. | Celery worker executes grading idempotently (`is_mcq_evaluated = TRUE`). Reconciliation worker detects attempt is evaluated and updates outbox status to `COMPLETED`. |
-| **5** | **Duplicate event delivery** | Network hiccup causes outbox dispatcher to deliver duplicate task messages to queue. | Both tasks carry identical `idempotency_key`. Celery worker acquires lock on `attempts_exam_attempt`. First task grades; second task sees `is_mcq_evaluated == TRUE` and exits cleanly. |
-| **6** | **Duplicate Celery task execution** | Celery broker redelivers message due to worker ACK timeout. | Row lock `SELECT ... FOR UPDATE` on `attempts_exam_attempt` serializes execution. Second execution detects `is_mcq_evaluated == TRUE` and skips score calculation. Zero score alteration. |
-| **7** | **Worker crash during grading** | Worker crashes (OOM / SIGKILL) mid-calculation during MCQ evaluation. | Active MySQL transaction rolls back automatically. Attempt `is_mcq_evaluated` remains `FALSE`. Outbox dispatcher observes pending event and retries with backoff. |
-| **8** | **MySQL temporarily unavailable** | Transient database deadlock, timeout, or connection drop during finalization. | Submission transaction rolls back and returns HTTP 503. Local client cache safely retains answers in IndexedDB (`SYNC_PENDING`) and retries. |
-| **9** | **Redis/Celery broker unavailable** | Redis broker is offline or unreachable when attempt is finalized. | Finalization commits cleanly because outbox record is stored in MySQL. Outbox events accumulate safely in MySQL in `PENDING` state and drain automatically once Redis recovers. |
-| **10** | **Dispatcher restart** | Dispatcher daemon restarted during normal maintenance. | Stateless dispatcher resumes querying `evaluations_grading_outbox WHERE status = 'PENDING'` ordered by `created_at`. Zero event loss. |
-| **11** | **Multiple concurrent dispatchers** | Multiple dispatcher processes execute across clustered application servers. | MySQL 8.0 `SELECT ... FOR UPDATE SKIP LOCKED` allows workers to concurrently claim distinct batches of outbox events with zero lock contention or duplicate claims. |
-| **12** | **Permanently failing grading tasks** | Buggy question data or corrupted attempt answers cause grading task to raise repeated exceptions. | Outbox retry counter increments up to `max_retries` (5). Upon exceeding threshold, event transitions to `DEAD_LETTER`, emits high-severity alert to admin monitor, and leaves attempt inspectable for manual intervention. |
+| **1** | **Crash before finalization commit** | Web worker or supervisor crashes during manual submission or auto-close transaction before MySQL `COMMIT`. | MySQL detects client disconnect and rolls back attempt status, receipt, and outbox event cleanly. Attempt remains `IN_PROGRESS`. Client retries with identical UUID; zero orphaned state. |
+| **2** | **Crash immediately after finalization commit** | Worker crashes after MySQL transaction commits but before responding to client or notifying dispatcher. | Attempt is durably `SUBMITTED`/`AUTO_CLOSED_DEADLINE`, receipt exists, and outbox event is persisted (`status = 'PENDING'`). Outbox dispatcher discovers event on next poll. Client retry receives cached receipt (HTTP 200). |
+| **3** | **Dispatcher crash before event claim** | Dispatcher crashes while querying pending events. | Zero rows were locked or modified. Outbox event remains `status = 'PENDING'`. Another dispatcher instance or restarted dispatcher claims the event on next polling interval. |
+| **4** | **Dispatcher crash after claim but before publication** | Dispatcher marks event `CLAIMED` (`lease_expires_at = NOW() + 60s`), commits claim, but crashes before sending message to Celery Redis broker. | Reconciliation supervisor queries `evaluations_grading_outbox WHERE status = 'CLAIMED' AND lease_expires_at <= NOW()`. Resets status to `RETRY_PENDING`, increments `retry_count`, and sets `next_retry_at = NOW()`. Event is re-claimed. |
+| **5** | **Broker accepts message but ack is lost** | Dispatcher publishes task to Redis, Redis accepts it, but network drop prevents Redis confirmation reaching dispatcher. | Dispatcher catches timeout, treats as transient failure, increments `retry_count`, and sets status to `RETRY_PENDING`. Dispatcher subsequently re-publishes. Duplicate Celery message is processed idempotently by worker. |
+| **6** | **Dispatcher crash after publication but before status update** | Message successfully enqueued in Redis, but dispatcher crashes before updating outbox status to `PUBLISHED`. | Event remains `CLAIMED` in MySQL. Celery worker dequeues task, locks attempt, executes grading, and updates outbox to `COMPLETED`. When supervisor inspects lease, event is already `COMPLETED` (no action needed). |
+| **7** | **Duplicate publication** | Event is published twice due to network retries or dispatcher lease expiry race. | Both Celery messages contain identical `event_id` and `attempt_id`. First worker grades and sets `is_mcq_evaluated = TRUE`. Second worker acquires attempt lock, detects `is_mcq_evaluated == TRUE`, skips grading, and sends Celery `basic_ack`. Zero score alteration. |
+| **8** | **Worker crash before grading** | Celery worker dequeues task from Redis, but crashes before opening MySQL transaction or acquiring attempt lock. | Celery tasks use `acks_late=True`. Because worker crashed before sending ACK, Redis broker detects lost worker and redelivers message to another active Celery worker. |
+| **9** | **Worker crash during grading** | Worker crashes (OOM, SIGKILL, network drop) mid-calculation during MCQ evaluation. | MySQL rolls back active uncommitted transaction automatically, releasing row locks. `attempts_exam_attempt.is_mcq_evaluated` remains `FALSE`. Because no Celery ACK was sent, Celery redelivers task to surviving worker. |
+| **10** | **Worker crash after grading commit but before broker ack** | Worker commits score updates, marks outbox `COMPLETED`, but crashes before transmitting `basic_ack` to Redis. | Broker redelivers task. New worker acquires row lock on `attempts_exam_attempt`, detects `is_mcq_evaluated = TRUE` and outbox `status = 'COMPLETED'`, skips calculation, immediately sends `basic_ack`, and terminates cleanly. |
+| **11** | **Redis/Celery broker outage** | Redis broker is completely offline when dispatcher attempts to publish. | Dispatcher catches broker connection error, increments `retry_count`, sets `status = 'RETRY_PENDING'`, and computes exponential backoff $T_{\text{next}} = \text{NOW}() + \min(300, 2^{\text{retry}} \times 5)\text{s}$. Outbox events accumulate safely in MySQL and drain automatically once Redis recovers. |
+| **12** | **MySQL outage** | MySQL primary instance experiences network partition or failover. | Both dispatchers and Celery workers fail closed without data loss. Dispatchers back off; Celery workers reject and requeue unacknowledged tasks (`reject_on_worker_lost=True`). Once MySQL primary recovers, dispatchers resume polling and workers resume execution. |
+| **13** | **Multiple concurrent dispatchers** | Multiple dispatcher processes execute across clustered application servers. | MySQL 8.0 `SELECT ... FOR UPDATE SKIP LOCKED` on `evaluations_grading_outbox` partitions pending events across dispatchers with zero lock contention, zero waiting, and zero duplicate claims. |
+| **14** | **Multiple workers processing same event** | Two Celery workers simultaneously dequeue tasks for the same attempt. | Concurrency is serialized strictly by the database row lock `SELECT * FROM attempts_exam_attempt WHERE id = :attempt_id FOR UPDATE`. Worker 1 acquires lock and grades; Worker 2 blocks, then upon acquiring lock sees `is_mcq_evaluated = TRUE` and exits cleanly. |
+| **15** | **Stale claimed or published events** | Dispatcher died permanently or message was lost in Redis due to unpersisted memory restart. | Reconciliation supervisor runs every 5 minutes: resets expired `CLAIMED` events (`lease_expires_at <= NOW()`), and checks `PUBLISHED` events older than 15 minutes where `attempts_exam_attempt.is_mcq_evaluated = FALSE`, resetting them to `RETRY_PENDING` for re-dispatch. |
+| **16** | **Permanently failing grading events** | Corrupted data or software bug causes grading worker to throw unhandled exceptions repeatedly. | Outbox retry counter increments up to `max_retries` (default 5). Upon exceeding threshold, event transitions to `DEAD_LETTER`, writes traceback to `last_error`, logs high-severity audit event in `audit_system_audit_log`, and leaves attempt inspectable for manual administrator intervention. |
 
 ---
 ## 5. Security, Cryptography & Retention Architecture
@@ -1434,9 +1529,12 @@ The Transactional Outbox pattern guarantees **at-least-once durable dispatch int
 ```
 
 ### 5.1 Realistic Examination PIN Security & Entropy Limitations
-A standard 6-digit numeric examination PIN possesses only $10^6$ combinations ($pprox 20$ bits of entropy). Even when hashed using salted PBKDF2-SHA256 or Argon2, $10^6$ candidate values can be evaluated within minutes on modern GPU hardware if a raw database dump is compromised.
+A standard 6-digit numeric examination PIN possesses exactly $10^6$ possible values.
+The Shannon entropy is calculated as:
+$$\text{Entropy} = \log_2(10^6) \approx 19.93\text{ bits}$$
+Even when hashed using salted PBKDF2-SHA256 or Argon2id, $10^6$ candidate values can be evaluated within minutes on modern GPU hardware if a raw database dump is compromised.
 
-**The architecture explicitly rejects the false claim that hashing alone makes short PINs immune to offline recovery.** Instead, it enforces a **defense-in-depth security model**:
+**The architecture explicitly rejects the false claim that hashing alone makes short PINs immune to offline recovery.** Salted hashing with 32-byte per-credential salts prevents precomputed rainbow tables, but it cannot compensate for the low intrinsic entropy ($\log_2(10^6) \approx 19.93$ bits) of short numeric credentials against targeted offline attacks. Instead, the architecture enforces a **defense-in-depth security model**:
 1. **Cryptographically Secure Random Generation:** PINs are generated using Python's `secrets` module (backed by `/dev/urandom`), ensuring maximum uniform entropy.
 2. **Configurable PIN Format & Entropy:** Institutional administrators can configure PIN format via `academics_institutional_config` (e.g. 6-digit numeric, 8-character alphanumeric, or base58 strings) to meet institutional risk appetites.
 3. **Per-Credential Random Salts:** Every PIN credential record in `pins_examination_pin` possesses a unique, random 32-byte cryptographic salt (`pin_salt`), completely defeating precomputed rainbow tables and multi-target attacks.
@@ -1638,16 +1736,16 @@ erDiagram
     STUDENTS_STUDENT_PROFILE ||--o{ ATTEMPTS_EXAM_ATTEMPT : "undertakes"
     QUESTIONS_QUESTION_PAPER_VERSION ||--o{ ATTEMPTS_EXAM_ATTEMPT : "assigned version"
 
-    ATTEMPTS_EXAM_ATTEMPT ||--o{ ATTEMPTS_ANSWER : "contains"
-    QUESTIONS_PAPER_QUESTION_MAPPING ||--o{ ATTEMPTS_ANSWER : "answers mapped question"
-    QUESTIONS_QUESTION ||--o{ ATTEMPTS_ANSWER : "answers question"
-    QUESTIONS_QUESTION_OPTION ||--o{ ATTEMPTS_ANSWER : "selects option"
+    ATTEMPTS_EXAM_ATTEMPT ||--o{ ATTEMPTS_ANSWER : "enforces attempt paper_version"
+    QUESTIONS_PAPER_QUESTION_MAPPING ||--o{ ATTEMPTS_ANSWER : "enforces mapping paper_version and question"
+    QUESTIONS_QUESTION_OPTION ||--o{ ATTEMPTS_ANSWER : "enforces option question"
     ATTEMPTS_EXAM_ATTEMPT ||--o| ATTEMPTS_SUBMISSION_RECEIPT : "produces"
 
     ATTEMPTS_EXAM_ATTEMPT {
         bigint id PK
         bigint examination_paper_id FK
         bigint student_id FK
+        bigint paper_version_id FK
         string status
         string submission_uuid UK
         datetime submitted_at
@@ -1660,6 +1758,7 @@ erDiagram
     ATTEMPTS_ANSWER {
         bigint id PK
         bigint attempt_id FK
+        bigint paper_version_id FK
         bigint paper_question_mapping_id FK
         bigint question_id FK
         bigint selected_option_id FK
@@ -1718,6 +1817,10 @@ erDiagram
         string status
         tinyint retry_count
         datetime next_retry_at
+        string claimed_by
+        datetime lease_expires_at
+        datetime published_at
+        datetime processed_at
     }
     RESULTS_STUDENT_PAPER_RESULT {
         bigint id PK
