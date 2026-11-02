@@ -1,7 +1,7 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-03  
+**Last Updated:** 2026-11-03 (Round 4 Revision)  
 
 ---
 
@@ -10,7 +10,7 @@
 * **Current Active Chunk:** **CHUNK 01 — SYSTEM ARCHITECTURE**
 * **Project Phase:** Architecture & Specification
 * **Implementation Permission:** **NOT GRANTED** (Application initialization, dependencies, and code remain gated)
-* **Next Permitted Action:** User review and authorization of Chunk 01 Architecture Audit
+* **Next Permitted Action:** User review and authorization of Chunk 01 Architecture Audit (Round 4 Revision)
 
 ---
 
@@ -46,7 +46,8 @@
 4. **PIN Delivery Gate:** Explicit institutional configuration (`EXAM_PIN_DELIVERY_METHOD`), initialized as unconfigured; PIN issuance strictly gated until approved.
 5. **Roll Number Architecture:** Configurable pattern-based generator supporting college/GU conventions once finalized (template illustrative only).
 6. **PDF Engine:** Pure-Python `ReportLab` for zero-OS-dependency portable admit card generation.
-7. **Deadline Enforcement:** Server-authoritative cutoff using high-precision Nginx `$msec` arrival timestamping (`X-Request-Arrival-Time`) overwritten by reverse proxy; accepted strictly from configured trusted proxy IPs; outermost WSGI middleware ingress fallback with documented conservative delay trade-off; zero trust in client timestamps.
-8. **Offline Cache Lifecycle:** Scoped storage keys (`exam_cache_*`); zero credential storage; unsynchronized answers never silently deleted before server acknowledgement; logout preserves unsynced data with shared-device isolation; recovery bundles (`AUDIT_RECOVERY_BUNDLE`) for appeal; rejected late answers marked `REJECTED_DEADLINE_EXCEEDED`; synchronized answers purged on confirmed submission.
-9. **XSS Defense-in-Depth:** Acknowledged `HttpOnly` scope (prevents raw cookie theft, but requires defense-in-depth via React JSX escaping, DOMPurify, strict CSP, and backend input validation).
-10. **Background Worker:** `Celery` + `Redis` for production batch operations (PDFs, emails, dead-letter supervision), with an abstracted service layer for test execution.
+7. **Deadline Enforcement & Ingress Timestamping ($T_{\text{ingress}}$):** Unified $T_{\text{ingress}}$ terminology across all sections and diagrams; server-authoritative cutoff using high-precision Nginx `$msec` arrival timestamping (`X-Request-Arrival-Time`) unconditionally overwritten by reverse proxy; accepted strictly from configured `TRUSTED_PROXIES`; direct backend access prevented via Unix socket/firewall; outermost WSGI middleware ingress fallback ($T_{\text{wsgi\_ingress}}$) with documented conservative latency trade-off; zero trust in client timestamps.
+8. **Encrypted Shared-Device Offline Cache:** Web Crypto API `AES-256-GCM` encryption at rest in IndexedDB with 96-bit random IVs and AAD binding `(student_id, examination_id, attempt_id)`; ephemeral in-memory DEK; dual-tier unwrapping (server-assisted release vs. candidate PIN-derived KEK via PBKDF2 600,000 iterations); zero credential storage; unsynchronized answers never silently deleted before server acknowledgement; recovery bundles (`AUDIT_RECOVERY_BUNDLE`) for appeal; rejected late answers marked `REJECTED_DEADLINE_EXCEEDED`; synchronized answers purged on confirmed submission; institutional kiosk wipe policies documented.
+9. **Submission Lifecycle Reconciliation:** Explicit distinction between $T_{\text{ingress}}$ (`submitted_at`), $T_{\text{process}}$, and $T_{\text{commit}}$ (`committed_at`); comprehensive handling of all 6 submission scenarios with exact HTTP response codes (200, 409, 410); transactional row locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) to serialize concurrent autosaves and final submissions; idempotent duplicate submission processing.
+10. **XSS Defense-in-Depth:** Acknowledged `HttpOnly` scope (prevents raw cookie theft, but requires defense-in-depth via React JSX escaping, DOMPurify, strict CSP, and backend input validation).
+11. **Background Worker:** `Celery` + `Redis` for production batch operations (PDFs, emails, dead-letter supervision), with an abstracted service layer for test execution.
