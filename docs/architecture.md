@@ -441,7 +441,8 @@ flowchart TD
    - The official examination deadline (`end_time`) is strictly server-authoritative and marks the absolute cutoff for answering questions.
    - Write requests (autosave updates and manual submissions) are accepted **only** when their authoritative ingress timestamp ($T_{\text{ingress}}$ evaluated via Nginx `$msec`, or fallback WSGI ingress in dev/test only) is $\le \text{official\_end\_time}$.
    - Requests first received after `end_time` are rejected for write, regardless of any client-side claims or offline timestamps.
-   - **Bounded-Processing Consistency Protocol (Option B):** Internal transport latency between reverse-proxy receipt and WSGI application completion is governed by a bounded processing window (Ingress Queue Drain Window $\Delta_{\text{drain}} = 15\text{s}$). The background deadline supervisor worker will not initiate finalization until $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$, giving on-time requests 15 seconds to traverse socket backlogs and achieve application admission.
+   - **Zero Premature Finalization by Late Requests:** A rejected late request (autosave or manual submission arriving with $T_{\text{ingress}} > \text{official\_end\_time}$) **never** transitions an attempt to `AUTO_CLOSED_DEADLINE` and **never** triggers MCQ evaluation. The attempt status remains unchanged (`IN_PROGRESS`), preserving processing eligibility for any earlier on-time requests still queued in socket backlogs.
+   - **Authoritative Deadline Auto-Closure Protocol:** Deadline finalization is performed strictly by the background deadline supervisor worker (`evaluate_examination_deadline_closure`) after the bounded processing drain window has elapsed ($\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$, where $\Delta_{\text{drain}} = 15\text{s}$). A valid on-time manual submission may independently transition the attempt to `SUBMITTED` under its own row-lock transaction.
    - All write operations and deadline finalization serialize strictly on the database row lock (`SELECT ... FOR UPDATE` on `ExamAttempt`). Requests admitted before finalization commit cleanly (HTTP 200). If extreme queueing delays admission past finalization, the request is rejected with HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`), and the payload is preserved in the client's local recovery bundle (`AUDIT_RECOVERY_BUNDLE`) for grievance appeal.
    - Once finalized, attempt status transitions to `AUTO_CLOSED_DEADLINE` (or `SUBMITTED`), with `submitted_at = T_ingress` for on-time submissions and `closed_at = official_end_time` for deadline auto-closures, while recording `transaction_recorded_at` during the database transaction. All subsequent write APIs strictly reject modifications (HTTP 410).
 4. **Email Delivery Failure:**
@@ -734,8 +735,11 @@ flowchart LR
      - If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`: releases lock and exits idempotently.
   4. **Bounded Exception & Grievance Fallback:**
      If extreme server queueing, worker contention, or network stall delays an on-time request past $\text{official\_end\_time} + \Delta_{\text{drain}}$ such that the supervisor has already committed `AUTO_CLOSED_DEADLINE`, the request is rejected with HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`). The answer payload is preserved in the candidate's local encrypted IndexedDB storage as `REJECTED_DEADLINE_EXCEEDED` inside the `AUDIT_RECOVERY_BUNDLE` for formal grievance appeal via Track B.
-  5. **Late Ingress Rejection:**
-     Any request whose perimeter ingress timestamp is $> \text{official\_end\_time}$ is **strictly rejected** immediately with HTTP 410 (`EXAMINATION_CLOSED`), regardless of server load or drain windows. The drain window **never** extends answering time for late requests.
+  5. **Late Ingress Rejection & Zero Premature Finalization:**
+     Any request whose perimeter ingress timestamp is $> \text{official\_end\_time}$ is **strictly rejected** immediately with HTTP 410 (`EXAMINATION_CLOSED` for autosaves, `MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED` for manual submissions), regardless of server load or drain windows. The drain window **never** extends answering time for late requests.
+     - **Authoritative Finalization Isolation:** A rejected late request **never** transitions an attempt to `AUTO_CLOSED_DEADLINE` and **never** triggers MCQ evaluation.
+     - The attempt status remains unchanged (`IN_PROGRESS`), preserving processing eligibility for any earlier on-time requests still traversing socket backlogs.
+     - Only the background deadline supervisor worker, following the 15-second drain interval ($\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$), performs authoritative deadline auto-closure.
 
 ### 13.2 Autosave Strategy & Monotonic Sequence Versioning
 
@@ -983,14 +987,22 @@ Admission and finalization are coordinated **strictly through MySQL InnoDB ACID 
      - If `status == SUBMITTED`: reject with **HTTP 409 (Conflict)** `{ error: "ATTEMPT_ALREADY_FINALIZED" }`.
      - If `status == AUTO_CLOSED_DEADLINE`: reject with **HTTP 410 (Gone)** `{ error: "WRITE_REJECTED_FINALIZATION_COMPLETED" }`.
    - **Manual Submission Request:**
-     - If `status == IN_PROGRESS` and $T_{\text{ingress}} \le \text{official\_end\_time}$: transition `status = SUBMITTED`, `submitted_at = T_ingress`, `committed_at = transaction_recorded_at`, commit transaction, release lock. Trigger asynchronous MCQ evaluation. Return **HTTP 200 (OK)** with signed submission receipt.
-     - If `status == SUBMITTED` and `submission_uuid == attempt.submission_uuid`: return cached submission receipt (**HTTP 200 OK**, idempotent retry).
-     - If `status == AUTO_CLOSED_DEADLINE`: reject with **HTTP 410 (Gone)** `{ error: "MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED" }`.
+     - **On-Time Submission ($T_{\text{ingress}} \le \text{official\_end\_time}$):**
+       - If `status == IN_PROGRESS`: transition `status = SUBMITTED`, `submitted_at = T_ingress`, `committed_at = transaction_recorded_at`, commit transaction, release lock. Post-commit: trigger asynchronous, idempotent MCQ evaluation (`evaluate_mcq_attempt.delay()`). Return **HTTP 200 (OK)** with signed submission receipt.
+       - If `status == SUBMITTED` and `submission_uuid == attempt.submission_uuid`: return cached submission receipt (**HTTP 200 OK**, idempotent retry with original `submitted_at`).
+       - If `status == SUBMITTED` and `submission_uuid != attempt.submission_uuid`: reject with **HTTP 409 (Conflict)** `{ error: "ATTEMPT_ALREADY_FINALIZED" }`.
+       - If `status == AUTO_CLOSED_DEADLINE`: reject with **HTTP 410 (Gone)** `{ error: "WRITE_REJECTED_FINALIZATION_COMPLETED" }` (bounded-processing exception: on-time ingress delayed in socket backlog until supervisor finalized). Local payload preserved in `AUDIT_RECOVERY_BUNDLE`.
+     - **Late Submission ($T_{\text{ingress}} > \text{official\_end\_time}$):**
+       - Evaluated against current attempt status without altering lifecycle state:
+         - **Case A (Attempt remains `IN_PROGRESS`):** Reject write payload immediately with **HTTP 410 (Gone)** `{ error: "MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED" }`. **Crucial Rule:** The late submission **does NOT** transition the attempt to `AUTO_CLOSED_DEADLINE` and **does NOT** trigger MCQ grading. Attempt status remains unchanged (`IN_PROGRESS`); earlier on-time autosaves or submissions in socket backlogs remain eligible for processing. Finalization is deferred strictly to the background deadline supervisor after the drain interval ($\text{official\_end\_time} + \Delta_{\text{drain}}$).
+         - **Case B (Attempt already `AUTO_CLOSED_DEADLINE`):** Reject with **HTTP 410 (Gone)** `{ error: "MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED", finalized_at: closed_at }`. Zero state alteration or duplicate grading.
+         - **Case C (Attempt already `SUBMITTED`):** If `submission_uuid == attempt.submission_uuid`, return cached original submission receipt (**HTTP 200 OK**, idempotent retry of earlier on-time submission). If `submission_uuid != attempt.submission_uuid`, reject with **HTTP 409 (Conflict)** `{ error: "ATTEMPT_ALREADY_FINALIZED" }`. The existing submission timestamp and receipt remain untouched.
+         - **Case D (Concurrent earlier on-time request queued):** The late submission is rejected immediately. Any earlier on-time autosave or submission queued in upstream buffers proceeds according to standard bounded-processing consistency without premature closure.
    - **Deadline Supervisor Worker:**
      - Waits until $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$ (15s).
-     - Acquires row lock: if `status == IN_PROGRESS`, transitions `status = AUTO_CLOSED_DEADLINE`, `closed_at = official_end_time`, `committed_at = transaction_recorded_at`, commits transaction, release lock. Triggers asynchronous MCQ evaluation.
+     - Acquires row lock: if `status == IN_PROGRESS`, transitions `status = AUTO_CLOSED_DEADLINE`, `closed_at = official_end_time`, `committed_at = transaction_recorded_at`, commits transaction, releases lock. Post-commit: triggers asynchronous, idempotent MCQ evaluation (`evaluate_mcq_attempt.delay()`).
      - If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`, releases lock and exits idempotently.
-3. **MCQ Grading Execution:** Evaluates strictly after the final transactional state has committed to MySQL, ensuring grading runs on the frozen answer snapshot.
+3. **MCQ Grading Execution:** Evaluates strictly after the final transactional state has committed to MySQL, ensuring grading runs on the frozen answer snapshot. Duplicate grading task dispatches are handled idempotently via row locks on `EvaluationResult` or transactional `is_evaluated` flag checks.
 
 #### 13.4.3 Scenario-by-Scenario Concurrency Analysis (16 Scenarios)
 
@@ -1001,7 +1013,7 @@ Admission and finalization are coordinated **strictly through MySQL InnoDB ACID 
 | **3** | **On-time request still queued after processing window** | $T_{\text{ingress}} \le \text{end}$; extreme queueing delays admission past $\text{end} + \Delta_{\text{drain}}$. | Supervisor has already acquired lock, transitioned attempt to `AUTO_CLOSED_DEADLINE`, and committed. Request acquires lock next, sees `AUTO_CLOSED_DEADLINE`. | **HTTP 410 (Gone)**<br>`{ error: "WRITE_REJECTED_FINALIZATION_COMPLETED" }`<br>Preserved locally in `AUDIT_RECOVERY_BUNDLE` for grievance appeal. |
 | **4** | **Late autosave** | $T_{\text{ingress}} > \text{end}$. | Evaluated immediately at ingress middleware; rejected before touching attempt state. | **HTTP 410 (Gone)**<br>`{ error: "EXAMINATION_CLOSED" }`<br>Zero late data committed. |
 | **5** | **On-time manual submission** | $T_{\text{ingress}} \le \text{end}$; admitted within processing window while `status == IN_PROGRESS`. | Acquires row lock, marks `status = SUBMITTED`, `submitted_at = T_ingress`, `committed_at = transaction_recorded_at`, commits, enqueues MCQ grading. | **HTTP 200 (OK)**<br>Signed submission receipt returned with immutable $T_{\text{ingress}}$. |
-| **6** | **Late manual submission** | $T_{\text{ingress}} > \text{end}$. | Submission rejected for late arrival. Atomic transaction transitions attempt to `AUTO_CLOSED_DEADLINE` (if open) with `closed_at = official_end_time`. | **HTTP 410 (Gone)**<br>`{ error: "MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED" }`<br>Auto-closure receipt returned; pre-deadline answers graded. |
+| **6** | **Late manual submission** | $T_{\text{ingress}} > \text{end}$. | Evaluated against attempt status without altering lifecycle state. The late request does NOT transition the attempt to `AUTO_CLOSED_DEADLINE` and does NOT trigger MCQ grading.<br>• *Case A (`IN_PROGRESS`):* Status left unchanged; auto-closure deferred strictly to deadline supervisor at $\text{end} + \Delta_{\text{drain}}$; queued on-time autosaves remain eligible.<br>• *Case B (`AUTO_CLOSED_DEADLINE`):* Returns finalized status.<br>• *Case C (`SUBMITTED`):* Idempotent retry returns original receipt if matching UUID; rejects new UUID.<br>• *Case D (Queued on-time write):* Earlier write processed under lock; late write rejected. | **HTTP 410 (Gone)**<br>`{ error: "MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED" }`<br>Zero late data committed; attempt auto-closure deferred strictly to deadline supervisor; local evidence preserved in `AUDIT_RECOVERY_BUNDLE` for Track B appeal. |
 | **7** | **Concurrent autosave and manual submission** | Both arrive at $T_{\text{ingress}} \le \text{end}$; compete for row lock. | Case A (Autosave first): Autosave updates answer, commits. Submission acquires lock next, marks `SUBMITTED`, commits.<br>Case B (Submission first): Submission marks `SUBMITTED`, commits. Autosave acquires lock next, sees `SUBMITTED`. | **Case A: Both HTTP 200 (OK)**<br>**Case B: Submission HTTP 200 (OK); Autosave HTTP 409 (Conflict / Finalized)** |
 | **8** | **Request admission racing with finalization** | On-time request and deadline worker compete for row lock at $T \approx \text{end} + \Delta_{\text{drain}}$. | MySQL InnoDB row lock serializes execution atomically.<br>If request wins lock: commits write; supervisor acquires lock next and finalizes attempt.<br>If supervisor wins lock: commits `AUTO_CLOSED_DEADLINE`; request acquires lock next and sees finalized state. | **If request wins: HTTP 200 (OK)**<br>**If supervisor wins: HTTP 410 (Gone / Finalized)**<br>Zero TOCTOU gap; atomic database coordination. |
 | **9** | **Worker crash after admission** | Worker accepts connection, acquires row lock, but crashes (OOM / `SIGSEGV`) before commit. | MySQL detects connection termination and rolls back uncommitted transaction automatically. Row lock released. Client detects network drop / HTTP 502. | **HTTP 502 (Bad Gateway)** to client.<br>Client retries with same sequence / submission UUID; state remains clean. |
@@ -1024,6 +1036,7 @@ sequenceDiagram
     participant Proxy as Nginx Trusted Reverse Proxy
     participant API as Django /attempts/ API
     participant DB as MySQL Database
+    participant Supervisor as Deadline Supervisor (Celery)
 
     Student->>UI: Enters Live Examination View
     UI->>Proxy: POST /api/attempts/{examId}/start/
@@ -1032,17 +1045,25 @@ sequenceDiagram
     API-->>UI: Questions Payload, Attempt ID, Remaining Seconds, Wrapped DEK
     UI->>UI: Import DEK into Volatile Memory (Zeroed on Tab Close / Logout)
 
-    loop Every 30s or on Question Blur
+    loop Every 30s or on Question Blur (Autosave Cycle)
         Student->>UI: Selects Option / Types Text
         UI->>IDB: Encrypt Payload (AES-256-GCM) & Store (SYNC_PENDING)
-        UI->>Proxy: PATCH /api/attempts/{attemptId}/answers/ (question_id, answer, seq=N)
+        UI->>Proxy: PATCH /api/attempts/{attemptId}/answers/ (qid, answer, seq=N)
         Proxy->>API: Overwrite & Forward X-Request-Arrival-Time ($msec as T_ingress)
-        alt T_ingress <= official_end_time
-            API->>DB: Conditional Update WHERE seq < N (Lock Row)
-            API-->>UI: HTTP 200 (Saved, Server Timestamp, Ack Seq=N)
-            UI->>IDB: Delete Local Cache Record for Acknowledged Seq
-        else T_ingress > official_end_time
-            API-->>UI: HTTP 410 (Examination Closed; Discard Write)
+        alt On-Time Ingress (T_ingress <= official_end_time)
+            API->>DB: SELECT * FROM ExamAttempt WHERE id = attempt_id FOR UPDATE
+            alt Attempt IN_PROGRESS (Standard Acceptance)
+                API->>DB: UPDATE Answer WHERE question_id = qid AND seq < N
+                API->>DB: Commit Transaction & Release Row Lock
+                API-->>UI: HTTP 200 (Saved, Server Timestamp, Ack Seq=N)
+                UI->>IDB: Delete Local Cache Record for Acknowledged Seq
+            else Bounded-Processing Delay (Finalized Before Lock Acquired)
+                API->>DB: Rollback / Release Row Lock
+                API-->>UI: HTTP 410 (WRITE_REJECTED_FINALIZATION_COMPLETED)
+                UI->>IDB: Mark Record as REJECTED_DEADLINE_EXCEEDED (Retain for Appeal)
+            end
+        else Late Ingress (T_ingress > official_end_time)
+            API-->>UI: HTTP 410 (EXAMINATION_CLOSED)
             UI->>IDB: Mark Record as REJECTED_DEADLINE_EXCEEDED (Retain for Appeal)
         end
     end
@@ -1051,15 +1072,44 @@ sequenceDiagram
         Student->>UI: Clicks "Submit Examination"
         UI->>Proxy: POST /api/attempts/{attemptId}/submit/ (submission_uuid)
         Proxy->>API: Overwrite & Forward X-Request-Arrival-Time ($msec as T_ingress)
-        API->>DB: Atomic Lock -> Mark SUBMITTED (submitted_at = T_ingress, transaction_recorded_at) -> Auto-score MCQs
-        API-->>UI: HTTP 200 (Signed Submission Receipt)
-        UI->>IDB: Purge Synchronized Attempt Cache & Zero DEK in Memory
+        API->>DB: SELECT * FROM ExamAttempt WHERE id = attempt_id FOR UPDATE
+        alt Attempt IN_PROGRESS (First-Time Finalization)
+            API->>DB: UPDATE ExamAttempt SET status=SUBMITTED, submitted_at=T_ingress, committed_at=now()
+            API->>DB: Commit Transaction & Release Row Lock
+            API->>Supervisor: Enqueue Asynchronous MCQ Grading (Post-Commit)
+            API-->>UI: HTTP 200 (Signed Submission Receipt)
+            UI->>IDB: Purge Synchronized Attempt Cache & Zero DEK in Memory
+        else Attempt Already SUBMITTED (Idempotent Retry)
+            API->>DB: Read Existing Submission Details & Release Lock
+            alt submission_uuid Matches Existing Attempt
+                API-->>UI: HTTP 200 (Cached Submission Receipt, Idempotent)
+            else submission_uuid Mismatch
+                API-->>UI: HTTP 409 (ATTEMPT_ALREADY_FINALIZED)
+            end
+        else Bounded-Processing Delay (Already AUTO_CLOSED_DEADLINE)
+            API->>DB: Rollback / Release Row Lock
+            API-->>UI: HTTP 410 (WRITE_REJECTED_FINALIZATION_COMPLETED)
+            UI->>IDB: Transition Cache to EXPIRED_STALE (Preserve for Track B Appeal)
+        end
     else Late Manual Submission (T_ingress > official_end_time)
         Student->>UI: Clicks "Submit Examination" (Arriving Late)
         Proxy->>API: Overwrite & Forward X-Request-Arrival-Time (T_ingress > end_time)
-        API->>DB: Atomic Lock -> Mark AUTO_CLOSED_DEADLINE (closed_at = end_time, transaction_recorded_at) -> Auto-score Pre-Deadline MCQs
+        API->>DB: Read ExamAttempt Status (Read-Only Check; NO Finalization Lock)
+        Note over API,DB: Status left unchanged (IN_PROGRESS); NO auto-closure; NO grading triggered
         API-->>UI: HTTP 410 (MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED)
-        UI->>IDB: Transition Cache to EXPIRED_STALE (Preserve Diagnostics)
+        UI->>IDB: Transition Cache to EXPIRED_STALE (Preserve Diagnostics for Track B Appeal)
+    end
+
+    opt Background Deadline Supervisor Finalization (After Drain Window)
+        Note over Supervisor,DB: Initiates strictly at server_time >= official_end_time + Δ_drain (15s)
+        Supervisor->>DB: SELECT * FROM ExamAttempt WHERE id = attempt_id FOR UPDATE
+        alt Attempt Still IN_PROGRESS
+            Supervisor->>DB: UPDATE ExamAttempt SET status=AUTO_CLOSED_DEADLINE, closed_at=end_time, committed_at=now()
+            Supervisor->>DB: Commit Transaction & Release Row Lock
+            Supervisor->>Supervisor: Enqueue Asynchronous MCQ Grading (Post-Commit)
+        else Attempt Already Finalized (SUBMITTED or AUTO_CLOSED_DEADLINE)
+            Supervisor->>DB: Rollback / Release Row Lock (Idempotent No-Op Exit)
+        end
     end
 ```
 ---
@@ -1172,7 +1222,7 @@ To defend against XSS and protect session integrity, the architecture enforces m
 | **Hashed Exam PINs** | Plaintext PINs in DB | If the database is compromised, plaintext PINs would allow unauthorized exam access. Hashing ensures zero-knowledge security. |
 | **Private File Storage** | Public S3 / Media root | Descriptive answer scripts and admit cards contain private student academic data; public URLs present severe privacy violations. |
 | **Encrypted Offline Cache & Dual-Track Key Recovery** | Plaintext IndexedDB / localStorage | Plaintext browser storage fails the shared-device threat model. AES-256-GCM at rest protects answers against extraction via browser DevTools on shared workstations. In-memory DEK is zeroed on tab close/logout. Dual-track key recovery separates active live exam resumption (Track A, server time $\le$ deadline, write-enabled) from post-deadline read-only evidence recovery (Track B, within configurable retention period, read-only). Zero credentials or PINs are stored locally as wrapping secrets. |
-| **Bounded-Processing Consistency Protocol (Option B)** | Unrealistic absolute admission guarantees or non-atomic distributed locks | Web applications cannot prevent operating system socket backlogs or worker queueing under extreme load. Option B defines an explicit Application Admission Window ($\Delta_{\text{drain}} = 15\text{s}$) and coordinates admission and finalization strictly through MySQL InnoDB ACID row locks (`SELECT ... FOR UPDATE` on `ExamAttempt`). Eliminates TOCTOU gaps and Redis dependencies. Requests delayed past the drain window are rejected with HTTP 410 and preserved in local diagnostic recovery bundles for appeal. |
+| **Bounded-Processing Consistency Protocol (Option B)** | Unrealistic absolute admission guarantees or non-atomic distributed locks | Web applications cannot prevent operating system socket backlogs or worker queueing under extreme load. Option B defines an explicit Application Admission Window ($\Delta_{\text{drain}} = 15\text{s}$) and coordinates admission and finalization strictly through MySQL InnoDB ACID row locks (`SELECT ... FOR UPDATE` on `ExamAttempt`). Eliminates TOCTOU gaps and Redis dependencies. Requests delayed past the drain window are rejected with HTTP 410 and preserved in local diagnostic recovery bundles for appeal. Late requests arriving after the deadline are rejected immediately without altering attempt status, preventing premature auto-closure while earlier on-time requests remain in socket queues. |
 | **Evidence Retention State Machine & Activation Gate** | Unrestricted / unconfigured default retention | Unconfigured retention periods leave key lifecycle undefined. The four-state configuration machine (`UNCONFIGURED` -> `CONFIGURED` -> `EXPIRED` / `LEGAL_HOLD`) enforces a hard production activation gate: no examination can be published or scheduled until college administration explicitly approves and signs an integer retention policy. |
 
 ## 18. Open Questions & Future Confirmation
