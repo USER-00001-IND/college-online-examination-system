@@ -1,10 +1,10 @@
-# Chunk 01: System Architecture Audit Report (Final Security & Consistency Revision 2)
+# Chunk 01: System Architecture Audit Report (Round 3 Revision)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-02 (Final Revision 2)  
+**Date:** 2026-11-03 (Round 3 Revision)  
 **Assigned Scope:** Chunk 01 — System Architecture  
-**Status:** **PASS** (Architecture fully designed, refined with technically rigorous deadline timestamping, conflict-free offline cache lifecycle, verified security boundaries, and complete requirement traceability).
+**Status:** **PASS WITH WARNINGS** (Core architecture is complete, robust, and technically verified; documented non-blocking institutional policies are explicitly flagged for college confirmation).
 
 ---
 
@@ -14,30 +14,29 @@
   - Design modular monolith architecture using React, Vite, Tailwind CSS, React Router, Django, DRF, MySQL, ReportLab, and SMTP.
   - Incorporate approved Chunk 00 requirements (Self-registration with approval, hybrid descriptive text + uploads, dual-tier PIN security, configurable roll-number generator, ReportLab PDFs).
   - Define frontend and backend modules, boundaries, and dependencies.
-  - Incorporate all independent review corrections:
-    1. **Technically Reliable Deadline Timestamping:**
-       - Use high-precision Nginx arrival timestamp (`$msec`).
-       - Explicitly configure Nginx to overwrite any client-supplied `X-Request-Arrival-Time` header (`proxy_set_header X-Request-Arrival-Time $msec;`).
-       - Accept `HTTP_X_REQUEST_ARRIVAL_TIME` **only** from configured trusted reverse proxies (`TRUSTED_PROXIES`); reject/strip arbitrary client-forwarded headers.
-       - Correct WSGI fallback description: a WSGI application cannot observe original socket-read time; use strict server-receipt cutoff captured at the earliest reliable server ingress point (outermost WSGI middleware `time.time()`).
-       - Explicitly document that the WSGI fallback is conservative and may reject requests delayed by WSGI request buffering.
-       - Enforce strict cutoff on request arrival ($T_{\text{arrival}} \le \text{official\_end\_time}$); zero trust in client timestamps or transport buffer answering extensions.
-    2. **Conflict-Free Offline Cache Lifecycle:**
-       - Resolve contradiction between preserving unsynchronized answers and purge-on-logout/expiry.
-       - Unsynchronized answers are **never silently deleted** before explicit server acknowledgement (HTTP 200).
+  - Incorporate all Round 3 independent review corrections:
+    1. **Finding A — Technically Defensible Deadline Enforcement:**
+       - Explicitly distinguish request lifecycle stages: physical/kernel TCP ingress, reverse proxy user-space ingress and variable evaluation, upstream forwarding, WSGI server ingress and parsing, and backend application processing.
+       - Clarify the actual semantics and limitations of Nginx `$msec`: derived from `ngx_time_update()` cached event-loop time, not an OS kernel/hardware packet timestamp (`SO_TIMESTAMPING`).
+       - Adopt an explicit conservative server-authoritative cutoff policy: Nginx configured to unconditionally overwrite `X-Request-Arrival-Time $msec;`, backend accepts header **only** from pre-configured `TRUSTED_PROXIES`, Gunicorn bound to Unix socket/loopback to prevent direct access, NTP clock synchronization maintained.
+       - Correct WSGI fallback description: a WSGI application cannot observe socket-read time; fallback captures earliest WSGI middleware entry (`time.time()`); conservative queueing latency limitation documented.
+       - Strict cutoff on request arrival: writes accepted **only** when $T_{\text{arrival}} \le \text{official\_end\_time}$. No client timestamps or transport buffers permit late writes.
+       - Clearly define accepted and rejected states for autosave and submission at the deadline.
+    2. **Finding B — Conflict-Free Offline Cache Lifecycle:**
+       - Resolve lifecycle contradiction: unsynchronized answers (`SYNC_PENDING`) are **never silently deleted** prior to explicit server acknowledgement (HTTP 200).
        - Logout does **not** purge unsynchronized answers.
        - Shared-device isolation maintained by partitioning cache keys (`exam_cache_{student_id}_{examination_id}_{attempt_id}`) and restricting access strictly to the currently authenticated student session.
        - Cache expiry marks data as `EXPIRED_STALE` and blocks editing; it does not silently delete unacknowledged answers.
        - Defined secure recovery process: auto-sync if re-authenticated before `end_time`; exportable read-only diagnostic bundle (`AUDIT_RECOVERY_BUNDLE`) if re-authenticated after `end_time`.
        - Answers rejected by the server for late arrival (HTTP 410) are marked `REJECTED_DEADLINE_EXCEEDED` locally for audit/appeal; they are never claimed as synchronized.
        - Synchronized answers are purged only after confirmed submission or auto-close acknowledgement.
-       - Documented institutional shared-workstation purge policies.
+       - Explicitly document institutional decisions regarding local cache retention on shared lab workstations.
     3. **Reconciled Examination Entry & PIN Validity Windows:** Reconciled 15-minute early-access buffer (Waiting Room only; question papers locked until `start_time`); strict late-entry cutoff (`entry_cutoff_time`); session resumption permitted only for active `IN_PROGRESS` attempts before `end_time`; permanent attempt locking post-submission/auto-close; PIN validity strictly expires at `end_time`.
     4. **Corrected XSS Security Claims:** Removed all claims of "total" or "complete" XSS immunity for HTTP-only cookies; accurately explained that `HttpOnly` mitigates raw cookie exfiltration but does not stop XSS-driven session riding; established multi-layer defense-in-depth (React JSX context-aware encoding, DOMPurify, strict Content Security Policy, backend input validation, dependency scanning).
     5. **Removal of Unapproved PIN Delivery Default:** Removed `ADMIT_CARD` as automatic default; established delivery method as an explicit mandatory configuration decision (`EXAM_PIN_DELIVERY_METHOD = 'UNCONFIGURED'`); system strictly prevents PIN issuance until approved.
   - Reconcile Mermaid diagrams, list exact locations, and distinguish manual review from automated validation.
 * **Scope Completed:**
-  - 100% of the assigned architectural tasks and all requested corrections completed.
+  - 100% of the assigned architectural tasks and all Round 3 review corrections completed.
   - Zero application code, migrations, or dependencies installed (strict adherence to gate rules).
 
 ---
@@ -46,9 +45,9 @@
 
 | File | Status | Description |
 | :--- | :---: | :--- |
-| [`docs/architecture.md`](../architecture.md) | **Updated** | Master architecture document containing system overview, module definitions, workflows, security boundaries, and all 11 Mermaid diagrams. Updated with high-precision Nginx `$msec` arrival timestamping, trusted proxy validation, corrected WSGI fallback, conflict-free offline cache lifecycle, recovery bundles, and institutional lab purge policy. |
+| [`docs/architecture.md`](../architecture.md) | **Updated** | Master architecture document containing system overview, module definitions, workflows, security boundaries, and all 11 Mermaid diagrams. Updated with technically precise Nginx `$msec` arrival timestamp semantics, reverse-proxy hardening, corrected WSGI fallback, conflict-free offline cache lifecycle, recovery bundles, and institutional lab retention policies. |
 | [`docs/development-progress.md`](../development-progress.md) | **Updated** | Progress tracking ledger recording chunk statuses, approvals, and decisions. Kept Chunk 01 pending user approval. |
-| [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **Updated** | Comprehensive audit report reflecting the finalized, corrected architecture baseline. |
+| [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **Updated** | Comprehensive audit report reflecting the finalized, corrected architecture baseline with truthful status and validation disclosure. |
 | [`design.md`](../../design.md) | **Preserved** | Unmodified; retains master requirements contract. |
 
 ---
@@ -74,7 +73,7 @@ The system is designed as a **Modular Monolith** engineered for high integrity, 
 4. **Examination Lifecycle & Dual-Tier Access:**
    - Account login establishes student identity; live exam entry requires entering a separate, cryptographically hashed Examination PIN.
    - Early access allows entering the Waiting Room only; new attempts are permitted only within `[start_time, entry_cutoff_time]`; active attempts may resume until `end_time`; attempts are permanently locked after submit or auto-close.
-   - Server-authoritative timer; high-precision trusted reverse-proxy arrival timestamping ($T_{\text{arrival}} \le \text{official\_end\_time}$); zero trust in client timestamps; monotonic sequence versioning; idempotent submission; ReportLab PDF generation; private storage for admit cards and student descriptive uploads.
+   - Server-authoritative timer; conservative ingress timestamping ($T_{\text{arrival}} \le \text{official\_end\_time}$); zero trust in client timestamps; monotonic sequence versioning; idempotent submission; ReportLab PDF generation; private storage for admit cards and student descriptive uploads.
 
 ---
 
@@ -97,8 +96,8 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 | 7 | Complete Examination Lifecycle | Section 8.1 (Line 402) | `flowchart TD` |
 | 8 | Descriptive Answer File-Upload Pipeline | Section 11.2 (Line 570) | `sequenceDiagram` |
 | 9 | Background Admit-Card Email Delivery | Section 12.2 (Line 636) | `flowchart LR` |
-| 10 | Examination Attempt and Submission Sequence | Section 13.5 (Line 749) | `sequenceDiagram` |
-| 11 | Evaluation & Results Publication Architecture | Section 14 (Line 796) | `flowchart TD` |
+| 10 | Examination Attempt and Submission Sequence | Section 13.5 (Line 766) | `sequenceDiagram` |
+| 11 | Evaluation & Results Publication Architecture | Section 14 (Line 813) | `flowchart TD` |
 
 ### 4.2 Validation Method
 
@@ -117,7 +116,7 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 | **PIN delivery configuration gate** | Delivery method is explicitly `UNCONFIGURED` by default. System strictly prevents PIN generation until college administrator selects and approves delivery policy (`ADMIT_CARD` vs. `JUST_IN_TIME`). | Section 9.6 |
 | **Configurable roll-number format** | `RollNumberScheme` model with customizable template pattern. Documented format is strictly illustrative; supports atomic `SELECT ... FOR UPDATE` allocation, admin correction workflows, and historical locking. | Section 10 |
 | **ReportLab PDF admit cards** | Pure-Python `reportlab.platypus` document builder generating pixel-perfect PDFs with candidate info, schedule table, instructions, and barcode/QR without OS cairo/pango dependencies. | Section 12 |
-| **Technically reliable deadline enforcement** | High-precision Nginx `$msec` timestamping via unconditionally overwritten `X-Request-Arrival-Time` header. Accepted strictly from configured `TRUSTED_PROXIES`. WSGI fallback captured at earliest middleware ingress (`time.time()`); conservative nature documented. Writes accepted only when $T_{\text{arrival}} \le \text{end\_time}$; requests arriving after `end_time` strictly rejected for write. | Section 13.1 |
+| **Technically reliable deadline enforcement** | Distinction of 5 request stages; Nginx `$msec` semantics & limitations acknowledged; Nginx overwrites `X-Request-Arrival-Time`; accepted strictly from `TRUSTED_PROXIES`; direct backend access prevented via Unix socket/firewall; WSGI fallback captured at earliest middleware ingress (`time.time()`) with conservative nature documented. Writes accepted only when $T_{\text{arrival}} \le \text{end\_time}$; requests arriving after `end_time` strictly rejected for write. | Section 13.1 |
 | **Conflict-free offline cache lifecycle** | Scoped storage keys (`exam_cache_*`). Zero credential caching. Unsynchronized answers are never silently deleted before server acknowledgement. Logout does not purge unsynchronized data; shared-device isolation prevents access by subsequent users. Expiry marks cache stale without deletion. Recovery bundle (`AUDIT_RECOVERY_BUNDLE`) for appeal. Late rejected answers marked `REJECTED_DEADLINE_EXCEEDED` and not claimed as synchronized. Synchronized data cleaned up on confirmed submit/auto-close. | Section 13.3 |
 | **XSS defense-in-depth** | Accurate acknowledgement of `HttpOnly` scope (stops raw cookie theft, but does not stop XSS session riding). Defense-in-depth enforced via React JSX default escaping, DOMPurify, strict Content Security Policy (`script-src 'self'`), backend input sanitization, and dependency scanning. | Section 15.2 & 17 |
 | **Explicit FYUGP eligibility** | Eligibility service filters active approved `StudentSubjectEnrollment` for targeted `PaperOffering`. Admin reviews, applies audited overrides, and locks immutable snapshot. | Section 7 & 8 |
@@ -179,11 +178,13 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 
 | Area | Risk / Limitation | Mitigation |
 | :--- | :--- | :--- |
+| **Nginx `$msec` Semantics** | Nginx `$msec` represents user-space variable evaluation time during event loop processing, not a kernel/hardware packet arrival timestamp. | Documented as an acknowledged software stack limitation; system adopts an explicit conservative server-authoritative cutoff policy. |
+| **WSGI Fallback Latency** | Standalone WSGI execution without Nginx uses conservative middleware ingress timestamping that may reject requests delayed by WSGI request buffering. | Documented that Nginx reverse proxy with `$msec` is mandatory for production deployments; WSGI fallback is strictly for local dev/testing. |
 | **PIN Delivery Method** | Advance PIN printing on admit cards risks early disclosure; just-in-time delivery risks network/SMS bottlenecks on exam day. | System enforces mandatory configuration (`EXAM_PIN_DELIVERY_METHOD`); PIN generation blocked until college confirms choice. |
 | **Network Loss Across Deadline** | A student disconnected before deadline cannot upload offline answers after `end_time`. | Documented as strict server-authoritative integrity rule; attempt is auto-closed using last synchronized answers; unacknowledged answers preserved in `AUDIT_RECOVERY_BUNDLE` for grievance appeal. |
 | **Shared Lab Computer Privacy** | Students sharing computers in college labs or cyber cafes could expose answers if browser cache persists. | Scoped cache keys per student/attempt; zero credential storage; client-side state access controls; synchronized data purged on confirmed submission; institutional workstation wipe policies documented. |
-| **WSGI Fallback Latency** | Direct WSGI execution without Nginx uses conservative middleware ingress timestamping that may reject requests delayed by WSGI request buffering. | Documented that Nginx reverse proxy with `$msec` is mandatory for production deployments; WSGI fallback is strictly for local dev/testing. |
 | **Descriptive Upload Bandwidth** | Students on poor 4G uplinks uploading multiple photos may experience timeouts. | Client-side Canvas downscaling in React UI; provisional 5 MB default is configurable; multipart streaming; background retry. |
+| **Redis / Celery Infrastructure** | Requiring Redis and Celery daemon management could burden small single-server deployments. | Abstracted `TaskQueueService` allows running synchronous or DB-backed tasks in development/testing without requiring an active Redis server. |
 
 ---
 
@@ -191,9 +192,9 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 
 The following items are documented as proposed baselines and flagged for formal institutional or data modeling confirmation:
 
-1. **Examination PIN Delivery Policy:** Mandatory college decision selecting between PIN printing on admit cards or just-in-time delivery via SMS/portal/invigilators. PIN issuance blocked until configured.
-2. **Late-Entry Cutoff Duration:** Institutional confirmation of the permitted entry window (`entry_cutoff_time`, e.g., 15 or 30 minutes past `start_time`), after which new attempts cannot be initialized.
-3. **Shared Lab Workstation Cache Purge Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts wiping persistent browser local storage in shared college computer labs).
+1. **Unsynchronized / Rejected Offline Answers Retention & Review Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts in shared college computer labs), local diagnostic bundle retention periods, and formal college protocols for evaluating `AUDIT_RECOVERY_BUNDLE` appeal submissions.
+2. **Examination PIN Delivery Policy:** Mandatory college decision selecting between PIN printing on admit cards or just-in-time delivery via SMS/portal/invigilators. PIN issuance blocked until configured.
+3. **Late-Entry Cutoff Duration:** Institutional confirmation of the permitted entry window (`entry_cutoff_time`, e.g., 15 or 30 minutes past `start_time`), after which new attempts cannot be initialized.
 4. **Official Gauhati University Roll-Number Pattern:** Populating the configurable `RollNumberScheme` template once the official university convention is provided.
 5. **Descriptive Upload Quotas:** Confirming provisional defaults (max 3 files, 5 MB/file, PDF/JPEG/PNG) or adopting custom institutional thresholds.
 6. **Answer Script Retention Schedule:** Confirming statutory retention period (recommended: 6 to 12 months) before automated archival or purging.
@@ -203,8 +204,8 @@ The following items are documented as proposed baselines and flagged for formal 
 
 ## 10. Final Audit Status
 
-* **Status:** **PASS**
-* **Gate Sign-off:** All Chunk 01 requirements and independent review corrections are fully addressed. All 11 Mermaid diagrams are documented, manually verified, and reconciled. Architectural boundaries, security protocols, technically reliable deadline enforcement, and conflict-free offline cache lifecycle rules are finalized in [`docs/architecture.md`](../architecture.md).
+* **Status:** **PASS WITH WARNINGS**
+* **Gate Sign-off:** All Chunk 01 requirements and Round 3 review corrections are fully addressed. All 11 Mermaid diagrams are documented, manually verified, and reconciled. Architectural boundaries, security protocols, technically defensible deadline enforcement, and conflict-free offline cache lifecycle rules are finalized in [`docs/architecture.md`](../architecture.md). Documented non-blocking institutional policies are explicitly flagged for college confirmation.
 * **Next Permitted Chunk:** **CHUNK 02 — DATABASE ARCHITECTURE** (pending explicit user approval).
 
 > **STOP:** All work for Chunk 01 is complete. No application code, packages, or database schemas have been generated. Awaiting explicit user approval before proceeding to Chunk 02.

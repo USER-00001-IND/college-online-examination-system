@@ -648,22 +648,39 @@ flowchart LR
 
 ## 13. Examination Reliability & Integrity Architecture
 
-### 13.1 Server-Authoritative Timer & Trusted Arrival Deadline Policy
+### 13.1 Server-Authoritative Timer & Conservative Ingress Deadline Policy
 
 * **Zero Trust in Client Timestamps:**
   - Client/browser timestamps are **never trusted** by the server as proof that an answer was entered or submitted before the deadline. A compromised client, manipulated system clock, or modified script could trivially forge pre-deadline timestamps.
-  - The server's clock and trusted network gateway timestamps govern all deadlines.
-* **High-Precision Trusted Reverse-Proxy Arrival Timestamp (`$msec`):**
-  - The authoritative time of request receipt is established **strictly** by the trusted reverse proxy using high-precision epoch milliseconds (`$msec`), captured at the instant the request arrives from the network.
-  - **Reverse-Proxy Configuration Hardening:** Nginx is explicitly configured to unconditionally overwrite any incoming client-supplied `X-Request-Arrival-Time` header:
+  - The server's clock and trusted network gateway timestamps strictly govern all deadlines.
+* **Request Ingress Pipeline & Timestamp Semantics:**
+  To ensure technical rigor, the architecture distinguishes the five distinct stages of the request lifecycle:
+  1. *Physical / Kernel TCP Ingress:* The client's TCP packets arrive at the physical host network interface card (NIC) and are buffered in the Linux kernel socket queue.
+  2. *Reverse-Proxy User-Space Ingress & Variable Evaluation:* The Nginx worker event loop (`epoll`) wakes up, reads the HTTP request line and headers from the socket, and evaluates configuration variables (such as `$msec`).
+  3. *Upstream Forwarding:* Nginx formats the HTTP request, injects trusted headers, and writes data to the upstream socket (Unix domain socket or loopback TCP) connecting to Gunicorn.
+  4. *WSGI Server Ingress & Parsing:* The Gunicorn worker process reads from the upstream socket, parses the HTTP stream into the Python WSGI `environ` dictionary, and invokes the Django WSGI application callable.
+  5. *Backend Application Processing:* Django middleware executes, the request is routed to the Django REST Framework view, serializers validate input, and MySQL database transactions commit.
+* **Semantics and Technical Limitations of Nginx `$msec`:**
+  - In Nginx, `$msec` evaluates to the current time in seconds with millisecond resolution (`time_t sec + msec`) obtained from Nginx's internal cached time structure, which is updated on each event loop iteration via `ngx_time_update()` (derived from `gettimeofday()`).
+  - **Limitations:**
+    - It is **not** an operating system kernel-level network packet arrival timestamp (unlike Linux socket options `SO_TIMESTAMPING` / `SO_TIMESTAMPNS`, which require dedicated C-level socket modules not provided in standard Nginx distributions).
+    - Under heavy load, worker event loop latency, or TLS handshake queueing, `$msec` represents the time when Nginx evaluated the variable during request header processing, which can lag slightly behind physical packet arrival on the wire.
+    - **Architecture Stance:** The system explicitly acknowledges this limitation. It does **not** claim `$msec` is an absolute physical packet arrival guarantee. Instead, it adopts `$msec` as the earliest practical software-evaluated ingress timestamp achievable in a standard Linux/Nginx web stack.
+* **Technically Defensible Production Cutoff Mechanism:**
+  - **Ingress Header Overwrite:** Nginx is explicitly configured as the sole external ingress point and unconditionally overwrites any incoming client-supplied header:
     ```nginx
-    # Securely inject high-precision arrival timestamp from trusted proxy
+    # Unconditionally overwrite any client-supplied header with high-precision proxy evaluation time
     proxy_set_header X-Request-Arrival-Time $msec;
     ```
-  - **Trusted Proxy Verification:** The backend application (Django custom middleware) accepts `HTTP_X_REQUEST_ARRIVAL_TIME` **only** when `request.META['REMOTE_ADDR']` originates from a pre-configured trusted proxy IP or CIDR block (e.g., `TRUSTED_PROXIES = ['127.0.0.1', '10.0.0.0/8']`). Forwarded arrival headers from untrusted clients or unverified proxies are strictly ignored and stripped.
-* **WSGI Fallback Description & Earliest Ingress Point:**
-  - In standard Python WSGI architectures (Gunicorn, uWSGI), a WSGI application receives control *after* the WSGI server has already accepted the TCP socket, buffered the request, and parsed HTTP headers/body. Therefore, a WSGI application *cannot* generally observe the original low-level socket-read time.
-  - When trusted reverse-proxy arrival time is unavailable (e.g., local development or standalone WSGI execution without Nginx), the fallback is a **strict server-receipt cutoff** captured at the earliest reliable server ingress point: the very first line of the outermost WSGI middleware (`time.time()`).
+  - **Trusted Proxy Verification:** The backend application (Django custom middleware) accepts `HTTP_X_REQUEST_ARRIVAL_TIME` **strictly** when `request.META['REMOTE_ADDR']` originates from a pre-configured trusted proxy IP or CIDR block (e.g., `TRUSTED_PROXIES = ['127.0.0.1', '10.0.0.0/8']`). Forwarded arrival headers from untrusted clients or unverified proxies are strictly ignored and stripped.
+  - **Direct Backend Access Restrictions:** Gunicorn is strictly bound to a local Unix domain socket (`/run/gunicorn.sock` with file mode `0660` owned by `www-data:www-data`), or bound exclusively to `127.0.0.1` with host firewall rules (`ufw` / `iptables`) dropping external traffic to port 8000. Direct access bypassing Nginx is architecturally prohibited.
+  - **Clock Synchronization & Skew Considerations:**
+    - Host system clocks are synchronized via `chrony` or `systemd-timesyncd` with local/regional NTP stratum-1/2 servers, maintaining target clock drift $< 10\\text{ ms}$.
+    - Because Nginx and Gunicorn reside on the same server (or within a tightly synchronized local container network), inter-service clock skew between proxy and backend is eliminated or negligible.
+  - **Failure Handling:** If `X-Request-Arrival-Time` is missing, non-numeric, or received from an untrusted source, the backend discards it, records a security warning in `AuditLog`, and falls back to the conservative WSGI middleware ingress timestamp.
+* **WSGI Fallback Description & Conservative Nature:**
+  - When trusted reverse-proxy arrival time is unavailable (e.g., local development or standalone WSGI execution without Nginx), a WSGI application *cannot* observe the original socket-read time, because Gunicorn buffers and parses the request before invoking the application callable.
+  - The fallback is a **strict server-receipt cutoff** captured at the earliest reliable Python entry point: the very first line of the outermost WSGI middleware (`time.time()`).
   - **Conservative Nature of Fallback:** This fallback is conservative. Under high server load or worker thread contention, a request that physically arrived at the host before the deadline might be delayed by WSGI request parsing/buffering and only timestamped at the middleware entry point after `end_time`, causing it to be rejected. Deploying behind a properly configured trusted reverse proxy (Nginx with `$msec`) is therefore the required production architecture.
 * **Strict Cutoff on Request Arrival (No Late Writes):**
   - A write request (autosave update or submission) is accepted **only** when its trusted arrival timestamp is at or before the official scheduled deadline:
@@ -910,4 +927,4 @@ The following policy and configuration items are flagged for institutional/colle
 4. **Descriptive Answer Upload Quotas:** Confirmation of provisional defaults (maximum 3 files, 5 MB per file, PDF/JPEG/PNG) or college-specific size/count limits.
 5. **Answer Script Data Retention Schedule:** Confirmation of the duration scripts are retained in active storage post-result publication before archival or purging (recommended: 6 to 12 months).
 6. **Grading & GPA Scale:** Raw component scores are implemented as the baseline; 10-point letter grade conversions (O, A+, A, etc.) and SGPA/CGPA formulas will be added upon confirmation of official GU tables.
-7. **Shared Lab Workstation Cache Purge Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts wiping persistent browser local storage in shared college computer labs).
+7. **Unsynchronized / Rejected Offline Answers Retention & Review Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts in shared college computer labs), local diagnostic bundle retention periods, and formal college protocols for evaluating `AUDIT_RECOVERY_BUNDLE` appeal submissions.
