@@ -1,16 +1,16 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-03 (Round 9 Revision)  
+**Last Updated:** 2026-11-03 (Chunk 02 In-Review)  
 
 ---
 
 ## 1. Overall Status
 
-* **Current Active Chunk:** **CHUNK 01 — SYSTEM ARCHITECTURE**
-* **Project Phase:** Architecture & Specification
-* **Implementation Permission:** **NOT GRANTED** (Application initialization, dependencies, and code remain gated)
-* **Next Permitted Action:** User review and authorization of Chunk 01 Architecture Audit (Round 9 Revision)
+* **Current Active Chunk:** **CHUNK 02 — DATABASE ARCHITECTURE**
+* **Project Phase:** Database Architecture & Specification
+* **Implementation Permission:** **NOT GRANTED** (Application initialization, dependencies, models, migrations, and code remain gated)
+* **Next Permitted Action:** Independent audit review and user authorization of Chunk 02 Database Architecture Audit
 
 ---
 
@@ -19,8 +19,8 @@
 | Chunk | Name | Status | Audit Document | Approval Status |
 | :---: | :--- | :---: | :--- | :---: |
 | **00** | Requirements Audit | **COMPLETED** | [`docs/audits/chunk-00-requirements-audit.md`](chunk-00-requirements-audit.md) | **APPROVED** (2026-11-02) |
-| **01** | System Architecture | **IN REVIEW** | [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **PENDING USER APPROVAL** |
-| **02** | Database Architecture | NOT STARTED | — | GATED |
+| **01** | System Architecture | **COMPLETED** | [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **APPROVED** (2026-11-03) |
+| **02** | Database Architecture | **IN REVIEW** | [`docs/audits/chunk-02-database-architecture-audit.md`](chunk-02-database-architecture-audit.md) | **PENDING INDEPENDENT AUDIT** |
 | **03** | Project Initialization | NOT STARTED | — | GATED |
 | **04** | Authentication and Roles | NOT STARTED | — | GATED |
 | **05** | FYUGP Academic Management | NOT STARTED | — | GATED |
@@ -51,4 +51,8 @@
 9. **Evidence Retention State Machine & Hard Production Gate:** Formal 4-state operational machine (`UNCONFIGURED` -> `CONFIGURED` -> `EXPIRED` / `LEGAL_HOLD`); Hard production activation gate strictly blocking examination scheduling and activation while `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` remains `UNCONFIGURED`; institutional approval requirement (`IsCollegeSuperAdmin`); immutable snapshots captured on `Examination` and `ExamAttempt`; scheduled daily deletion (`purge_expired_evidence_keys`) with security audit logging; legal hold suspension mechanics for active grievance appeals.
 10. **Submission Lifecycle, Sequence Model & 16-Scenario Concurrency Model:** Explicit distinction between perimeter arrival $T_{\text{ingress}}$ (`submitted_at`), application admission $T_{\text{admit}}$, and application transaction recording time `transaction_recorded_at` (persisted in `committed_at`). Comprehensive handling of all 16 submission scenarios with exact HTTP response codes (200, 408, 409, 410, 502); transactional row locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) to serialize concurrent autosaves, manual submissions, and deadline supervisor finalization; late manual submissions do not transition attempts to `AUTO_CLOSED_DEADLINE` or trigger grading; Section 13.5 sequence diagram models all branches including on-time autosaves under lock, bounded delay rejections, idempotent submission retries, late submissions without auto-closure, and post-commit asynchronous grading.
 11. **XSS Defense-in-Depth:** Acknowledged `HttpOnly` scope (prevents raw cookie theft, but requires defense-in-depth via React JSX escaping, DOMPurify, strict CSP, and backend input validation).
-12. **Background Worker:** `Celery` + `Redis` for production batch operations (PDFs, emails, dead-letter supervision), with an abstracted service layer for test execution.\n
+12. **Background Worker:** `Celery` + `Redis` for production batch operations (PDFs, emails, dead-letter supervision), with an abstracted service layer for test execution.
+13. **Relational Schema & MySQL InnoDB 8.x Baseline:** 51 normalized tables targeting MySQL 8.x with InnoDB exclusively; character set `utf8mb4` with `utf8mb4_0900_ai_ci`; Django ORM-compatible conventions (`id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY`, snake_case table and column names); strict SQL mode; 3NF compliance across all entities with 4 formally justified denormalizations for historical immutability.
+14. **Centralized Concurrency & Locking Serialization on `ExamAttempt`:** Implementation of Option B Bounded-Processing Consistency Model directly in the relational schema; `attempts_exam_attempt` serves as the centralized row-lock coordination point (`SELECT ... FOR UPDATE`); monotonic answer saving via `attempts_answer.version_sequence`; idempotent manual submissions with client UUID4 matching; deadline supervisor finalization respects the 15-second drain window; late submissions rejected with HTTP 410 without altering attempt status.
+15. **Dual-Tier Cryptographic Credential & Key Storage:** Salted PBKDF2-SHA256 password hashes; separately salted PBKDF2 examination PIN hashes with independent 32-byte cryptographic salts (`pin_salt`); Data Encryption Keys (DEKs) envelope-wrapped under Master KEK via AES-KeyWrap; zero plaintext secrets or PINs stored in MySQL; evidence retention state machine with immutable expiry timestamps and daily automated purging.
+16. **Private Descriptive Upload Storage Architecture:** Physical handwritten answer sheet photos and PDFs stored outside HTTP webroot in private disk storage; files renamed to random UUID4 identifiers (`uploads_descriptive_upload.file_uuid`) to eliminate path traversal and direct enumeration; ClamAV malware scanning status tracking; streaming access restricted strictly to authenticated Django controller views with role checks.\n
