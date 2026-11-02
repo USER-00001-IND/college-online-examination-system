@@ -1,16 +1,16 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-03 (Chunk 02 Round 4 Revision)  
+**Last Updated:** 2026-11-03 (Chunk 03 Backend Foundation Initialization)  
 
 ---
 
 ## 1. Overall Status
 
-* **Current Active Chunk:** **CHUNK 02 — DATABASE ARCHITECTURE**
-* **Project Phase:** Database Architecture & Specification
-* **Implementation Permission:** **NOT GRANTED** (Application initialization, dependencies, models, migrations, and code remain gated)
-* **Next Permitted Action:** Independent audit review and user authorization of Chunk 02 Database Architecture Audit
+* **Current Active Chunk:** **CHUNK 03 — BACKEND FOUNDATION**
+* **Project Phase:** Backend Foundation & Infrastructure Initialization
+* **Implementation Permission:** **GRANTED FOR CHUNK 03 ONLY** (Django/DRF foundation, modular app skeletons, environment settings hierarchy, health check endpoint, security baseline, structured error handling, JSON/structured logging, and smoke test suite; models, domain migrations, examination business logic, grading workers, and frontend remain gated)
+* **Next Permitted Action:** Implement Chunk 03 backend foundation, execute smoke verification tests, and generate Chunk 03 audit documentation for independent review
 
 ---
 
@@ -20,8 +20,8 @@
 | :---: | :--- | :---: | :--- | :---: |
 | **00** | Requirements Audit | **COMPLETED** | [`docs/audits/chunk-00-requirements-audit.md`](chunk-00-requirements-audit.md) | **APPROVED** (2026-11-02) |
 | **01** | System Architecture | **COMPLETED** | [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **APPROVED** (2026-11-03) |
-| **02** | Database Architecture | **IN REVIEW** | [`docs/audits/chunk-02-database-architecture-audit.md`](chunk-02-database-architecture-audit.md) | **PENDING INDEPENDENT AUDIT** |
-| **03** | Project Initialization | NOT STARTED | — | GATED |
+| **02** | Database Architecture | **COMPLETED** | [`docs/audits/chunk-02-database-architecture-audit.md`](chunk-02-database-architecture-audit.md) | **APPROVED** (2026-11-03) |
+| **03** | Backend Foundation | **IN PROGRESS** | [`docs/audits/chunk-03-backend-foundation-audit.md`](chunk-03-backend-foundation-audit.md) | **IN PROGRESS (Pending Independent Audit)** |
 | **04** | Authentication and Roles | NOT STARTED | — | GATED |
 | **05** | FYUGP Academic Management | NOT STARTED | — | GATED |
 | **06** | Student and Faculty Management | NOT STARTED | — | GATED |
@@ -59,3 +59,25 @@
 17. **Submission Receipt Timestamp Integrity:** Explicit timestamp semantics on `attempts_submission_receipt` separating manual submission ($T_{\text{ingress}}$ in `submitted_at`) from deadline auto-closure (`official_end_time` in `closed_at`); enforced via MySQL CHECK constraint `chk_receipt_status_timestamps`; zero fabrication of manual submission timestamps or client UUIDs for auto-closed attempts.
 18. **Private Descriptive Upload Storage Architecture:** Physical handwritten answer sheet photos and PDFs stored outside HTTP webroot in private disk storage; files renamed to random UUID4 identifiers (`uploads_descriptive_upload.file_uuid`) to eliminate path traversal and direct enumeration; ClamAV malware scanning status tracking; streaming access restricted strictly to authenticated Django controller views with role checks.
 19. **Two-Tier Answer Payload Validation Architecture:** Tier 1 storage engine enforcement via MySQL CHECK constraint `chk_answer_payload_exclusivity CHECK (selected_option_id IS NULL OR answer_text IS NULL)` mechanically forbidding corrupted hybrid payloads containing both an MCQ option and descriptive text simultaneously, while safely permitting unanswered drafts (`NULL, NULL`), MCQ selections (`opt, NULL`), and descriptive drafts (`NULL, text`); Tier 2 Django application layer validation under row lock validating incoming payload against `question.question_type`: MCQ questions reject typed text and file uploads, while descriptive questions reject option selections and accept typed text, uploaded handwritten sheet files (`uploads_descriptive_upload`), or both.
+
+
+---
+
+## 4. Mandatory Future Acceptance Criteria (Carried Over from Chunk 02 Warnings)
+
+The following warnings from the Chunk 02 Database Architecture Independent Audit (Pass with Warnings) are recorded as mandatory acceptance criteria for future chunks:
+
+1. **Worker-Event Binding (Target: Chunk 11 / Chunk 12):**
+   - The Celery grading task must strictly bind to the locked `attempts_exam_attempt` record before inspecting or updating outbox rows.
+   - Task identifiers, attempt IDs, and outbox IDs must be mutually validated against persisted database records before grading evaluation begins.
+2. **Outbox Claim Fencing & Terminal Immutability (Target: Chunk 11 / Chunk 12):**
+   - Outbox dispatcher transitions must use the `claim_version` fencing token and guarded SQL predicates (`status = 'CLAIMED' AND claimed_by = :dispatcher_id AND claim_version = :claim_version`).
+   - If `affected_rows == 0`, dispatcher must verify the current state and treat `status == 'COMPLETED'` as obsolete without overwriting.
+   - Celery worker must be able to transition the outbox row to `COMPLETED` from any non-terminal state (`PUBLISHED`, `CLAIMED`, `PROCESSING`, `RETRY_PENDING`, `DEAD_LETTER`).
+   - Any manual administrative intervention on `DEAD_LETTER` outbox rows must produce an immutable audit trail in `audit_system_audit_log`.
+   - Comprehensive live multi-threaded / multi-process MySQL concurrency tests must be executed when outbox execution is authorized.
+3. **Institutional Policy Baseline Confirmation (Target: Chunk 05 / Chunk 08):**
+   - Authoritative Gauhati University roll number format template must be configured prior to student roll number generation.
+   - Official letter grading scale and 10-point formula mapping must be populated in `academics_institutional_config`.
+   - Hard production activation gate must prevent examination activation while `EXAM_PIN_DELIVERY_METHOD` or `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` remains `UNCONFIGURED`.
+   - Statutory retention schedules for private descriptive upload files (photos/PDFs) must be confirmed and configured before production deployment.

@@ -1,0 +1,59 @@
+# Python / Django Bytecode and Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+
+# Django Runtime Artifacts
+*.sqlite3
+*.sqlite3-journal
+/staticfiles/
+/media/
+/private_uploads/
+
+# Logging
+*.log
+logs/
+
+# Testing & Coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+coverage.xml
+*.cover
+
+# IDEs & System Files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Node / Frontend Artifacts (for future chunks)
+node_modules/
+dist/
+build/
+.npm
+.eslintcache
+
+# Project scratch directories
+temp/
+scratch/
