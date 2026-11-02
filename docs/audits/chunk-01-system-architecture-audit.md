@@ -1,8 +1,8 @@
-# Chunk 01: System Architecture Audit Report (Round 7 Revision)
+# Chunk 01: System Architecture Audit Report (Round 8 Revision)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 7 Revision)  
+**Date:** 2026-11-03 (Round 8 Revision)  
 **Assigned Scope:** Chunk 01 — System Architecture  
 **Status:** **PASS WITH WARNINGS** (Core architecture is complete, robust, and technically verified; documented non-blocking institutional policies are explicitly flagged for college confirmation).
 
@@ -14,26 +14,27 @@
   - Design modular monolith architecture using React, Vite, Tailwind CSS, React Router, Django, DRF, MySQL, ReportLab, and SMTP.
   - Incorporate approved Chunk 00 requirements (Self-registration with approval, hybrid descriptive text + uploads, dual-tier PIN security, configurable roll-number generator, ReportLab PDFs).
   - Define frontend and backend modules, boundaries, and dependencies.
-  - Incorporate all Round 7 independent review corrections:
-    1. **Finding A (High Priority Resolved) — Deadline Finalization Race Condition:**
-       - Eliminated the race condition where the background deadline worker could auto-close an attempt while valid on-time requests ($T_{\text{ingress}} \le \text{official\_end\_time}$) were still queued in socket backlogs or executing in Gunicorn workers.
-       - Designed a two-stage finalization protocol for the deadline supervisor worker:
-         - *Stage 1 (Queue Drain Wait):* Mandatory delay window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$) before initiating attempt closure, allowing requests buffered at Nginx/sockets to enter Django.
-         - *Stage 2 (In-Flight Registry Verification):* Redis-backed active request tracking (`exam:inflight:{attempt_id}`) across multiple Gunicorn workers. Supervisor defers finalization while active requests remain, bounded by a hard ceiling timeout (30s total) to prevent indefinite stalls.
-         - *Stage 3 (Atomic Finalization):* Exclusive row lock (`SELECT ... FOR UPDATE` on `ExamAttempt`), freezing attempt state to `AUTO_CLOSED_DEADLINE`, followed by asynchronous, idempotent MCQ evaluation.
-       - Specified a universal row-lock acquisition order across Autosave, Submission, and Supervisor finalization.
-       - Provided exhaustive 12-scenario concurrency analysis covering worker crashes, slow body uploads, out-of-order network arrival, retries, and duplicate evaluations with authoritative outcomes and HTTP status codes.
-    2. **Finding B (Medium Priority Resolved) — Evidence Retention Configuration State Machine:**
-       - Defined an explicit 4-state operational machine: `UNCONFIGURED`, `CONFIGURED`, `EXPIRED`, and `LEGAL_HOLD / GRIEVANCE_PENDING`.
-       - Implemented a **Hard Production Activation Gate**: examination publishing and activation is strictly blocked while `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` remains `UNCONFIGURED`.
-       - Enforced institutional role authorization (`IsCollegeSuperAdmin`) with mandatory written justification and audit logging (`AuditLog: RETENTION_POLICY_CONFIGURED`).
-       - Captured retention policy as an immutable snapshot on `Examination` (`evidence_key_retention_days`) and `ExamAttempt` (`evidence_key_expires_at`), preventing retroactive changes to active/finalized attempts.
-       - Defined exact countdown start at `finalized_at`, server-authoritative request-time expiry enforcement (HTTP 410 `EVIDENCE_RETENTION_EXPIRED`), scheduled daily key deletion (`purge_expired_evidence_keys`), audit logging (`AuditLog: EVIDENCE_KEY_PURGED`), and failure recovery.
-       - Specified legal hold suspension (`is_under_legal_hold = True`) for active grievances.
-       - Detailed lab workstation sanitization policies and warned candidates to export bundles prior to PC reboots.
+  - Incorporate all Round 8 independent review corrections:
+    1. **Finding A (Resolved) — Request Ingress Pipeline & The Six Lifecycle Stages:**
+       - Formally distinguished the six distinct lifecycle stages: Physical Network Arrival, Perimeter Timestamp Evaluation ($T_{\text{ingress}}$), Complete HTTP Request Receipt, Application Admission ($T_{\text{admit}}$), Database Transaction Execution, and Successful Durable Commit.
+       - Clarified that a perimeter timestamp $T_{\text{ingress}}$ alone does not guarantee application admission or durable commit if workers crash, socket drops occur, or extreme queueing exceeds the processing window.
+    2. **Finding B (Resolved) — Single Database Source of Truth for Concurrency:**
+       - Eliminated distributed state mismatch and non-atomic Redis-check sequences by coordinating admission and finalization strictly through MySQL InnoDB ACID row locks (`SELECT ... FOR UPDATE` on `ExamAttempt`).
+       - Removed reliance on Redis availability for admission correctness, ensuring the core submission and finalization protocol operates reliably directly on the database.
+    3. **Finding C (Resolved) — Option B: Bounded-Processing Consistency Model:**
+       - Adopted Option B: Bounded-Processing Consistency Model to account for real-world operating system socket queues and worker starvation under peak load.
+       - Defined the Application Admission Window:
+         $$W_{\text{admission}} = [\text{start\_time}, \text{official\_end\_time} + \Delta_{\text{drain}}] \quad (\Delta_{\text{drain}} = 15\text{s})$$
+       - Configured the background deadline supervisor worker to wait until $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$ before initiating attempt closure, providing on-time requests 15 seconds to traverse socket backlogs and achieve application admission.
+       - Disclosed the realistic boundary limitation: if extreme queueing delays admission past supervisor finalization, the request is rejected with HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`) and preserved locally in `AUDIT_RECOVERY_BUNDLE` for grievance appeal via Track B.
+       - Late ingress ($T_{\text{ingress}} > \text{official\_end\_time}$) is strictly rejected immediately (HTTP 410 `EXAMINATION_CLOSED`), ensuring the drain window never extends answering time.
+    4. **Comprehensive Concurrency Analysis (16 Scenarios):**
+       - Provided an exhaustive 16-scenario concurrency analysis matrix covering worker crashes, slow body uploads, out-of-order network arrival, concurrent autosaves and submissions, retries, duplicate workers, Redis/MySQL unavailability, and duplicate evaluations with authoritative outcomes and HTTP status codes.
+    5. **Terminology Cleanup:**
+       - Removed inaccurate or overreaching claims ("race-free", "mathematically bounded guarantees", "guaranteed processing"). Replaced with precise, technically defensible terms ("Bounded-Processing Consistency Model", "Database-Coordinated Row-Locking Protocol").
   - Reconcile Mermaid diagrams, list exact locations, and distinguish manual review from automated validation.
 * **Scope Completed:**
-  - 100% of the assigned architectural tasks and all Round 7 review corrections completed.
+  - 100% of the assigned architectural tasks and all Round 8 review corrections completed.
   - Zero application code, migrations, or dependencies installed (strict adherence to gate rules).
 
 ---
@@ -42,9 +43,9 @@
 
 | File | Status | Description |
 | :--- | :---: | :--- |
-| [`docs/architecture.md`](../architecture.md) | **Updated** | Master architecture document containing system overview, module definitions, workflows, security boundaries, and all 11 Mermaid diagrams. Updated with two-stage deadline finalization protocol, Redis cross-worker in-flight registry, 12-scenario concurrency analysis, formal evidence-retention configuration state machine, production activation gate, and legal hold mechanics. |
+| [`docs/architecture.md`](../architecture.md) | **Updated** | Master architecture document containing system overview, module definitions, workflows, security boundaries, and all 11 Mermaid diagrams. Updated with Option B Bounded-Processing Consistency Model, Six Lifecycle Stages, single database row-lock coordination, 16-scenario concurrency analysis, formal evidence-retention configuration state machine, production activation gate, and legal hold mechanics. |
 | [`docs/development-progress.md`](../development-progress.md) | **Updated** | Progress tracking ledger recording chunk statuses, approvals, and decisions. Kept Chunk 01 pending user approval. |
-| [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **Updated** | Comprehensive audit report reflecting the finalized Round 7 corrected architecture baseline with truthful status and validation disclosure. |
+| [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **Updated** | Comprehensive audit report reflecting the finalized Round 8 corrected architecture baseline with truthful status and validation disclosure. |
 | [`design.md`](../../design.md) | **Preserved** | Unmodified; retains master requirements contract. |
 
 ---
@@ -67,11 +68,11 @@ The system is designed as a **Modular Monolith** engineered for high integrity, 
    - `SubjectCategory` (Major, Minor, MDC, AEC, SEC, VAC) modeled dynamically in DB rather than hardcoded enums.
    - Cross-programme paper support for shared NEP courses (e.g., Environmental Studies VAC).
    - Explicit registration: Eligibility requires an approved `StudentSubjectEnrollment` record.
-4. **Examination Lifecycle & Concurrency Protocol:**
+4. **Examination Lifecycle & Bounded-Processing Concurrency Protocol:**
    - Account login establishes student identity; live exam entry requires entering a separate, cryptographically hashed Examination PIN.
    - Server-authoritative timer ($T_{\text{ingress}} \le \text{official\_end\_time}$); zero trust in client timestamps; monotonic sequence versioning; idempotent submission.
-   - **Race-Free Finalization:** Ingress Queue Drain Window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$) and Redis in-flight tracking prevent premature auto-closure while valid on-time requests are buffered or processing.
-   - Strict row-lock acquisition order (`SELECT ... FOR UPDATE` on `ExamAttempt`) serializes concurrent autosaves, submissions, and supervisor workers.
+   - **Option B Bounded-Processing Consistency:** Application Admission Window ($\Delta_{\text{drain}} = 15\text{s}$) accommodates OS socket queues and Gunicorn worker backlogs.
+   - Strict database row-lock acquisition order (`SELECT ... FOR UPDATE` on `ExamAttempt`) coordinates concurrent autosaves, manual submissions, and deadline supervisor workers without distributed race conditions.
 5. **Shared-Device Cryptographic Confidentiality & Dual-Track Key Recovery:**
    - Local answer persistence protected at rest using Web Crypto API `AES-256-GCM` with 96-bit random IVs and AAD binding. Zero local PIN wrapping.
    - Server-assisted key release partitioned into Track A (Live Exam Recovery, active `IN_PROGRESS`, $T \le \text{deadline}$, write-enabled) and Track B (Post-Deadline Read-Only Evidence Recovery, finalized attempts within `EXAM_EVIDENCE_KEY_RETENTION_PERIOD`, strictly read-only).
@@ -89,17 +90,17 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 
 | # | Diagram Name | Location in `architecture.md` | Diagram Type |
 | :-: | :--- | :--- | :--- |
-| 1 | High-Level System Architecture | Section 3.1 (Line 54) | `flowchart TD` |
-| 2 | Frontend and Backend Module Communication | Section 5.2 (Line 182) | `flowchart LR` |
-| 3 | Backend Module Dependency Graph | Section 5.3 (Line 215) | `flowchart TD` |
-| 4 | Student Self-Registration & Approval Workflow | Section 6.2 (Line 292) | `sequenceDiagram` |
-| 5 | Authentication and Examination PIN Verification Flow | Section 6.3 (Line 322) | `sequenceDiagram` |
-| 6 | Student Subject Enrollment & Historical Preservation | Section 7.2 (Line 379) | `flowchart TD` |
-| 7 | Complete Examination Lifecycle | Section 8.1 (Line 402) | `flowchart TD` |
-| 8 | Descriptive Answer File-Upload Pipeline | Section 11.2 (Line 569) | `sequenceDiagram` |
-| 9 | Background Admit-Card Email Delivery | Section 12.2 (Line 635) | `flowchart LR` |
-| 10 | Examination Attempt and Submission Sequence | Section 13.5 (Line 1007) | `sequenceDiagram` |
-| 11 | Evaluation & Results Publication Architecture | Section 14 (Line 1058) | `flowchart TD` |
+| 1 | High-Level System Architecture | Section 3.1 (Lines 54–106) | `flowchart TD` |
+| 2 | Frontend and Backend Module Communication | Section 5.2 (Lines 182–211) | `flowchart LR` |
+| 3 | Backend Module Dependency Graph | Section 5.3 (Lines 215–264) | `flowchart TD` |
+| 4 | Student Self-Registration & Approval Workflow | Section 6.2 (Lines 292–318) | `sequenceDiagram` |
+| 5 | Authentication and Examination PIN Verification Flow | Section 6.3 (Lines 322–353) | `sequenceDiagram` |
+| 6 | Student Subject Enrollment & Historical Preservation | Section 7.2 (Lines 379–394) | `flowchart TD` |
+| 7 | Complete Examination Lifecycle | Section 8.1 (Lines 402–423) | `flowchart TD` |
+| 8 | Descriptive Answer File-Upload Pipeline | Section 11.2 (Lines 570–593) | `sequenceDiagram` |
+| 9 | Background Admit-Card Email Delivery | Section 12.2 (Lines 636–645) | `flowchart LR` |
+| 10 | Examination Attempt and Submission Sequence | Section 13.5 (Lines 1018–1064) | `sequenceDiagram` |
+| 11 | Evaluation & Results Publication Architecture | Section 14 (Lines 1069–1089) | `flowchart TD` |
 
 ### 4.2 Validation Method
 
@@ -117,11 +118,11 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 | **Dual-tier examination access** | Account login issues short-lived JWT/Session. Starting or resuming an exam requires verifying a cryptographically hashed Examination PIN, creating an ephemeral `exam_session_token`. | Section 6.3 & 13.2 |
 | **Configurable roll numbers** | Dynamic pattern-based template engine (`RollNumberScheme`) supporting college prefix, academic session, programme code, and zero-padded sequence numbers. Documented default is strictly illustrative; supports atomic `SELECT ... FOR UPDATE` allocation, admin correction workflows, and historical locking. | Section 10 |
 | **ReportLab PDF admit cards** | Pure-Python `reportlab.platypus` document builder generating pixel-perfect PDFs with candidate info, schedule table, instructions, and barcode/QR without OS cairo/pango dependencies. | Section 12 |
-| **Unified deadline timestamping ($T_{\text{ingress}}$)** | Distinction of 5 request stages; Nginx `$msec` semantics & limitations acknowledged; Nginx overwrites `X-Request-Arrival-Time`; accepted strictly from `TRUSTED_PROXIES`; direct backend access prevented via Unix socket/firewall; mandatory fail-closed behavior on missing/invalid timestamps in production (HTTP 502); WSGI fallback strictly restricted to dev/test environments. Writes accepted only when $T_{\text{ingress}} \le \text{official\_end\_time}$. | Section 13.1 |
-| **Two-stage finalization protocol** | Prevents race condition between in-flight on-time writes and deadline auto-closure. Stage 1 queue drain window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$) + Stage 2 Redis in-flight tracking (`exam:inflight:{id}`) + hard ceiling timeout (30s). Full 12-scenario concurrency analysis documented. | Section 13.1 & 13.4 |
+| **Unified deadline timestamping ($T_{\text{ingress}}$)** | Distinction of six request stages; Nginx `$msec` semantics & limitations acknowledged; Nginx overwrites `X-Request-Arrival-Time`; accepted strictly from `TRUSTED_PROXIES`; direct backend access prevented via Unix socket/firewall; mandatory fail-closed behavior on missing/invalid timestamps in production (HTTP 502); WSGI fallback strictly restricted to dev/test environments. Writes accepted only when $T_{\text{ingress}} \le \text{official\_end\_time}$. | Section 13.1 |
+| **Option B: Bounded-Processing Consistency Model** | Acknowledges OS socket queues and worker latency. Defines Application Admission Window ($\Delta_{\text{drain}} = 15\text{s}$). Single database row lock (`SELECT ... FOR UPDATE` on `ExamAttempt`) coordinates writes and auto-closure. Eliminates Redis TOCTOU gaps. Exhaustive 16-scenario concurrency analysis documented. | Section 13.1 & 13.4 |
 | **Evidence retention state machine** | Formal 4-state lifecycle (`UNCONFIGURED` -> `CONFIGURED` -> `EXPIRED` / `LEGAL_HOLD`). Hard production gate blocks exam activation while unconfigured. Immutable snapshots per exam and attempt. Scheduled daily deletion and legal hold mechanics. | Section 13.3.6 |
 | **Encrypted offline cache & dual-track recovery** | Concrete Web Crypto API `AES-256-GCM` encryption at rest in IndexedDB with 96-bit random IVs and AAD binding. Zero local PIN wrapping. Partitioned dual-track key recovery: Track A for active attempts before deadline; Track B for post-deadline read-only evidence recovery and diagnostic export within `EXAM_EVIDENCE_KEY_RETENTION_PERIOD`. Preserved unacknowledged answers; recovery bundles (`AUDIT_RECOVERY_BUNDLE`) with SHA-256 integrity metadata and server HMACs; institutional kiosk and deep freeze warning documented. | Section 13.3 |
-| **Reconciled submission lifecycle** | Explicit distinction between $T_{\text{ingress}}$ (`submitted_at`), $T_{\text{process}}$, and application transaction recording time `transaction_recorded_at` (persisted in `committed_at`). Exhaustive documentation of all 12 submission scenarios with exact HTTP response codes (200, 408, 409, 410, 502) and transactional row-locking semantics (`SELECT ... FOR UPDATE`). | Section 13.4 & 13.5 |
+| **Reconciled submission lifecycle (16 scenarios)** | Explicit distinction between $T_{\text{ingress}}$ (`submitted_at`), $T_{\text{admit}}$, and application transaction recording time `transaction_recorded_at` (persisted in `committed_at`). Exhaustive documentation of all 16 submission scenarios with exact HTTP response codes (200, 408, 409, 410, 502) and transactional row-locking semantics (`SELECT ... FOR UPDATE`). | Section 13.4 & 13.5 |
 | **XSS defense-in-depth** | Accurate acknowledgement of `HttpOnly` scope (stops raw cookie theft, but does not stop XSS session riding). Defense-in-depth enforced via React JSX default escaping, DOMPurify, strict Content Security Policy (`script-src 'self'`), backend input sanitization, and dependency scanning. | Section 15.2 & 17 |
 | **Explicit FYUGP eligibility** | Eligibility service filters active approved `StudentSubjectEnrollment` for targeted `PaperOffering`. Admin reviews, applies audited overrides, and locks immutable snapshot. | Section 7 & 8 |
 | **Role-based access & private files** | Django permission classes (`IsAdminRole`, `IsFacultyRole`, `IsApprovedStudent`). Private storage outside webroot with authenticated streaming downloads. | Section 4.2 & 11.4 |
@@ -175,13 +176,13 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
    - Nginx high-precision `$msec` arrival timestamping unconditionally injected as $T_{\text{ingress}}$.
    - Mandatory fail-closed enforcement in production: requests missing `$msec` or arriving from untrusted proxies immediately return HTTP 502 (`INGRESS_TIMESTAMP_INVALID`) and log `INGRESS_TIMESTAMP_INTEGRITY_FAILURE`.
    - Outermost WSGI middleware fallback is restricted strictly to development and testing environments (`ALLOW_WSGI_TIMESTAMP_FALLBACK = True`).
-   - Requests arriving before `end_time` at the trusted reverse proxy ($T_{\text{ingress}} \le \text{official\_end\_time}$) are accepted even if internal processing finishes slightly after `end_time`.
-   - Requests first received after `end_time` are rejected immediately with HTTP 410 Gone, and attempt is transitioned to `AUTO_CLOSED_DEADLINE`.
-4. **Race-Free Deadline Finalization Protocol:**
-   - Background supervisor worker will not initiate closure until $T_{\text{now}} \ge \text{official\_end\_time} + \Delta_{\text{ingress\_drain}}$ (15s).
-   - Active in-flight tracking via Redis hash `exam:inflight:{attempt_id}` defers finalization while qualifying requests execute, with a 30s hard ceiling preventing indefinite stalls.
-   - Database row-level locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) serializes concurrent autosaves, manual submissions, and supervisor workers.
-   - Full 12-scenario matrix defines exact behaviors, outcomes, and HTTP status codes.
+   - Requests arriving before `end_time` at the trusted reverse proxy ($T_{\text{ingress}} \le \text{official\_end\_time}$) and admitted before supervisor finalization are committed cleanly.
+   - Requests first received after `end_time` are rejected immediately with HTTP 410 (`EXAMINATION_CLOSED`).
+4. **Option B Bounded-Processing Consistency & Database Row-Lock Coordination:**
+   - Background supervisor worker will not initiate closure until $T_{\text{now}} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$ (15s).
+   - Single database row-level locking (`SELECT ... FOR UPDATE` on `ExamAttempt`) serializes concurrent autosaves, manual submissions, and supervisor workers.
+   - If an on-time request is delayed in socket queues past $\text{official\_end\_time} + \Delta_{\text{drain}}$ such that the supervisor has already committed `AUTO_CLOSED_DEADLINE`, the request is rejected with HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`) and preserved locally in `AUDIT_RECOVERY_BUNDLE` for Track B grievance appeal.
+   - Full 16-scenario matrix defines exact behaviors, outcomes, and HTTP status codes.
 5. **Peak Examination Traffic:**
    - Read-heavy live exam questions and configuration can be cached in Redis.
    - Static assets served directly by Nginx.
@@ -196,14 +197,14 @@ The table below enumerates all 11 Mermaid diagrams present in [`docs/architectur
 | :--- | :--- | :--- |
 | **Nginx `$msec` Semantics** | Nginx `$msec` represents user-space variable evaluation time during event loop processing, not a kernel/hardware packet arrival timestamp. | Documented as an acknowledged software stack limitation; system adopts an explicit conservative server-authoritative cutoff policy. |
 | **Production Ingress Header Tampering** | Untrusted clients or misconfigured reverse proxies sending manipulated `X-Request-Arrival-Time` headers. | Strict fail-closed policy: header accepted only from verified `TRUSTED_PROXIES`; missing or invalid headers return HTTP 502 `INGRESS_TIMESTAMP_INVALID` and log security audit event. |
-| **In-Flight Finalization Bounded Wait** | Extreme server worker queueing exceeding the 30-second hard ceiling could theoretically cause a late on-time request to encounter `AUTO_CLOSED_DEADLINE`. | Mitigated by 15s socket drain window + Redis in-flight tracking + worker sizing; uncommitted requests delayed beyond ceiling are logged as `ABANDONED_INFLIGHT_REQUEST` and preserved locally as `REJECTED_DEADLINE_EXCEEDED` for appeal. |
+| **Bounded Admission Drain Window (Option B)** | Extreme server worker queueing exceeding the 15-second drain window could theoretically cause a late on-time request to encounter `AUTO_CLOSED_DEADLINE`. | Mitigated by 15s socket drain window + worker sizing; uncommitted requests delayed beyond finalization receive HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`) and are preserved locally in `AUDIT_RECOVERY_BUNDLE` for administrative appeal. |
 | **Shared-Device Lab PC Reboot Sanitization** | Workstations running Deep Freeze or reboot-wipe scripts purge IndexedDB on reboot. | Documented mandatory operational rule: candidates experiencing exam disruption on shared lab PCs must export `AUDIT_RECOVERY_BUNDLE` prior to rebooting or leaving the workstation. |
 | **Post-Deadline Evidence Expiry** | Once the configured evidence key retention period (`EXAM_EVIDENCE_KEY_RETENTION_PERIOD`) expires, local ciphertext becomes permanently unrecoverable. | Documented policy lifecycle; server deletes DEKs post-retention; candidates must file appeals within institutional retention window; production activation gated on configured policy. |
 | **Diagnostic Bundle Verification Limits** | Client-generated timestamps inside `AUDIT_RECOVERY_BUNDLE` are self-reported and cannot cryptographically prove pre-deadline completion. | Documented limitation; bundle accompanied by SHA-256 integrity metadata; server-issued receipts authenticated via server HMAC; evaluation governed by administrative committee review rather than automatic override. |
 | **PIN Delivery Method** | Advance PIN printing on admit cards risks early disclosure; just-in-time delivery risks network/SMS bottlenecks on exam day. | System enforces mandatory configuration (`EXAM_PIN_DELIVERY_METHOD`); PIN generation blocked until college confirms choice. |
 | **Network Loss Across Deadline** | A student disconnected before deadline cannot upload offline answers after `end_time`. | Documented as strict server-authoritative integrity rule; attempt is auto-closed using last synchronized answers; unacknowledged answers preserved in `AUDIT_RECOVERY_BUNDLE` for grievance appeal via Track B. |
 | **Descriptive Upload Bandwidth** | Students on poor 4G uplinks uploading multiple photos may experience timeouts. | Client-side Canvas downscaling in React UI; provisional 5 MB default is configurable; multipart streaming; background retry. |
-| **Redis / Celery Infrastructure** | Requiring Redis and Celery daemon management could burden small single-server deployments. | Abstracted `TaskQueueService` allows running synchronous or DB-backed tasks in development/testing without requiring an active Redis server. |
+| **Redis / Celery Infrastructure** | Requiring Redis and Celery daemon management could burden small single-server deployments. | Core admission and finalization protocol coordinates strictly through MySQL row locks and continues to function without Redis. Abstracted `TaskQueueService` allows running synchronous or DB-backed tasks in development/testing without requiring an active Redis server. |
 
 ---
 
@@ -226,7 +227,7 @@ The following items are documented as proposed baselines and flagged for formal 
 ## 10. Final Audit Status
 
 * **Status:** **PASS WITH WARNINGS**
-* **Gate Sign-off:** All Chunk 01 requirements and Round 1–7 audit corrections are fully addressed. The Two-Stage Deadline Finalization Protocol resolves the in-flight race condition with mathematically bounded guarantees. The Evidence Retention State Machine establishes a hard production activation gate and complete lifecycle controls. All 11 Mermaid diagrams are reconciled and manually verified. Documented non-blocking institutional policies are explicitly flagged for college confirmation.
+* **Gate Sign-off:** All Chunk 01 requirements and Round 1–8 audit corrections are fully addressed. The Option B Bounded-Processing Consistency Model and database row-lock coordination resolve in-flight concurrency with technically defensible guarantees. The Evidence Retention State Machine establishes a hard production activation gate and complete lifecycle controls. All 11 Mermaid diagrams are reconciled and manually verified. Documented non-blocking institutional policies are explicitly flagged for college confirmation.
 * **Next Permitted Chunk:** **CHUNK 02 — DATABASE ARCHITECTURE** (pending explicit user approval).
 
-> **STOP:** All work for Chunk 01 is complete. No application code, packages, or database schemas have been generated. Awaiting explicit user approval before proceeding to Chunk 02.
+> **STOP:** All work for Chunk 01 is complete. No application code, packages, or database schemas have been generated. Awaiting explicit user approval before proceeding to Chunk 02.\n

@@ -437,12 +437,13 @@ flowchart TD
    - **During Active Exam Window (Server Time $\le \text{end\_time}$):** Backend recognizes active `ExamAttempt` (`status == IN_PROGRESS`). In-memory Data Encryption Key (DEK) is securely restored via **Live Examination Key Recovery** over TLS after verifying student identity, active attempt ownership, session token validity, and deadline compliance. Countdown timer reflects remaining server time; previously saved answers load immediately into the UI.
    - **After Examination Deadline (Server Time $> \text{end\_time}$ or Finalized):** Attempt cannot be resumed for answering. The student can access the **Post-Deadline Read-Only Evidence Recovery** workflow to restore the DEK strictly in read-only mode, decrypt locally preserved unsynchronized answers, and export an `AUDIT_RECOVERY_BUNDLE` for formal grievance appeal.
    - *(Note: Encrypted cached answers are temporarily inaccessible while the workstation remains completely offline until server re-authentication succeeds; no examination credentials or short PINs are stored locally as wrapping secrets).*
-3. **Deadline Reached & Strict Server-Authoritative Enforcement:**
+3. **Deadline Reached & Bounded-Processing Consistency Enforcement:**
    - The official examination deadline (`end_time`) is strictly server-authoritative and marks the absolute cutoff for answering questions.
    - Write requests (autosave updates and manual submissions) are accepted **only** when their authoritative ingress timestamp ($T_{\text{ingress}}$ evaluated via Nginx `$msec`, or fallback WSGI ingress in dev/test only) is $\le \text{official\_end\_time}$.
    - Requests first received after `end_time` are rejected for write, regardless of any client-side claims or offline timestamps.
-   - **In-Flight Concurrency Protocol:** Internal processing latency between reverse-proxy receipt and WSGI application completion is accommodated without opening a race condition. The system employs a two-stage finalization protocol (an Ingress Queue Drain Window $\Delta_{\text{ingress\_drain}} = 15\text{s}$ combined with a Redis-backed cross-worker in-flight registry `exam:inflight:{attempt_id}`). The background deadline worker will **never** finalize an attempt while qualifying on-time requests remain in-flight.
-   - Once all in-flight on-time requests have drained (or the hard ceiling timeout elapses), the attempt is transitioned to `AUTO_CLOSED_DEADLINE`, with `submitted_at = T_ingress` for on-time submissions and `closed_at = official_end_time` for auto-closed attempts, while recording `transaction_recorded_at` during the database transaction. All subsequent write APIs strictly reject modifications (HTTP 410).
+   - **Bounded-Processing Consistency Protocol (Option B):** Internal transport latency between reverse-proxy receipt and WSGI application completion is governed by a bounded processing window (Ingress Queue Drain Window $\Delta_{\text{drain}} = 15\text{s}$). The background deadline supervisor worker will not initiate finalization until $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$, giving on-time requests 15 seconds to traverse socket backlogs and achieve application admission.
+   - All write operations and deadline finalization serialize strictly on the database row lock (`SELECT ... FOR UPDATE` on `ExamAttempt`). Requests admitted before finalization commit cleanly (HTTP 200). If extreme queueing delays admission past finalization, the request is rejected with HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`), and the payload is preserved in the client's local recovery bundle (`AUDIT_RECOVERY_BUNDLE`) for grievance appeal.
+   - Once finalized, attempt status transitions to `AUTO_CLOSED_DEADLINE` (or `SUBMITTED`), with `submitted_at = T_ingress` for on-time submissions and `closed_at = official_end_time` for deadline auto-closures, while recording `transaction_recorded_at` during the database transaction. All subsequent write APIs strictly reject modifications (HTTP 410).
 4. **Email Delivery Failure:**
    - Failed email attempts are captured in `AdmitCardEmailQueue` with error message.
    - Admin monitor displays failed records; provides single-click "Retry Failed Emails" batch action.
@@ -652,13 +653,20 @@ flowchart LR
 * **Zero Trust in Client Timestamps:**
   - Client/browser timestamps are **never trusted** by the server as proof that an answer was entered or submitted before the deadline. A compromised client, manipulated system clock, or modified script could trivially forge pre-deadline timestamps.
   - The server's clock and trusted network gateway timestamps strictly govern all deadlines.
-* **Request Ingress Pipeline & Timestamp Semantics:**
-  To ensure technical rigor, the architecture distinguishes the five distinct stages of the request lifecycle:
-  1. *Physical / Kernel TCP Ingress:* The client's TCP packets arrive at the physical host network interface card (NIC) and are buffered in the Linux kernel socket queue.
-  2. *Reverse-Proxy User-Space Ingress & Variable Evaluation:* The Nginx worker event loop (`epoll`) wakes up, reads the HTTP request line and headers from the socket, and evaluates configuration variables (such as `$msec`).
-  3. *Upstream Forwarding:* Nginx formats the HTTP request, injects trusted headers, and writes data to the upstream socket (Unix domain socket or loopback TCP) connecting to Gunicorn.
-  4. *WSGI Server Ingress & Parsing:* The Gunicorn worker process reads from the upstream socket, parses the HTTP stream into the Python WSGI `environ` dictionary, and invokes the Django WSGI application callable.
-  5. *Backend Application Processing:* Django middleware executes, the request is routed to the Django REST Framework view, serializers validate input, and MySQL database transactions commit.
+* **Request Ingress Pipeline & The Six Lifecycle Stages:**
+  To ensure absolute technical rigor and eliminate false concurrency assumptions, the architecture distinguishes the **six distinct stages** of the request and data lifecycle:
+  1. *Physical Network Arrival:* The client's TCP packets arrive at the physical host network interface card (NIC) and are buffered in the Linux operating system kernel socket queue.
+  2. *Perimeter Timestamp Evaluation ($T_{\text{ingress}}$):* The Nginx worker event loop (`epoll`) wakes up, reads the HTTP request line and headers from the socket, and evaluates `$msec` as the trusted perimeter ingress timestamp.
+  3. *Complete HTTP Request Receipt:* Nginx fully ingests and buffers the complete HTTP request body from the client (governed by `client_body_timeout 10s`). A request is not forwarded upstream until headers and body are fully received.
+  4. *Application Admission ($T_{\text{admit}}$):* The Gunicorn worker process accepts the connection from the upstream Unix socket backlog, parses the WSGI environment, and dispatches the request into the Django application middleware.
+  5. *Database Transaction Execution:* Django view logic executes, begins an atomic database transaction, and acquires an exclusive row lock on the `ExamAttempt` record (`SELECT ... FOR UPDATE`).
+  6. *Successful Durable Commit:* The MySQL InnoDB transaction commits, flushing the write-ahead log (WAL / redo log) to persistent storage, establishing durable persistence.
+
+* **Critical Architectural Clarification on Ingress Timestamps:**
+  - A timestamp evaluated at Stage 2 ($T_{\text{ingress}}$) represents perimeter receipt time; it **does NOT** guarantee application admission (Stage 4) or durable commit (Stage 6).
+  - If a worker crashes, the connection drops, or upstream socket backlogs exceed the processing window, an on-time timestamp alone cannot force a database write.
+  - The architecture therefore adopts **Option B: Bounded-Processing Consistency**.
+
 * **Semantics and Technical Limitations of Nginx `$msec`:**
   - In Nginx, `$msec` evaluates to the current time in seconds with millisecond resolution (`time_t sec + msec`) obtained from Nginx's internal cached time structure, which is updated on each event loop iteration via `ngx_time_update()` (derived from `gettimeofday()`).
   - **Limitations:**
@@ -708,35 +716,26 @@ flowchart LR
 * **Distinction Between Request Arrival and Processing Completion:**
   - If a request arrives at the trusted reverse proxy before the deadline ($T_{\\text{ingress}} \le \text{official\_end\_time}$), but backend worker thread scheduling or database lock contention causes processing to complete slightly after ($T_{\\text{complete}} > \text{official\_end\_time}$), the write is **accepted and committed** because the request was verified to have arrived on time.
   - The internal latency buffer accommodates server processing queues, but **never extends answering time or permits late-arriving requests**.
-* **Exact Handling of Requests at the Deadline & In-Flight Concurrency Protocol:**
-  1. **Autosave Arriving On or Before Deadline ($T_{\text{ingress}} \le \text{end\_time}$):**
-     - Registered in Redis in-flight tracker upon WSGI entry: `HSET exam:inflight:{attempt_id} {request_uuid} "{T_ingress}:{time}"`.
-     - Verified against monotonic sequence version (`incoming_seq > stored_seq`) under `ExamAttempt` row lock.
-     - Answer updated in database; returns HTTP 200 with server timestamp and acknowledged sequence.
-     - De-registered from Redis in-flight tracker in `finally` block.
-  2. **Autosave Arriving After Deadline ($T_{\text{ingress}} > \text{end\_time}$):**
-     - Write operation is rejected immediately with HTTP 410 (`EXAMINATION_CLOSED`).
-     - Answer payload is discarded. The attempt is transitioned to `AUTO_CLOSED_DEADLINE` if not already finalized.
-  3. **Submission Arriving On or Before Deadline ($T_{\text{ingress}} \le \text{end\_time}$):**
-     - Registered in Redis in-flight tracker upon WSGI entry.
-     - Atomic transaction locks attempt (`SELECT ... FOR UPDATE`), transitions `status = SUBMITTED`, sets `submitted_at = T_ingress`, records application transaction time `transaction_recorded_at = timezone.now()` (persisted in field `committed_at`).
-     - De-registers from Redis in-flight tracker.
-     - Automatically invokes idempotent MCQ auto-grading and returns a signed submission receipt.
-  4. **Submission Arriving After Deadline ($T_{\text{ingress}} > \text{end\_time}$):**
-     - Manual submission write is rejected.
-     - Atomic transaction checks attempt state; if `IN_PROGRESS`, transitions `status = AUTO_CLOSED_DEADLINE`, sets `closed_at = official_end_time`, records application transaction time `transaction_recorded_at = timezone.now()` (persisted in field `committed_at`).
-     - Invokes MCQ auto-grading on all answers successfully saved on or before `end_time`.
-     - Returns HTTP 410 with auto-closure receipt reflecting that manual submission was rejected for late arrival, and the attempt was auto-closed at the deadline.
-  5. **Network Interruptions Across the Deadline:**
-     - If a student disconnects before the deadline and reconnects afterward, any answers entered into the local offline cache after `end_time` **cannot be accepted**.
-     - Upon reconnection, the client receives HTTP 410 informing the student that the exam has closed; the attempt is finalized using only the answers synchronized prior to `end_time`. Preserved unacknowledged answers can be inspected or exported via Track B Post-Deadline Evidence Recovery.
-* **Authoritative In-Flight Request Tracking Mechanism across Gunicorn Workers:**
-  - **Cross-Worker Redis Registry:** Because Gunicorn runs multiple worker processes, in-flight requests cannot be tracked in Python process memory. The system uses a centralized, high-speed Redis hash: `exam:inflight:{attempt_id}`.
-  - **Ingress Queue Drain Window ($\Delta_{\text{ingress\_drain}} = 15\text{s}$):** When the examination reaches `official_end_time`, requests that physically arrived at Nginx prior to the deadline may still be traversing Nginx buffers, the Unix domain socket backlog, or Gunicorn worker dispatch. The supervisor worker enforces a mandatory delay window $\Delta_{\text{ingress\_drain}}$ before initiating finalization.
-  - **Two-Stage Deadline Supervisor Finalization Protocol:**
-    - *Stage 1 (Queue Drain Wait):* The background supervisor worker (`evaluate_examination_deadline_closure`) will **never** initiate attempt closure until: $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{ingress\_drain}}$.
-    - *Stage 2 (In-Flight Registry Verification):* At $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{ingress\_drain}}$, the supervisor queries `HLEN exam:inflight:{attempt_id}`. If active in-flight requests exist (with timestamps younger than the 30s stale threshold), the supervisor yields and reschedules for check after 2 seconds.
-    - *Stage 3 (Hard Ceiling Timeout):* To prevent an abandoned request, broken TCP connection, or crashed worker from delaying finalization indefinitely, a hard ceiling is enforced at $\text{server\_time} = \text{official\_end\_time} + \Delta_{\text{ingress\_drain}} + \Delta_{\text{hard\_ceiling}}$ ($15\text{s} + 15\text{s} = 30\text{s}$). At the hard ceiling, any remaining in-flight entries are logged as `ABANDONED_INFLIGHT_REQUEST` in `AuditLog` and purged, and finalization proceeds unconditionally under database row lock.
+* **Bounded-Processing Consistency Model & Database-Coordinated Finalization:**
+  To eliminate distributed state mismatch and non-atomic coordination gaps, the system coordinates admission and finalization **strictly through the database row lock on `ExamAttempt`**.
+
+  1. **Dual Conditions for Write Acceptance:**
+     A write request (autosave or submission) is accepted for durable persistence if and only if **both** of the following conditions are met:
+     - **Condition 1 (On-Time Ingress):** Its trusted perimeter ingress timestamp was on or before the deadline: $T_{\text{ingress}} \le \text{official\_end\_time}$.
+     - **Condition 2 (Admitted Prior to Finalization):** The request achieves application admission and acquires the `ExamAttempt` row lock while `status == IN_PROGRESS`.
+  2. **Application Admission Window ($W_{\text{admission}}$):**
+     To accommodate legitimate transport and queueing latency for on-time requests, the system provides a bounded processing window:
+     $$W_{\text{admission}} = [\text{start\_time}, \text{official\_end\_time} + \Delta_{\text{drain}}] \quad (\Delta_{\text{drain}} = 15\text{ seconds})$$
+  3. **Deadline Supervisor Finalization Protocol:**
+     The background supervisor worker (`evaluate_examination_deadline_closure`) will **never** initiate attempt closure until the processing drain window has elapsed:
+     $$\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$$
+     At that instant, the supervisor acquires the row lock: `SELECT * FROM ExamAttempt WHERE id = :id FOR UPDATE`.
+     - If `status == IN_PROGRESS`: transitions `status = AUTO_CLOSED_DEADLINE`, sets `closed_at = official_end_time`, `committed_at = transaction_recorded_at`, commits, and triggers MCQ evaluation.
+     - If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`: releases lock and exits idempotently.
+  4. **Bounded Exception & Grievance Fallback:**
+     If extreme server queueing, worker contention, or network stall delays an on-time request past $\text{official\_end\_time} + \Delta_{\text{drain}}$ such that the supervisor has already committed `AUTO_CLOSED_DEADLINE`, the request is rejected with HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`). The answer payload is preserved in the candidate's local encrypted IndexedDB storage as `REJECTED_DEADLINE_EXCEEDED` inside the `AUDIT_RECOVERY_BUNDLE` for formal grievance appeal via Track B.
+  5. **Late Ingress Rejection:**
+     Any request whose perimeter ingress timestamp is $> \text{official\_end\_time}$ is **strictly rejected** immediately with HTTP 410 (`EXAMINATION_CLOSED`), regardless of server load or drain windows. The drain window **never** extends answering time for late requests.
 
 ### 13.2 Autosave Strategy & Monotonic Sequence Versioning
 
@@ -966,41 +965,53 @@ The retention and disposal of server-wrapped Data Encryption Keys (`ExamAttempt.
   - High-stakes examinations should be conducted on college-controlled workstations configured in **Kiosk Mode** (locked down full-screen browser, disabled DevTools via Group Policy, extension installation blocked).
   - Regular automated workstation sanitization: nightly deep-freeze or reboot scripts wiping temporary profiles and browser storage.
 
-### 13.4 Idempotent Submissions, Locking Order & 12-Scenario Concurrency Analysis
+### 13.4 Idempotent Submissions, Locking Order & 16-Scenario Concurrency Analysis
 
 #### 13.4.1 Accurate Timestamp Definitions for Submissions
-To resolve lifecycle ambiguity and maintain technical precision, the architecture defines three distinct timestamps:
-* **$T_{\text{ingress}}$ (Authoritative Ingress Timestamp):** The software-evaluated timestamp captured at the perimeter reverse proxy (Nginx `$msec`), or at outermost WSGI ingress ($T_{\text{wsgi\_ingress}}$ in dev/test only). For accepted submissions, this represents `submitted_at`.
-* **$T_{\text{process}}$:** The timestamp when the backend WSGI worker begins executing the submission logic.
-* **Application Transaction Recording Time (`transaction_recorded_at`):** The application server timestamp captured during the database transaction block (`django.utils.timezone.now()`), persisted in the model field `committed_at`.
+To maintain technical precision, the architecture defines three distinct timestamps:
+* **$T_{\text{ingress}}$ (Perimeter Ingress Timestamp):** High-precision Nginx `$msec` captured at header read. Recorded immutably as `submitted_at` for on-time submissions.
+* **$T_{\text{admit}}$ (Application Admission Timestamp):** The instant a Gunicorn worker accepts the request and enters Django middleware.
+* **`transaction_recorded_at` (Model field `committed_at`):** Application server timestamp captured during the database transaction block (`django.utils.timezone.now()`).
   - **Technical Precision Note:** The architecture explicitly distinguishes between application transaction recording time and the actual database engine transaction commit instant. The hardware/engine commit completion instant is an internal MySQL InnoDB event (write-ahead log / redo log flush) that cannot be directly observed by the Python application layer without specialized database binary log hooks. The field `committed_at` therefore accurately records the application-evaluated transaction execution timestamp.
 
-#### 13.4.2 Transaction Boundaries & Row-Lock Acquisition Order
-To prevent deadlocks and race conditions across concurrent autosaves, manual submissions, and the background deadline worker, **all write operations adhere to a strict, universal row-lock acquisition order**:
-1. **Acquire Exclusive Row Lock:** Execute atomic `SELECT * FROM ExamAttempt WHERE id = :attempt_id FOR UPDATE`.
-2. **Evaluate In-Flight Registry:** Validate that active in-flight requests for this attempt are de-registered upon completion.
-3. **Inspect Attempt Status & Timestamp:**
-   - If `status == IN_PROGRESS` and $T_{\text{ingress}} \le \text{official\_end\_time}$: execute update (Answer or Submission), commit transaction, release row lock.
-   - If `status == SUBMITTED`: reject writes with HTTP 409 Conflict (`ATTEMPT_ALREADY_FINALIZED`), or return cached submission receipt if duplicate submission.
-   - If `status == AUTO_CLOSED_DEADLINE`: reject writes with HTTP 410 Gone (`EXAMINATION_CLOSED`).
-4. **Mcq Grading Execution:** Triggered asynchronously **only after** the final transactional state has committed to the database, ensuring zero grading runs on intermediate or uncommitted data.
+#### 13.4.2 Database-Coordinated Row-Locking Order & Transaction Boundaries
+Admission and finalization are coordinated **strictly through MySQL InnoDB ACID row locks** (`SELECT ... FOR UPDATE` on `ExamAttempt`), eliminating distributed race conditions and TOCTOU gaps:
+1. **Acquire Exclusive Row Lock:** Execute `SELECT * FROM ExamAttempt WHERE id = :attempt_id FOR UPDATE`.
+2. **Evaluate Ingress Timestamp & Attempt Status:**
+   - **Autosave Request:**
+     - If `status == IN_PROGRESS` and $T_{\text{ingress}} \le \text{official\_end\_time}$: execute `UPDATE Answer SET ... WHERE question_id = :qid AND version_sequence < :seq`, commit transaction, release lock. Return **HTTP 200 (OK)**.
+     - If `status == SUBMITTED`: reject with **HTTP 409 (Conflict)** `{ error: "ATTEMPT_ALREADY_FINALIZED" }`.
+     - If `status == AUTO_CLOSED_DEADLINE`: reject with **HTTP 410 (Gone)** `{ error: "WRITE_REJECTED_FINALIZATION_COMPLETED" }`.
+   - **Manual Submission Request:**
+     - If `status == IN_PROGRESS` and $T_{\text{ingress}} \le \text{official\_end\_time}$: transition `status = SUBMITTED`, `submitted_at = T_ingress`, `committed_at = transaction_recorded_at`, commit transaction, release lock. Trigger asynchronous MCQ evaluation. Return **HTTP 200 (OK)** with signed submission receipt.
+     - If `status == SUBMITTED` and `submission_uuid == attempt.submission_uuid`: return cached submission receipt (**HTTP 200 OK**, idempotent retry).
+     - If `status == AUTO_CLOSED_DEADLINE`: reject with **HTTP 410 (Gone)** `{ error: "MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED" }`.
+   - **Deadline Supervisor Worker:**
+     - Waits until $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$ (15s).
+     - Acquires row lock: if `status == IN_PROGRESS`, transitions `status = AUTO_CLOSED_DEADLINE`, `closed_at = official_end_time`, `committed_at = transaction_recorded_at`, commits transaction, release lock. Triggers asynchronous MCQ evaluation.
+     - If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`, releases lock and exits idempotently.
+3. **MCQ Grading Execution:** Evaluates strictly after the final transactional state has committed to MySQL, ensuring grading runs on the frozen answer snapshot.
 
-#### 13.4.3 Scenario-by-Scenario Concurrency Analysis (12 Scenarios)
+#### 13.4.3 Scenario-by-Scenario Concurrency Analysis (16 Scenarios)
 
-| # | Scenario Description | Ingress Timestamp & Conditions | Execution Path & Lock Serialization | Authoritative Outcome & HTTP Response |
+| # | Scenario Description | Ingress Timestamp & Conditions | Lock Serialization & Path | Authoritative Outcome & HTTP Code |
 | :-: | :--- | :--- | :--- | :--- |
-| **1** | **Autosave arrives before deadline and commits before deadline** | $T_{\text{ingress}} \le \text{end\_time}$; processed while $T_{\text{process}} \le \text{end\_time}$. | Registers in Redis tracker; acquires row lock on `ExamAttempt` (`status == IN_PROGRESS`); updates `Answer` row (`WHERE version_sequence < incoming_seq`); commits; de-registers. | **HTTP 200 (OK)**<br>`{ status: "SAVED", seq: N, timestamp: T_server }` |
-| **2** | **Autosave arrives before deadline but reaches Django after deadline** | $T_{\text{ingress}} \le \text{end\_time}$; buffered in Unix socket backlog; reaches Django at $T_{\text{process}} > \text{end\_time}$. | Registers in Redis tracker; supervisor is held in Stage 1 queue drain window ($\Delta_{\text{ingress\_drain}}$); request acquires row lock on `ExamAttempt` (`status == IN_PROGRESS`); verifies $T_{\text{ingress}} \le \text{end\_time}$; commits answer; de-registers. | **HTTP 200 (OK)**<br>Answer accepted because ingress arrival was verified on-time before deadline. |
-| **3** | **Manual submission arrives before deadline but waits behind an autosave** | Both requests arrive at $T_{\text{ingress}} \le \text{end\_time}$; autosave enters view first. | Autosave acquires row lock first, updates answer, commits, releases lock. Submission then acquires row lock, sees updated answer, transitions `status = SUBMITTED`, `submitted_at = T_ingress`, commits, enqueues grading. | **HTTP 200 (OK)**<br>Submission succeeds cleanly with signed receipt; all pre-deadline answers included. |
-| **4** | **Autosave arrives before deadline but waits behind manual submission** | Both requests arrive at $T_{\text{ingress}} \le \text{end\_time}$; submission enters view first. | Submission acquires row lock first, marks `status = SUBMITTED`, commits, releases lock. Autosave then acquires row lock, inspects attempt state, sees `status == SUBMITTED`. | **HTTP 409 (Conflict)**<br>`{ error: "ATTEMPT_ALREADY_FINALIZED" }`<br>Zero writes permitted post-submission. |
-| **5** | **Multiple on-time requests arrive out of processing order** | Request A (seq=5, $T_1$), Request B (seq=6, $T_2$) where $T_1 < T_2 \le \text{end\_time}$; worker thread scheduling causes B to reach DB before A. | Request B acquires lock, updates answer with seq=6 (`WHERE seq < 6`). Request A acquires lock next; update query condition `WHERE seq < 5` fails against stored seq=6; zero rows modified. | **Request B: HTTP 200 (Saved)**<br>**Request A: HTTP 200 (Stale Sequence Ignored)**<br>Database state deterministically preserves latest monotonic answer. |
-| **6** | **Request reaches Nginx before deadline but body finishes uploading afterward** | TCP stream starts before deadline; Nginx evaluates `$msec$ at header read; body transmission is slow. | Nginx enforces `client_body_timeout 10s`. If body transfer completes within timeout, request forwards with $T_{\text{ingress}} \le \text{end\_time}$ and executes within drain window. If transfer stalls past body timeout, Nginx aborts connection. | **HTTP 408 (Request Timeout)** or **HTTP 200 (if completed within timeout)**.<br>Zero partial or corrupted request bodies committed. |
-| **7** | **Deadline worker executes while requests remain queued** | Background supervisor runs at $T_{\text{now}} > \text{end\_time}$; valid requests are queued in socket backlog or in-flight in Gunicorn. | Supervisor enforces Stage 1 wait ($T_{\text{now}} \ge \text{end\_time} + \Delta_{\text{ingress\_drain}}$) and Stage 2 check (`HLEN exam:inflight:{id} == 0`). Supervisor yields and defers closure until in-flight requests complete. | **Queued Requests: HTTP 200 (Processed)**<br>Supervisor finalization deferred until queue drains; prevents premature auto-close. |
-| **8** | **Gunicorn worker crashes after request acceptance** | Request accepted by Nginx; Gunicorn worker crashes (`SIGSEGV` / OOM) before commit. | Database transaction rolls back automatically (MySQL connection termination); Redis in-flight entry expires via TTL (60s); client detects network drop / HTTP 502 and initiates retry. | **HTTP 502 (Bad Gateway)** to client.<br>Client retries with same sequence / submission UUID; supervisor finalizes cleanly after hard ceiling. |
-| **9** | **Network disconnects during a pending request** | Client sends request; connection drops while Django is executing or returning response. | If dropped before body upload finishes, Nginx logs HTTP 499 and aborts. If dropped during Django execution, Django commits transaction; client reconnects and retries with same sequence / submission UUID. | **Client Reconnects & Retries**:<br>Monotonic versioning or submission idempotency returns existing committed state cleanly. |
-| **10** | **Retry arrives after deadline** | Client retries request after `official_end_time` following a client-side timeout. | Case A (Autosave retry): $T_{\text{ingress}} > \text{end\_time}$; rejected immediately with HTTP 410.<br>Case B (Submission retry): $T_{\text{ingress}} > \text{end\_time}$, but `submission_uuid` matches existing attempt already `SUBMITTED`; returns cached receipt. | **Case A: HTTP 410 (Examination Closed)**<br>**Case B: HTTP 200 (OK / Idempotent Receipt)**<br>Late autosaves rejected; existing on-time submissions verified idempotently. |
-| **11** | **Two deadline workers attempt finalization simultaneously** | Multiple Celery worker instances attempt to finalize the same expired attempt. | Both execute `SELECT * FROM ExamAttempt WHERE id = :id FOR UPDATE`. Worker 1 acquires lock, transitions to `AUTO_CLOSED_DEADLINE`, commits, enqueues grading. Worker 2 acquires lock next, inspects state, sees `AUTO_CLOSED_DEADLINE`. | **Worker 1: Commits Finalization**<br>**Worker 2: Idempotent No-Op Exit**<br>Zero duplicate auto-closures or conflicting states. |
-| **12** | **MCQ grading job is triggered more than once** | Duplicate Celery message or concurrent submit/auto-close triggers `evaluate_mcq_attempt`. | Grading task acquires row lock on `EvaluationResult` or checks `is_evaluated` flag under transaction. Task 1 computes scores and commits result. Task 2 acquires lock, sees `is_evaluated == True`, and skips computation. | **Exactly One Evaluation Record**<br>Zero score alteration or duplicate result entries. |
+| **1** | **On-time autosave admitted before deadline** | $T_{\text{ingress}} \le \text{end}$; admitted at $T_{\text{admit}} \le \text{end}$. | Acquires row lock on `IN_PROGRESS` attempt; updates `Answer` row (`WHERE version_sequence < incoming_seq`); commits transaction. | **HTTP 200 (OK)**<br>`{ status: "SAVED", seq: N, timestamp: T_server }` |
+| **2** | **On-time autosave admitted after deadline within processing window** | $T_{\text{ingress}} \le \text{end}$; buffered in socket queue; admitted at $T_{\text{admit}} \le \text{end} + \Delta_{\text{drain}}$. | Supervisor delayed in drain window ($\Delta_{\text{drain}} = 15\text{s}$); request acquires row lock on `IN_PROGRESS` attempt; verifies $T_{\text{ingress}} \le \text{end}$; commits answer. | **HTTP 200 (OK)**<br>Answer accepted because ingress arrival was verified on-time and admitted before closure. |
+| **3** | **On-time request still queued after processing window** | $T_{\text{ingress}} \le \text{end}$; extreme queueing delays admission past $\text{end} + \Delta_{\text{drain}}$. | Supervisor has already acquired lock, transitioned attempt to `AUTO_CLOSED_DEADLINE`, and committed. Request acquires lock next, sees `AUTO_CLOSED_DEADLINE`. | **HTTP 410 (Gone)**<br>`{ error: "WRITE_REJECTED_FINALIZATION_COMPLETED" }`<br>Preserved locally in `AUDIT_RECOVERY_BUNDLE` for grievance appeal. |
+| **4** | **Late autosave** | $T_{\text{ingress}} > \text{end}$. | Evaluated immediately at ingress middleware; rejected before touching attempt state. | **HTTP 410 (Gone)**<br>`{ error: "EXAMINATION_CLOSED" }`<br>Zero late data committed. |
+| **5** | **On-time manual submission** | $T_{\text{ingress}} \le \text{end}$; admitted within processing window while `status == IN_PROGRESS`. | Acquires row lock, marks `status = SUBMITTED`, `submitted_at = T_ingress`, `committed_at = transaction_recorded_at`, commits, enqueues MCQ grading. | **HTTP 200 (OK)**<br>Signed submission receipt returned with immutable $T_{\text{ingress}}$. |
+| **6** | **Late manual submission** | $T_{\text{ingress}} > \text{end}$. | Submission rejected for late arrival. Atomic transaction transitions attempt to `AUTO_CLOSED_DEADLINE` (if open) with `closed_at = official_end_time`. | **HTTP 410 (Gone)**<br>`{ error: "MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED" }`<br>Auto-closure receipt returned; pre-deadline answers graded. |
+| **7** | **Concurrent autosave and manual submission** | Both arrive at $T_{\text{ingress}} \le \text{end}$; compete for row lock. | Case A (Autosave first): Autosave updates answer, commits. Submission acquires lock next, marks `SUBMITTED`, commits.<br>Case B (Submission first): Submission marks `SUBMITTED`, commits. Autosave acquires lock next, sees `SUBMITTED`. | **Case A: Both HTTP 200 (OK)**<br>**Case B: Submission HTTP 200 (OK); Autosave HTTP 409 (Conflict / Finalized)** |
+| **8** | **Request admission racing with finalization** | On-time request and deadline worker compete for row lock at $T \approx \text{end} + \Delta_{\text{drain}}$. | MySQL InnoDB row lock serializes execution atomically.<br>If request wins lock: commits write; supervisor acquires lock next and finalizes attempt.<br>If supervisor wins lock: commits `AUTO_CLOSED_DEADLINE`; request acquires lock next and sees finalized state. | **If request wins: HTTP 200 (OK)**<br>**If supervisor wins: HTTP 410 (Gone / Finalized)**<br>Zero TOCTOU gap; atomic database coordination. |
+| **9** | **Worker crash after admission** | Worker accepts connection, acquires row lock, but crashes (OOM / `SIGSEGV`) before commit. | MySQL detects connection termination and rolls back uncommitted transaction automatically. Row lock released. Client detects network drop / HTTP 502. | **HTTP 502 (Bad Gateway)** to client.<br>Client retries with same sequence / submission UUID; state remains clean. |
+| **10** | **Worker crash before admission** | Worker crashes while request is buffered in socket backlog or during HTTP header read. | Nginx detects upstream socket closure and returns HTTP 502 to client. Zero application or database state touched. | **HTTP 502 (Bad Gateway)** to client.<br>Client retries with same sequence / submission UUID. |
+| **11** | **Duplicate submission UUID** | Client double-clicks or retries submit after network timeout with identical `submission_uuid`. | Acquires row lock, matches `submission_uuid` on already `SUBMITTED` attempt, reads existing state. | **HTTP 200 (OK)**<br>Cached submission receipt returned (`idempotency: "ALREADY_SUBMITTED"`). Zero re-grading. |
+| **12** | **Duplicate deadline workers** | Multiple Celery worker processes execute finalization task simultaneously. | Both execute `SELECT ... FOR UPDATE`. Worker 1 acquires lock, marks `AUTO_CLOSED_DEADLINE`, commits. Worker 2 acquires lock next, sees `AUTO_CLOSED_DEADLINE`. | **Worker 1: Commits Finalization**<br>**Worker 2: Idempotent No-Op Exit**<br>Zero duplicate auto-closures or conflicting states. |
+| **13** | **Redis unavailable** | Redis cache / broker is down or unreachable. | Core admission and finalization protocol coordinates strictly through MySQL row locks and continues to function without Redis. Tasks fall back to synchronous execution via `TaskQueueService`. | **Writes and Finalization Succeed (HTTP 200 / 410)**.<br>Zero data loss; admission correctness independent of Redis. |
+| **14** | **MySQL temporarily unavailable** | Transient database deadlock, timeout, or connection drop. | Django transaction rolls back, returns HTTP 503 or HTTP 500. Client catches error, keeps answer cached in IndexedDB (`SYNC_PENDING`), and retries with backoff. | **HTTP 503 (Service Unavailable)**<br>Local client cache safely preserves answers until database recovers. |
+| **15** | **Request body incomplete at deadline** | Header read before deadline ($T_{\text{ingress}} \le \text{end}$); body upload slow. | Nginx buffers body under `client_body_timeout 10s`. If completed within timeout, request forwards to Gunicorn. If stalled past timeout, Nginx aborts connection. | **HTTP 408 (Request Timeout)** or **HTTP 200 (if completed within timeout)**.<br>Zero partial or corrupted request bodies committed. |
+| **16** | **MCQ grading triggered more than once** | Duplicate worker message or concurrent submit/auto-close triggers `evaluate_mcq_attempt`. | Grading task acquires row lock on `EvaluationResult` or checks `is_evaluated` flag under transaction. Task 1 computes scores and commits result. Task 2 acquires lock, sees `is_evaluated == True`, and skips computation. | **Exactly One Evaluation Record**<br>Zero score alteration or duplicate result entries. |
 
 ### 13.5 Examination Attempt and Submission Sequence
 
@@ -1161,10 +1172,8 @@ To defend against XSS and protect session integrity, the architecture enforces m
 | **Hashed Exam PINs** | Plaintext PINs in DB | If the database is compromised, plaintext PINs would allow unauthorized exam access. Hashing ensures zero-knowledge security. |
 | **Private File Storage** | Public S3 / Media root | Descriptive answer scripts and admit cards contain private student academic data; public URLs present severe privacy violations. |
 | **Encrypted Offline Cache & Dual-Track Key Recovery** | Plaintext IndexedDB / localStorage | Plaintext browser storage fails the shared-device threat model. AES-256-GCM at rest protects answers against extraction via browser DevTools on shared workstations. In-memory DEK is zeroed on tab close/logout. Dual-track key recovery separates active live exam resumption (Track A, server time $\le$ deadline, write-enabled) from post-deadline read-only evidence recovery (Track B, within configurable retention period, read-only). Zero credentials or PINs are stored locally as wrapping secrets. |
-| **Two-Stage Deadline Finalization Protocol** | Immediate background auto-close at deadline | Immediate auto-closure creates a race condition that prematurely rejects valid on-time requests waiting in socket backlogs or Gunicorn workers. The two-stage protocol (Queue Drain Window $\Delta_{\text{ingress\_drain}} = 15\text{s}$ + Redis in-flight registry `exam:inflight:{id}`) guarantees all qualifying on-time requests drain before finalization, with a hard ceiling (30s) preventing indefinite stalls. |
+| **Bounded-Processing Consistency Protocol (Option B)** | Unrealistic absolute admission guarantees or non-atomic distributed locks | Web applications cannot prevent operating system socket backlogs or worker queueing under extreme load. Option B defines an explicit Application Admission Window ($\Delta_{\text{drain}} = 15\text{s}$) and coordinates admission and finalization strictly through MySQL InnoDB ACID row locks (`SELECT ... FOR UPDATE` on `ExamAttempt`). Eliminates TOCTOU gaps and Redis dependencies. Requests delayed past the drain window are rejected with HTTP 410 and preserved in local diagnostic recovery bundles for appeal. |
 | **Evidence Retention State Machine & Activation Gate** | Unrestricted / unconfigured default retention | Unconfigured retention periods leave key lifecycle undefined. The four-state configuration machine (`UNCONFIGURED` -> `CONFIGURED` -> `EXPIRED` / `LEGAL_HOLD`) enforces a hard production activation gate: no examination can be published or scheduled until college administration explicitly approves and signs an integer retention policy. |
-
----
 
 ## 18. Open Questions & Future Confirmation
 
