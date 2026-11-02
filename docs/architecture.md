@@ -436,10 +436,10 @@ flowchart TD
    - Student navigates back to exam URL.
    - Backend recognizes active `ExamAttempt` (`status == IN_PROGRESS`); resumes existing attempt only if server time is $\le \text{end\_time}$.
    - Countdown timer reflects remaining server time (no time lost, no timer reset).
-   - In-memory encryption key is restored via server-assisted release or candidate PIN unwrap, and previously saved answers load immediately into the UI.
+   - In-memory Data Encryption Key (DEK) is securely restored via authenticated server-assisted key release over TLS after verifying student identity, active attempt ownership, session token validity, and deadline compliance. (Note: Encrypted cached answers are temporarily inaccessible while the workstation remains completely offline until server re-authentication succeeds; no examination credentials or short PINs are stored locally as wrapping secrets). Previously saved answers load immediately into the UI.
 3. **Deadline Reached & Strict Server-Authoritative Enforcement:**
    - The official examination deadline (`end_time`) is strictly server-authoritative and marks the absolute cutoff for answering questions.
-   - Write requests (autosave updates and manual submissions) are accepted **only** when their authoritative ingress timestamp ($T_{\\text{ingress}}$ evaluated via Nginx `$msec` or fallback WSGI ingress) is $\le \text{official\_end\_time}$.
+   - Write requests (autosave updates and manual submissions) are accepted **only** when their authoritative ingress timestamp ($T_{\text{ingress}}$ evaluated via Nginx `$msec`, or fallback WSGI ingress in dev/test only) is $\le \text{official\_end\_time}$.
    - Requests first received after `end_time` are rejected for write, regardless of any client-side claims or offline timestamps.
    - Internal processing latency between reverse-proxy receipt and WSGI application completion is accommodated (distinguishing arrival from processing completion), but network transport latency that results in late arrival after `end_time` does **not** permit late writes.
    - At or immediately following `end_time`, any remaining open attempt is transitioned to `AUTO_CLOSED_DEADLINE`, and all write APIs strictly reject further modifications.
@@ -678,11 +678,29 @@ flowchart LR
   - **Clock Synchronization & Skew Considerations:**
     - Host system clocks are synchronized via `chrony` or `systemd-timesyncd` with local/regional NTP stratum-1/2 servers, maintaining target clock drift $\\pm 10\\text{ to }50\\text{ ms}$.
     - Because Nginx and Gunicorn reside on the same server (or within a tightly synchronized local container network), inter-service clock skew between proxy and backend is eliminated or negligible.
-  - **Failure Handling:** If `X-Request-Arrival-Time` is missing, non-numeric, or received from an untrusted source, the backend discards it, records a security warning in `AuditLog`, and falls back to $T_{\\text{wsgi\_ingress}}$.
-* **WSGI Fallback Description & Conservative Nature ($T_{\\text{wsgi\_ingress}}$):**
-  - When trusted reverse-proxy arrival time is unavailable (e.g., local development or standalone WSGI execution without Nginx), a WSGI application *cannot* observe the original socket-read time, because Gunicorn buffers and parses the request before invoking the application callable.
-  - The fallback is a **strict server-receipt cutoff** captured at the earliest reliable Python entry point: the very first line of the outermost WSGI middleware (`time.time()`).
-  - **Conservative Nature of Fallback:** This fallback is conservative. Under high server load or worker thread contention, a request that physically arrived at the host before the deadline might be delayed by WSGI request parsing/buffering and only timestamped at the middleware entry point after `end_time`, causing it to be rejected. Deploying behind a properly configured trusted reverse proxy (Nginx with `$msec`) is therefore the required production architecture.
+  - **Mandatory Production Security Control & Fail-Closed Behavior:**
+    In production deployments, trusted ingress timestamping is a mandatory security control. If an incoming write request (`/api/attempts/*/answers/`, `/api/attempts/*/submit/`) at the backend:
+    1. Lacks the `HTTP_X_REQUEST_ARRIVAL_TIME` header,
+    2. Originates from an IP address not explicitly listed in `TRUSTED_PROXIES`,
+    3. Contains a malformed, non-numeric, or unparseable timestamp value, OR
+    4. Carries an implausible timestamp that diverges from the backend system clock by more than the configured maximum tolerance $\delta_{\text{max}}$ (e.g., future timestamp $> 500\text{ ms}$, or lagging behind by an impossible duration indicating proxy clock failure):
+    $\rightarrow$ **The backend fails closed immediately.**
+    - The write operation is aborted before touching or modifying attempt state.
+    - An explicit error response is returned: **HTTP 502 (Bad Gateway / Ingress Timestamp Error)** with structured error payload:
+      ```json
+      {
+        "error": "INGRESS_TIMESTAMP_INVALID",
+        "message": "Trusted perimeter ingress timestamp is missing, untrusted, or skewed."
+      }
+      ```
+    - A critical security audit event is logged: `AuditLog: INGRESS_TIMESTAMP_INTEGRITY_FAILURE` recording the client IP, proxy headers, local clock reading, and failure reason.
+    - **Strict Distinction:** This failure mode represents an infrastructure/perimeter fault and is **strictly distinguished** from normal examination deadline expiry (`AUTO_CLOSED_DEADLINE` / HTTP 410). It does not auto-close or alter the student's examination attempt state.
+* **WSGI Fallback Strictly Restricted to Development / Testing:**
+  - Fallback to outermost WSGI middleware ingress timestamping ($T_{\text{wsgi\_ingress}} = \text{time.time()}$) is **permitted strictly in development, staging, or automated testing environments** where explicitly enabled via settings flag:
+    `ALLOW_WSGI_TIMESTAMP_FALLBACK = True` (or `DEBUG = True`).
+  - In production (`DEBUG = False`, `ALLOW_WSGI_TIMESTAMP_FALLBACK = False`), missing or untrusted proxy arrival headers **always fail closed** as described above.
+  - When active in dev/test, WSGI fallback captures the earliest Python entry point (`time.time()` on the first line of the outermost WSGI middleware).
+  - **Conservative Nature of Fallback:** This fallback is conservative. Under worker thread contention or WSGI request buffering, a request that physically arrived at the host before the deadline might be delayed by WSGI request parsing and only timestamped at the middleware entry point after `end_time`, causing it to be rejected. Deploying behind a properly configured trusted reverse proxy (Nginx with `$msec`) with strict fail-closed enforcement is therefore the required production architecture.
 * **Strict Cutoff on Request Arrival (No Late Writes):**
   - A write request (autosave update or submission) is accepted **only** when its authoritative ingress timestamp is at or before the official scheduled deadline:
     $$T_{\\text{ingress}} \le \text{official\_end\_time}$$
@@ -697,12 +715,12 @@ flowchart LR
   2. **Autosave Arriving After Deadline ($T_{\\text{ingress}} > \text{end\_time}$):**
      - Write operation is rejected immediately with HTTP 410 (`EXAMINATION_CLOSED`).
      - Answer payload is discarded. The attempt is transitioned to `AUTO_CLOSED_DEADLINE` if not already finalized.
-  3. **Submission Arriving On or Before Deadline ($T_{\\text{ingress}} \le \text{end\_time}$):**
-     - Atomic transaction locks attempt, transitions `status = SUBMITTED`, sets `submitted_at = T_ingress`, `committed_at = now()`.
+  3. **Submission Arriving On or Before Deadline ($T_{\text{ingress}} \le \text{end\_time}$):**
+     - Atomic transaction locks attempt, transitions `status = SUBMITTED`, sets `submitted_at = T_ingress`, records application transaction time `transaction_recorded_at = timezone.now()` (persisted in field `committed_at`).
      - Automatically invokes MCQ auto-grading and returns a signed submission receipt.
-  4. **Submission Arriving After Deadline ($T_{\\text{ingress}} > \text{end\_time}$):**
+  4. **Submission Arriving After Deadline ($T_{\text{ingress}} > \text{end\_time}$):**
      - Manual submission write is rejected.
-     - Atomic transaction checks attempt state; if `IN_PROGRESS`, transitions `status = AUTO_CLOSED_DEADLINE`, sets `closed_at = official_end_time`, `committed_at = now()`.
+     - Atomic transaction checks attempt state; if `IN_PROGRESS`, transitions `status = AUTO_CLOSED_DEADLINE`, sets `closed_at = official_end_time`, records application transaction time `transaction_recorded_at = timezone.now()` (persisted in field `committed_at`).
      - Invokes MCQ auto-grading on all answers successfully saved on or before `end_time`.
      - Returns HTTP 410 with auto-closure receipt reflecting that manual submission was rejected for late arrival, and the attempt was auto-closed at the deadline.
   5. **Network Interruptions Across the Deadline:**
@@ -754,9 +772,14 @@ In college deployments, students frequently access online examinations from unma
   ```
 * **Binding via AAD:** Authenticated Additional Data binds candidate and attempt metadata to the ciphertext, preventing ciphertext-swapping attacks between questions or attempts.
 
-#### 13.3.4 Key Management, Unlocking, and Recovery Lifecycle
-1. **Data Encryption Key (DEK) Generation & In-Memory Lifetime:**
-   - Upon entering the live exam interface, the client generates an attempt-specific 256-bit AES-GCM key:
+#### 13.3.4 Secure Key-Management Lifecycle (Authenticated Server-Assisted Key Recovery)
+
+1. **Removal of Examination PIN as Local Encryption Secret:**
+   - **NO Examination PIN, student password, or short credential is ever used to derive local encryption wrapping keys, nor is any wrapped DEK stored in IndexedDB.**
+   - Short credentials (such as 6-character PINs) possess insufficient entropy against offline brute-force attacks if stored locally on a shared computer. Eliminating local PIN wrapping eliminates the offline dictionary-attack vector completely.
+
+2. **Data Encryption Key (DEK) Generation & In-Memory Lifetime:**
+   - Upon entering the live exam interface, the client generates an attempt-specific 256-bit AES-GCM key via Web Crypto API:
      ```javascript
      const dek = await window.crypto.subtle.generateKey(
        { name: "AES-GCM", length: 256 },
@@ -765,36 +788,73 @@ In college deployments, students frequently access online examinations from unma
      );
      ```
    - The DEK is held **strictly in volatile JavaScript memory** (within a private closure / React ref). It is **never** stored in plaintext in `localStorage`, `sessionStorage`, or `IndexedDB`.
-2. **Dual-Tier Key Escrow & Recovery Mechanisms:**
-   Because keeping the DEK solely in memory would cause permanent data loss if the browser tab is closed or the PC restarts, the DEK is wrapped using two distinct mechanisms:
-   - **Mechanism A: Server-Assisted Key Release (Primary Connected Recovery):**
-     - At attempt initialization over TLS, the client wraps the DEK using a server-provided attempt public key (or sends the wrapped DEK over the authenticated HTTPS session).
-     - The server stores the wrapped DEK in the `ExamAttempt` row (encrypted under the backend master secret).
-     - *Recovery Workflow:* When the student re-authenticates after a browser restart or logout, the backend verifies credentials, active session, and attempt ownership, and securely releases the wrapped DEK back to the authenticated client.
-     - *Offline Limitation:* **If the workstation is completely offline when the student returns, server-assisted key release is technically impossible.** The student cannot decrypt the cache while disconnected from the server.
-   - **Mechanism B: Student-Controlled Passphrase Key Wrapping (Offline Fallback):**
-     - To enable offline recovery without server connectivity, the DEK is additionally wrapped locally using a Key Encryption Key (KEK) derived from the candidate's secret Examination PIN + unique per-attempt salt using PBKDF2 (`crypto.subtle.deriveKey` with 600,000 iterations of SHA-256).
-     - The wrapped DEK (`wrapped_dek_by_pin`) and salt are stored in IndexedDB.
-     - *Recovery Workflow:* If offline, the student re-enters their secret Examination PIN. The client derives the KEK locally, unwraps the DEK, and decrypts the offline cache.
-     - *Security Trade-Off & Caveat:* Short PINs (e.g., 6 characters) carry a residual risk of offline dictionary attacks by an adversary with physical DevTools access. This trade-off is documented and mitigated by high PBKDF2 iteration counts and kiosk policies.
-3. **Non-Extractable Keys vs. Same-Origin Scripts:**
-   - The architecture explicitly documents that marking a Web Crypto key `extractable: false` prevents raw key export, but **does not protect against arbitrary scripts executing within the same origin**. An attacker executing script via XSS or a malicious extension can invoke `crypto.subtle.decrypt()` using the key handle. Robust XSS defenses (CSP, JSX escaping) remain essential.
-4. **Disposal & Finalization Cleanup:**
-   - Upon confirmed submission (`SUBMITTED`) or auto-close acknowledgement, the in-memory DEK is wiped from RAM, and all synchronized IndexedDB records are deleted.
-5. **Key Loss & Unrecoverable Data:**
-   - If both server-assisted release fails (server unreachable or session corrupted) and local PIN unwrap fails (PIN lost or corrupted), the encrypted data is permanently unrecoverable.
-   - The client will not silently overwrite corrupted data; it flags it as unrecoverable and generates an error audit record.
+   - While the browser tab remains open during an active examination, the in-memory DEK is continuously used to encrypt unsynchronized keystrokes into IndexedDB, providing uninterrupted local caching even during prolonged network outages.
 
-#### 13.3.5 Safe Handling of Rejected Late Answers & Diagnostic Bundles
-- When offline answers are transmitted after `official_end_time`, the server responds with HTTP 410 (`EXAMINATION_CLOSED`).
-- The client **does not** claim these answers were synchronized.
-- The client updates their local status to `REJECTED_DEADLINE_EXCEEDED` alongside the server's rejection timestamp.
-- The candidate can export or submit a tamper-evident, read-only diagnostic bundle (`AUDIT_RECOVERY_BUNDLE`) containing:
-  - Attempt and student metadata.
-  - Question IDs, version sequences, and client interaction timestamps.
-  - Ciphertext payloads, IVs, authentication tags, and wrapped DEK blobs.
-  - Server rejection receipts and network attempt logs.
-- The bundle allows the college examination grievance committee to perform technical forensic review without violating live deadline integrity.
+3. **Server-Assisted Key Wrapping & Protection over TLS:**
+   - During attempt initialization or re-entry over TLS (`POST /api/attempts/{examId}/start/` or `/init-cache-key/`), the client exports the DEK securely over TLS to the backend.
+   - The backend encrypts/wraps the DEK using a server-managed Key Encryption Key (e.g., dedicated server envelope key `AES-256-GCM` or Django application secret).
+   - The server stores the wrapped DEK in the `ExamAttempt.encrypted_cache_dek` database field.
+   - At rest in the database, the DEK is cryptographically protected by the server key; in transit, it is protected by TLS 1.3.
+
+4. **Authorization Checks for Key Release:**
+   When a student reopens the exam after an accidental tab close, browser crash, or system restart, the client requests key restoration via `POST /api/attempts/{attemptId}/recover-cache-key/`:
+   The backend enforces strict authorization checks before releasing the DEK:
+   1. *Identity Verification:* Authenticated student account must match `attempt.student_id`.
+   2. *Attempt Ownership & State:* Attempt must exist and be in `IN_PROGRESS` status. If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`, key release is rejected (HTTP 403 `EXAM_ATTEMPT_FINALIZED`).
+   3. *Session & PIN Validity:* Active valid session token and verified examination PIN for the attempt.
+   4. *Deadline Boundary:* Server time must be $\le \text{official\_end\_time}$.
+   5. *Rate Limiting & Audit:* Strictly rate-limited (max 3 key-release requests per minute); each key release generates an audited event (`AuditLog: CACHE_KEY_RELEASED`).
+   Upon passing all checks, the backend decrypts the stored DEK and transmits it over TLS to the client, which imports it into volatile memory (`window.crypto.subtle.importKey`).
+
+5. **Lifecycle Behavior Across Session Boundaries:**
+   - *Logout / Tab Close:* The in-memory DEK is immediately zeroed and discarded. The encrypted records remain safely encrypted in IndexedDB.
+   - *Browser Restart:* In-memory DEK is absent. The client cannot read or decrypt the cached records until re-authenticating with the server.
+   - *Session Expiry:* Expired session tokens cannot fetch the DEK from the server.
+   - *Reauthentication:* Re-authenticating with the server restores the DEK over TLS into memory.
+   - *Temporary Inaccessibility During Offline Disconnection:* **If a browser restart or tab closure occurs while the device is offline, encrypted cached answers are temporarily inaccessible until server connectivity is restored.** The client cannot decrypt the IndexedDB ciphertext without contacting the server for DEK release.
+
+6. **Key Loss, Failed Key Release, and Unrecoverable Ciphertext:**
+   - If the server is unreachable, session is invalid, or key release fails, ciphertext in IndexedDB remains intact and is **never silently deleted or overwritten**.
+   - The client transitions the local cache state to `LOCKED_KEY_UNAVAILABLE`.
+   - If keys are permanently lost (e.g. database corruption of wrapped DEK), the ciphertext cannot be decrypted; the client flags the records as `UNRECOVERABLE_CIPHERTEXT` and alerts the administrator.
+
+7. **Disposal & Finalization Cleanup:**
+   - Upon confirmed submission (`SUBMITTED`) or auto-close acknowledgement, the in-memory DEK is wiped from RAM, and all synchronized IndexedDB records are deleted.
+
+8. **Limits Against Same-Origin Scripts & Compromised Endpoints:**
+   - Marking a Web Crypto key `extractable: false` prevents raw key export, but **does not protect against arbitrary scripts executing within the same origin**. An attacker executing script via XSS or a malicious extension can invoke `crypto.subtle.decrypt()` using the key handle. Robust XSS defenses (CSP, JSX escaping) remain essential.
+   - Browser cryptography cannot protect against an operating system compromised by root-level malware, memory dumpers, or hardware keyloggers.
+
+#### 13.3.5 Diagnostic Recovery Bundle (`AUDIT_RECOVERY_BUNDLE`) & Authenticity Limitations
+
+When offline answers are transmitted after `official_end_time`, the server responds with HTTP 410 (`EXAMINATION_CLOSED`). The client **does not** claim these answers were synchronized, and updates their local status to `REJECTED_DEADLINE_EXCEEDED` alongside the server's rejection timestamp.
+
+The candidate or proctor can export a structured diagnostic bundle (`AUDIT_RECOVERY_BUNDLE`) for administrative appeal.
+
+1. **Exact Bundle Specification:**
+   An `AUDIT_RECOVERY_BUNDLE` is a structured JSON diagnostic archive containing two clearly separated sections:
+   - **Client-Generated Diagnostic Evidence (Self-Reported / Untrusted):**
+     - Client environment: Browser user-agent, OS platform, screen resolution, local system clock time at export.
+     - Local cache records: Question IDs, encrypted answer payloads (base64 ciphertext), random IVs, 128-bit AES-GCM authentication tags, client version sequence numbers, and client-recorded interaction timestamps (`client_recorded_at`).
+     - Local network diagnostic log: Timestamps of failed autosave fetch attempts, connection errors, HTTP status codes (e.g. timeouts, HTTP 410), and client online/offline event transitions.
+   - **Server-Generated Records & Linked Receipts (Authoritative / Trusted):**
+     - Examination attempt metadata: `attempt_id`, `student_id`, `examination_id`, scheduled `start_time`, and `official_end_time`.
+     - Server receipts: `submission_receipt_uuid`, HTTP 410 rejection receipt containing $T_{\text{ingress}}$, server-recorded sequence counter (`last_synchronized_sequence`), and server digital signature / HMAC digest (`receipt_signature`) generated by the backend using server-managed secret keys.
+
+2. **Cryptographic Authentication vs. Integrity Metadata:**
+   - The bundle is **accompanied by integrity metadata** (a client-computed SHA-256 hash of the canonical JSON export) to detect file corruption during transmission.
+   - **No Trusted Signing Secret in Frontend JavaScript:** The frontend JavaScript does NOT and CANNOT hold a private signing key, because any secret placed in client-side code can be extracted or forged by the user.
+   - **Client Timestamps Do Not Prove Pre-Deadline Entry:** Client-generated timestamps inside the bundle are self-reported and **do not prove answers were entered before the official deadline**.
+   - Server-issued receipts linked in the bundle are authenticated using server-side signatures (HMAC-SHA256 with server `SECRET_KEY`).
+
+3. **Forensic Verification Limits:**
+   - Forensic scrutiny cannot prove timeline authenticity if the client endpoint was compromised or if client JavaScript was manipulated.
+
+4. **College Examination Committee Grievance Review Process:**
+   - Defined as a **proposed institutional workflow**, NOT an automated grading override.
+   - The candidate exports `audit_recovery_bundle_{attemptId}.json` and submits it through the college examination grievance portal.
+   - The committee compares server-side audit logs, network gateway logs, and pre-deadline synchronized sequence numbers against the bundle.
+   - **Late-rejected answers are never silently or automatically treated as valid examination submissions.** Any acceptance or special evaluation requires a formal, recorded administrative committee resolution.
 
 #### 13.3.6 Residual Risks & Required Institutional Policies
 - **Residual Risks on Unmanaged Devices:** Hardware keyloggers, screen recording malware, or root-level compromise on commercial cyber cafe machines cannot be fully mitigated by browser-level cryptography.
@@ -804,33 +864,34 @@ In college deployments, students frequently access online examinations from unma
 
 ### 13.4 Idempotent Submissions & Submission Lifecycle
 
-#### 13.4.1 Timestamp Definitions for Submissions
-To resolve lifecycle ambiguity, the architecture defines three distinct timestamps:
-* **$T_{\\text{ingress}}$ (Authoritative Ingress Timestamp):** The software-evaluated timestamp captured at the perimeter reverse proxy (Nginx `$msec`), or at outermost WSGI ingress ($T_{\\text{wsgi\_ingress}}$) as fallback. For accepted submissions, this represents `submitted_at`.
-* **$T_{\\text{process}}$:** The timestamp when the backend WSGI worker begins executing the submission logic.
-* **$T_{\\text{commit}}$ (`now()`):** The exact database transaction commit timestamp recorded in `committed_at`.
+#### 13.4.1 Accurate Timestamp Definitions for Submissions
+To resolve lifecycle ambiguity and maintain technical precision, the architecture defines three distinct timestamps:
+* **$T_{\text{ingress}}$ (Authoritative Ingress Timestamp):** The software-evaluated timestamp captured at the perimeter reverse proxy (Nginx `$msec`), or at outermost WSGI ingress ($T_{\text{wsgi\_ingress}}$ in dev/test only). For accepted submissions, this represents `submitted_at`.
+* **$T_{\text{process}}$:** The timestamp when the backend WSGI worker begins executing the submission logic.
+* **Application Transaction Recording Time (`transaction_recorded_at`):** The application server timestamp captured during the database transaction block (`django.utils.timezone.now()`), persisted in the model field `committed_at`.
+  - **Technical Precision Note:** The architecture explicitly distinguishes between application transaction recording time and the actual database engine transaction commit instant. The hardware/engine commit completion instant is an internal MySQL InnoDB event (write-ahead log / redo log flush) that cannot be directly observed by the Python application layer without specialized database binary log hooks. The field `committed_at` therefore accurately records the application-evaluated transaction execution timestamp.
 
 #### 13.4.2 Behavior Across All Six Submission Scenarios
 
-1. **Scenario 1: On-Time Manual Submission ($T_{\\text{ingress}} \le \text{official\_end\_time}$):**
+1. **Scenario 1: On-Time Manual Submission ($T_{\text{ingress}} \le \text{official\_end\_time}$):**
    - Acquire atomic row lock on `ExamAttempt` (`SELECT ... FOR UPDATE`).
    - Verify `status == IN_PROGRESS`.
    - Update attempt:
      - `status = SUBMITTED`
      - `submitted_at = T_ingress`
-     - `committed_at = now()`
+     - `committed_at = transaction_recorded_at`
      - `submission_type = MANUAL_STUDENT`
      - `submission_uuid = payload.submission_uuid`
    - Commit transaction and release row lock.
    - Trigger idempotent MCQ auto-evaluation pipeline.
    - Return **HTTP 200 (OK)** with signed submission receipt (`status: "SUBMITTED"`, `submitted_at: T_ingress`, `receipt_uuid`).
-2. **Scenario 2: Late Manual Submission ($T_{\\text{ingress}} > \text{official\_end\_time}$):**
+2. **Scenario 2: Late Manual Submission ($T_{\text{ingress}} > \text{official\_end\_time}$):**
    - Manual submission write is **strictly rejected**.
    - Acquire atomic row lock on `ExamAttempt`.
    - If attempt is `IN_PROGRESS`:
      - Transition `status = AUTO_CLOSED_DEADLINE`
      - `closed_at = official_end_time`
-     - `committed_at = now()`
+     - `committed_at = transaction_recorded_at`
      - `submission_type = AUTO_DEADLINE`
      - Trigger idempotent MCQ auto-evaluation scoring **only** answers validly committed on or before `official_end_time`.
    - If already finalized, read existing closure state.
@@ -843,7 +904,7 @@ To resolve lifecycle ambiguity, the architecture defines three distinct timestam
    - If attempt is `IN_PROGRESS`:
      - `status = AUTO_CLOSED_DEADLINE`
      - `closed_at = official_end_time`
-     - `committed_at = now()`
+     - `committed_at = transaction_recorded_at`
      - `submission_type = AUTO_DEADLINE`
      - Trigger MCQ auto-evaluation on answers committed on or before `official_end_time`.
    - Commit transaction.
@@ -886,7 +947,7 @@ sequenceDiagram
     Proxy->>API: Overwrite & Forward X-Request-Arrival-Time ($msec as T_ingress)
     API->>DB: Check or Create ExamAttempt (status=IN_PROGRESS)
     API-->>UI: Questions Payload, Attempt ID, Remaining Seconds, Wrapped DEK
-    UI->>UI: Unwrap DEK via Session Key or PIN Derivation
+    UI->>UI: Import DEK into Volatile Memory (Zeroed on Tab Close / Logout)
 
     loop Every 30s or on Question Blur
         Student->>UI: Selects Option / Types Text
@@ -907,13 +968,13 @@ sequenceDiagram
         Student->>UI: Clicks "Submit Examination"
         UI->>Proxy: POST /api/attempts/{attemptId}/submit/ (submission_uuid)
         Proxy->>API: Overwrite & Forward X-Request-Arrival-Time ($msec as T_ingress)
-        API->>DB: Atomic Lock -> Mark SUBMITTED (submitted_at = T_ingress, committed_at = now()) -> Auto-score MCQs
+        API->>DB: Atomic Lock -> Mark SUBMITTED (submitted_at = T_ingress, transaction_recorded_at) -> Auto-score MCQs
         API-->>UI: HTTP 200 (Signed Submission Receipt)
         UI->>IDB: Purge Synchronized Attempt Cache & Zero DEK in Memory
     else Late Manual Submission (T_ingress > official_end_time)
         Student->>UI: Clicks "Submit Examination" (Arriving Late)
         Proxy->>API: Overwrite & Forward X-Request-Arrival-Time (T_ingress > end_time)
-        API->>DB: Atomic Lock -> Mark AUTO_CLOSED_DEADLINE (closed_at = end_time, committed_at = now()) -> Auto-score Pre-Deadline MCQs
+        API->>DB: Atomic Lock -> Mark AUTO_CLOSED_DEADLINE (closed_at = end_time, transaction_recorded_at) -> Auto-score Pre-Deadline MCQs
         API-->>UI: HTTP 410 (MANUAL_SUBMISSION_REJECTED_DEADLINE_EXCEEDED)
         UI->>IDB: Transition Cache to EXPIRED_STALE (Preserve Diagnostics)
     end
@@ -1027,7 +1088,7 @@ To defend against XSS and protect session integrity, the architecture enforces m
 | **Monolith vs Microservices**| Microservices | Microservices introduce distributed transaction risks and operational overhead inappropriate for a single college deployment. |
 | **Hashed Exam PINs** | Plaintext PINs in DB | If the database is compromised, plaintext PINs would allow unauthorized exam access. Hashing ensures zero-knowledge security. |
 | **Private File Storage** | Public S3 / Media root | Descriptive answer scripts and admit cards contain private student academic data; public URLs present severe privacy violations. |
-| **Encrypted Offline Cache (Web Crypto AES-GCM)** | Plaintext IndexedDB / localStorage | Plaintext browser storage fails the shared-device threat model. AES-256-GCM at rest protects answers against extraction via browser DevTools on shared workstations. Server-assisted key escrow enables connected recovery, while candidate PIN-derived KEK enables offline recovery (with documented short-PIN dictionary attack trade-offs). |
+| **Encrypted Offline Cache (Web Crypto AES-GCM)** | Plaintext IndexedDB / localStorage | Plaintext browser storage fails the shared-device threat model. AES-256-GCM at rest protects answers against extraction via browser DevTools on shared workstations. In-memory DEK is zeroed on tab close/logout. Server-assisted key release over TLS enables secure recovery without exposing local PINs to offline dictionary attacks. |
 
 ---
 
@@ -1041,3 +1102,4 @@ The following policy and configuration items are flagged for institutional/colle
 5. **Answer Script Data Retention Schedule:** Confirmation of the duration scripts are retained in active storage post-result publication before archival or purging (recommended: 6 to 12 months).
 6. **Grading & GPA Scale:** Raw component scores are implemented as the baseline; 10-point letter grade conversions (O, A+, A, etc.) and SGPA/CGPA formulas will be added upon confirmation of official GU tables.
 7. **Unsynchronized / Rejected Offline Answers Retention & Review Policy:** Institutional confirmation of administrative workstation sanitization schedules (e.g. nightly deep-freeze/reboot scripts in shared college computer labs), local diagnostic bundle retention periods, and formal college protocols for evaluating `AUDIT_RECOVERY_BUNDLE` appeal submissions.
+8. **Optional High-Entropy Offline Encryption Recovery Secret (Unresolved Design Decision):** Documenting the trade-off of generating an optional, separate high-entropy recovery secret (e.g., 128-bit random alphanumeric passphrase or base58 recovery token) printed or physically distributed by proctors to allow offline DEK unwrapping during total server outages. Due to substantial operational overhead in generating, securely distributing, proctor tracking, and managing lost secrets across thousands of candidates, this is NOT implemented by default; server-assisted key release remains the standard baseline.
