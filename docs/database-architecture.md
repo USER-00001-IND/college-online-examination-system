@@ -1,4 +1,4 @@
-# Database Architecture Specification (Chunk 02)
+# Database Architecture Specification (Chunk 02 — Round 2 Revision)
 
 **Project:** College Online Examination System  
 **Academic Context:** Gauhati University FYUGP / NEP 2020 Context (College Level)  
@@ -17,9 +17,12 @@ The database layer functions as the authoritative single source of truth for all
 ### 1.2 Storage Engine & Technical Conventions
 1. **Engine:** MySQL 8.0+ using the **InnoDB** storage engine exclusively to guarantee ACID transaction compliance, row-level locking (`SELECT ... FOR UPDATE`), and foreign key referential integrity.
 2. **Character Set & Collation:** `utf8mb4` character set with `utf8mb4_0900_ai_ci` collation across all tables to support international unicode characters, student names with regional diacritics, and rich question text.
-3. **Primary Keys:** Every relational table utilizes an unsigned 64-bit integer surrogate primary key (`id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY`), adhering to Django ORM defaults (`BigAutoField`) and optimizing B+Tree clustered index depth.
+3. **Primary Keys (Django `BigAutoField` Compatibility):**
+   - Every relational table utilizes a **signed 64-bit integer surrogate primary key** (`id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY`), matching Django's standard `BigAutoField` on MySQL.
+   - Using standard signed `BIGINT` provides a keyspace of $9.22 	imes 10^{18}$ positive values, which is practically inexhaustible while eliminating custom ORM field hacks, schema divergence, and migration incompatibilities.
+   - All corresponding foreign keys explicitly use matching signed `BIGINT NOT NULL` (or `BIGINT NULL` for nullable relations).
 4. **Naming Conventions:**
-   - Table names follow Django app-prefixed lowercase snake_case convention: `<app>_<model>` (e.g., `accounts_user`, `examinations_examination`, `attempts_exam_attempt`).
+   - Table names follow Django app-prefixed lowercase snake_case convention: `<app>_<model>` (e.g., `accounts_user`, `examinations_examination`, `attempts_exam_attempt`, `evaluations_grading_outbox`).
    - Column names use lowercase snake_case (e.g., `paper_offering_id`, `is_active`, `submitted_at`).
    - Foreign key columns explicitly end with `_id` and reference target table primary keys.
 5. **SQL Mode:** Enforces MySQL strict SQL mode (`STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION,ERROR_FOR_DIVISION_BY_ZERO`).
@@ -28,12 +31,15 @@ The database layer functions as the authoritative single source of truth for all
    - `ON DELETE RESTRICT` / `PROTECT`: Applied to all academic structures, student profiles, examination records, submitted attempts, and evaluation scores to prevent accidental cascading deletion of historical academic records.
    - `ON DELETE CASCADE`: Restricted exclusively to strictly owned sub-entities that have no independent lifecycle (e.g., options belonging to a question, mappings belonging to a paper version).
    - `ON DELETE SET NULL`: Used only for optional audit references (e.g., `reviewed_by_id`).
+8. **Deadlock Management & Concurrency Philosophy:**
+   - Transactional design enforces a global lock acquisition hierarchy to minimize lock contention. However, the architecture recognizes that no relational database can eliminate all deadlocks under concurrent workloads (due to lock conversions, gap locks, and next-key locks in InnoDB).
+   - The application layer implements mandatory deadlock detection (catching MySQL error 1213 `ER_LOCK_DEADLOCK` and error 1205 `ER_LOCK_WAIT_TIMEOUT`) with automatic transaction rollback and bounded retry with randomized exponential backoff.
 
 ---
 
 ## 2. Comprehensive Domain Data Dictionary
 
-The schema is partitioned into nine cohesive domain modules comprising **51 relational tables**.
+The schema is partitioned into nine cohesive domain modules comprising **52 relational tables**.
 
 ```
 +---------------------------------------------------------------------------------------------------+
@@ -46,10 +52,10 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 | Domain E: Attempts, Answers & Concurrency   | attempts_*                              (3 Tables)  |
 | Domain F: Encrypted Evidence Recovery       | evidence_*                              (3 Tables)  |
 | Domain G: Descriptive Uploads & Storage     | uploads_*                               (1 Table)   |
-| Domain H: Evaluation & Results Publishing   | evaluations_*, results_*                (6 Tables)  |
+| Domain H: Evaluation & Results Publishing   | evaluations_*, results_*                (7 Tables)  |
 | Domain I: System Audit & Task Operations    | audit_*, operations_*                   (2 Tables)  |
 +---------------------------------------------------------------------------------------------------+
-| Total Normalized Relational Entities: 51 Tables                                                   |
+| Total Normalized Relational Entities: 52 Tables                                                   |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -59,11 +65,11 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 1: `accounts_user`
 * **Purpose:** Central user authentication account extending Django `AbstractBaseUser`.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
+  | `id` | BIGINT | No | AUTO | Primary Key (Django `BigAutoField`) |
   | `username` | VARCHAR(150) | No | None | Unique username / registration handle (`UNIQUE`) |
   | `email` | VARCHAR(254) | No | None | Normalized email address (`UNIQUE`, indexed) |
   | `password_hash` | VARCHAR(255) | No | None | Salted PBKDF2-SHA256 or Argon2 password hash |
@@ -83,11 +89,11 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 2: `accounts_role`
 * **Purpose:** Granular role definitions supporting institutional role-based access control.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
+  | `id` | BIGINT | No | AUTO | Primary Key |
   | `code` | VARCHAR(50) | No | None | Unique role identifier e.g. `COLLEGE_SUPERADMIN`, `EXAM_OFFICER`, `HEAD_EXAMINER` (`UNIQUE`) |
   | `name` | VARCHAR(100) | No | None | Human readable role title |
   | `description` | TEXT | Yes | NULL | Role scope and privileges |
@@ -95,26 +101,26 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 3: `accounts_user_role`
 * **Purpose:** Many-to-many relationship assigning granular administrative/faculty roles to users.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `user_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_user.id` (`ON DELETE CASCADE`) |
-  | `role_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_role.id` (`ON DELETE RESTRICT`) |
-  | `assigned_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `user_id` | BIGINT | No | None | FK -> `accounts_user.id` (`ON DELETE CASCADE`) |
+  | `role_id` | BIGINT | No | None | FK -> `accounts_role.id` (`ON DELETE RESTRICT`) |
+  | `assigned_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `assigned_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Role assignment timestamp |
 * **Indexes & Constraints:**
   - `UNIQUE (user_id, role_id)`
 
 #### Table 4: `accounts_email_verification`
 * **Purpose:** Secure verification token storage for student self-registration email validation.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `user_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_user.id` (`ON DELETE CASCADE`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `user_id` | BIGINT | No | None | FK -> `accounts_user.id` (`ON DELETE CASCADE`) |
   | `token_hash` | VARCHAR(64) | No | None | SHA-256 hash of random 32-byte cryptographic token (`UNIQUE`) |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Token issuance timestamp |
   | `expires_at` | DATETIME(6) | No | None | Expiration cutoff (default: `created_at + 24 hours`) |
@@ -126,15 +132,15 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 5: `accounts_registration_approval`
 * **Purpose:** Administrative approval tracking for student self-registered accounts.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `user_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_user.id` (`ON DELETE CASCADE`, `UNIQUE`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `user_id` | BIGINT | No | None | FK -> `accounts_user.id` (`ON DELETE CASCADE`, `UNIQUE`) |
   | `status` | VARCHAR(20) | No | 'PENDING' | Enum: `PENDING`, `APPROVED`, `REJECTED` |
   | `submitted_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Submission timestamp |
-  | `reviewed_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `reviewed_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `reviewed_at` | DATETIME(6) | Yes | NULL | Timestamp of review |
   | `rejection_reason` | TEXT | Yes | NULL | Reason text if rejected |
 * **Indexes & Constraints:**
@@ -142,16 +148,16 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 6: `students_student_profile`
 * **Purpose:** Academic student profile linked to `accounts_user`.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `user_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `user_id` | BIGINT | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `enrollment_number` | VARCHAR(50) | No | None | College institutional admission number (`UNIQUE`) |
   | `registration_year` | SMALLINT UNSIGNED | No | None | Year of college admission |
-  | `programme_id` | BIGINT UNSIGNED | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
+  | `programme_id` | BIGINT | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
   | `current_semester` | TINYINT UNSIGNED | No | 1 | Integer (1 to 8) |
   | `phone_number` | VARCHAR(20) | Yes | NULL | Mobile contact number |
   | `date_of_birth` | DATE | Yes | NULL | Student birthdate |
@@ -165,15 +171,15 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 7: `faculty_faculty_profile`
 * **Purpose:** Academic faculty profile linked to `accounts_user`.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `user_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `user_id` | BIGINT | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `employee_code` | VARCHAR(50) | No | None | Faculty institutional ID (`UNIQUE`) |
-  | `department_id` | BIGINT UNSIGNED | No | None | FK -> `academics_department.id` (`ON DELETE RESTRICT`) |
+  | `department_id` | BIGINT | No | None | FK -> `academics_department.id` (`ON DELETE RESTRICT`) |
   | `designation` | VARCHAR(100) | No | 'Assistant Professor' | Academic designation |
   | `phone_number` | VARCHAR(20) | Yes | NULL | Contact number |
   | `is_examiner` | BOOLEAN | No | TRUE | Flag enabling grading assignment |
@@ -185,12 +191,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 8: `accounts_auth_event`
 * **Purpose:** Comprehensive security log of authentication events and progressive lockout tracking.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `user_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `user_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `identifier_entered`| VARCHAR(254) | No | '' | Username or email entered |
   | `event_type` | VARCHAR(30) | No | None | Enum: `LOGIN_SUCCESS`, `LOGIN_FAILED`, `LOGOUT`, `PASSWORD_RESET`, `LOCKOUT`, `PIN_VERIFY_SUCCESS`, `PIN_VERIFY_FAILED` |
   | `ip_address` | VARCHAR(45) | No | None | IPv4 or IPv6 client address |
@@ -201,16 +207,15 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   - `INDEX idx_auth_ip_event (ip_address, event_type, created_at)`
 
 ---
-
 ### DOMAIN B: Academic Structure & FYUGP
 
 #### Table 9: `academics_college`
 * **Purpose:** Top-level college institution entity.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
+  | `id` | BIGINT | No | AUTO | Primary Key |
   | `name` | VARCHAR(255) | No | None | Full college title |
   | `code` | VARCHAR(20) | No | None | College institutional code e.g. `MC-GU` (`UNIQUE`) |
   | `address` | TEXT | Yes | NULL | Postal address |
@@ -221,12 +226,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 10: `academics_academic_session`
 * **Purpose:** Academic sessions (e.g., 2026-2027).
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `name` | VARCHAR(50) | No | None | Session title e.g. "2026-2027" |
   | `start_date` | DATE | No | None | Academic session start |
   | `end_date` | DATE | No | None | Academic session end |
@@ -237,12 +242,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 11: `academics_programme`
 * **Purpose:** Academic degree programmes under FYUGP.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `name` | VARCHAR(150) | No | None | Programme title e.g. "Bachelor of Arts (FYUGP)" |
   | `code` | VARCHAR(20) | No | None | Short code e.g. `BA-FYUGP` |
   | `duration_semesters`| TINYINT UNSIGNED | No | 8 | Standard duration (default: 8 semesters) |
@@ -254,12 +259,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 12: `academics_department`
 * **Purpose:** Academic departments offering subjects.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `name` | VARCHAR(150) | No | None | e.g. "Department of Political Science" |
   | `code` | VARCHAR(20) | No | None | e.g. `POL` |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Creation timestamp |
@@ -268,12 +273,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 13: `academics_semester`
 * **Purpose:** Configurable semester terms linked to programmes.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `programme_id` | BIGINT UNSIGNED | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `programme_id` | BIGINT | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
   | `semester_number` | TINYINT UNSIGNED | No | None | Integer between 1 and 8 |
   | `name` | VARCHAR(50) | No | None | e.g. "Semester 1", "Semester 6" |
   | `is_active` | BOOLEAN | No | TRUE | Active status |
@@ -282,12 +287,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 14: `academics_subject_category`
 * **Purpose:** Dynamic database-driven FYUGP subject categorization (NEP 2020 categories).
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `code` | VARCHAR(20) | No | None | e.g. `MAJOR`, `MINOR`, `MDC`, `AEC`, `SEC`, `VAC` |
   | `name` | VARCHAR(100) | No | None | e.g. "Multidisciplinary Course", "Value Addition Course" |
   | `description` | TEXT | Yes | NULL | Category description and regulation rules |
@@ -299,12 +304,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 15: `academics_subject`
 * **Purpose:** Broad academic disciplines under a department.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `department_id` | BIGINT UNSIGNED | No | None | FK -> `academics_department.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `department_id` | BIGINT | No | None | FK -> `academics_department.id` (`ON DELETE RESTRICT`) |
   | `name` | VARCHAR(150) | No | None | e.g. "Political Science", "Mathematics" |
   | `code` | VARCHAR(20) | No | None | e.g. `POLSCI`, `MATH` |
   | `description` | TEXT | Yes | NULL | Subject overview |
@@ -315,15 +320,15 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 16: `academics_paper_offering`
 * **Purpose:** Concrete academic paper offered in a specific semester and academic session.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `academic_session_id`| BIGINT UNSIGNED | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
-  | `semester_id` | BIGINT UNSIGNED | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
-  | `subject_id` | BIGINT UNSIGNED | No | None | FK -> `academics_subject.id` (`ON DELETE RESTRICT`) |
-  | `subject_category_id`| BIGINT UNSIGNED | No | None | FK -> `academics_subject_category.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `academic_session_id`| BIGINT | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
+  | `semester_id` | BIGINT | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
+  | `subject_id` | BIGINT | No | None | FK -> `academics_subject.id` (`ON DELETE RESTRICT`) |
+  | `subject_category_id`| BIGINT | No | None | FK -> `academics_subject_category.id` (`ON DELETE RESTRICT`) |
   | `paper_code` | VARCHAR(30) | No | None | e.g. `POL1014`, `VAC1012` |
   | `title` | VARCHAR(255) | No | None | e.g. "Foundations of Political Theory" |
   | `credits` | DECIMAL(4,1) | No | 4.0 | Paper academic credit weight |
@@ -340,26 +345,26 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 17: `academics_paper_programme_mapping`
 * **Purpose:** Maps common papers (e.g. Environmental Studies VAC) to multiple eligible programmes.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `paper_offering_id` | BIGINT UNSIGNED | No | None | FK -> `academics_paper_offering.id` (`ON DELETE CASCADE`) |
-  | `programme_id` | BIGINT UNSIGNED | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `paper_offering_id` | BIGINT | No | None | FK -> `academics_paper_offering.id` (`ON DELETE CASCADE`) |
+  | `programme_id` | BIGINT | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
 * **Indexes & Constraints:**
   - `UNIQUE (paper_offering_id, programme_id)`
 
 #### Table 18: `enrollments_student_academic_record`
 * **Purpose:** High-level student programme enrollment ledger preserving admission status.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `programme_id` | BIGINT UNSIGNED | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
-  | `academic_session_id`| BIGINT UNSIGNED | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `programme_id` | BIGINT | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
+  | `academic_session_id`| BIGINT | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
   | `admission_date` | DATE | No | None | Date of admission to programme |
   | `status` | VARCHAR(20) | No | 'ACTIVE' | Enum: `ACTIVE`, `SUSPENDED`, `ALUMNI`, `DROPOUT` |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Creation timestamp |
@@ -368,18 +373,18 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 19: `enrollments_student_subject_enrollment`
 * **Purpose:** Authoritative individual subject/paper registration ledger. **Sole prerequisite for exam eligibility**.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `paper_offering_id` | BIGINT UNSIGNED | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
-  | `academic_session_id`| BIGINT UNSIGNED | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
-  | `semester_id` | BIGINT UNSIGNED | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `paper_offering_id` | BIGINT | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
+  | `academic_session_id`| BIGINT | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
+  | `semester_id` | BIGINT | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
   | `enrollment_type` | VARCHAR(20) | No | 'REGULAR' | Enum: `REGULAR`, `BACKLOG`, `REPEAT` |
   | `status` | VARCHAR(20) | No | 'SUBMITTED'| Enum: `DRAFT`, `SUBMITTED`, `APPROVED`, `REJECTED` |
-  | `approved_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `approved_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `approved_at` | DATETIME(6) | Yes | NULL | Timestamp of approval |
   | `rejection_reason` | TEXT | Yes | NULL | Reason if rejected |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Enrollment timestamp |
@@ -391,13 +396,13 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 20: `academics_faculty_subject_assignment`
 * **Purpose:** Faculty teaching and examination assignments for paper offerings.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `faculty_id` | BIGINT UNSIGNED | No | None | FK -> `faculty_faculty_profile.id` (`ON DELETE RESTRICT`) |
-  | `paper_offering_id` | BIGINT UNSIGNED | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `faculty_id` | BIGINT | No | None | FK -> `faculty_faculty_profile.id` (`ON DELETE RESTRICT`) |
+  | `paper_offering_id` | BIGINT | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
   | `role` | VARCHAR(30) | No | 'TEACHER' | Enum: `TEACHER`, `INTERNAL_EXAMINER`, `EXTERNAL_EXAMINER`, `MODERATOR` |
   | `assigned_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Assignment timestamp |
 * **Indexes & Constraints:**
@@ -405,34 +410,33 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 21: `academics_institutional_config`
 * **Purpose:** Key-value configuration store for institutional parameters and activation gates.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `config_key` | VARCHAR(100) | No | None | Unique key identifier (`UNIQUE` within college) |
   | `config_value` | TEXT | No | None | Serialized configuration value |
   | `data_type` | VARCHAR(20) | No | 'STRING' | Enum: `STRING`, `INTEGER`, `BOOLEAN`, `JSON` |
   | `description` | TEXT | Yes | NULL | Setting explanation |
   | `is_sensitive` | BOOLEAN | No | FALSE | Hide in public API responses |
-  | `updated_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `updated_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `updated_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Last modified timestamp |
 * **Indexes & Constraints:**
   - `UNIQUE (college_id, config_key)`
 
 ---
-
-### DOMAIN C: Examination Management & Eligibility
+### DOMAIN C: Examination Setup & Eligibility
 
 #### Table 22: `examinations_roll_number_scheme`
 * **Purpose:** Configurable template engine for generating sequential examination roll numbers.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
   | `name` | VARCHAR(100) | No | None | Scheme title |
   | `pattern` | VARCHAR(255) | No | None | Template pattern e.g. `{PROG}/{YEAR}/{SEQ:04d}` |
   | `scope` | VARCHAR(50) | No | 'PER_EXAM' | Enum: `PER_EXAM`, `PER_SESSION_PROGRAMME`, `PER_COLLEGE_ANNUAL` |
@@ -443,25 +447,25 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 23: `examinations_examination`
 * **Purpose:** Master examination cycle entity controlling lifecycle phases and configuration gates.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
-  | `academic_session_id`| BIGINT UNSIGNED | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
-  | `programme_id` | BIGINT UNSIGNED | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
-  | `semester_id` | BIGINT UNSIGNED | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `academic_session_id`| BIGINT | No | None | FK -> `academics_academic_session.id` (`ON DELETE RESTRICT`) |
+  | `programme_id` | BIGINT | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
+  | `semester_id` | BIGINT | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
   | `title` | VARCHAR(255) | No | None | e.g. "BA FYUGP Semester 1 End-Term Examination 2026" |
   | `exam_code` | VARCHAR(50) | No | None | Unique examination code (`UNIQUE`) |
   | `exam_type` | VARCHAR(20) | No | 'REGULAR' | Enum: `REGULAR`, `BACKLOG`, `SPECIAL` |
   | `start_date` | DATE | No | None | Scheduled start date |
   | `end_date` | DATE | No | None | Scheduled end date |
-  | `roll_number_scheme_id`| BIGINT UNSIGNED | Yes | NULL | FK -> `examinations_roll_number_scheme.id` (`ON DELETE RESTRICT`) |
+  | `roll_number_scheme_id`| BIGINT | Yes | NULL | FK -> `examinations_roll_number_scheme.id` (`ON DELETE RESTRICT`) |
   | `pin_delivery_method`| VARCHAR(40) | No | 'UNCONFIGURED'| Enum: `UNCONFIGURED`, `ADMIT_CARD`, `SMS_EMAIL_PORTAL`, `INVIGILATOR_DISTRIBUTION` |
   | `evidence_key_retention_days`| INT UNSIGNED | No | 30 | Immutable snapshot of retention policy days |
   | `status` | VARCHAR(30) | No | 'DRAFT' | Enum: `DRAFT`, `ELIGIBILITY_GENERATED`, `ELIGIBILITY_LOCKED`, `ROLL_NUMBERS_ALLOCATED`, `ADMIT_CARDS_ISSUED`, `IN_PROGRESS`, `EVALUATION_PHASE`, `RESULTS_PUBLISHED`, `COMPLETED`, `ARCHIVED` |
-  | `created_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `created_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Creation timestamp |
   | `updated_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Modification timestamp |
 * **Indexes & Constraints:**
@@ -470,13 +474,13 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 24: `examinations_examination_paper`
 * **Purpose:** Individual paper schedule and delivery settings within an examination cycle.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
-  | `paper_offering_id` | BIGINT UNSIGNED | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
+  | `paper_offering_id` | BIGINT | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
   | `exam_date` | DATE | No | None | Scheduled calendar date of paper |
   | `start_time` | DATETIME(6) | No | None | Official paper opening instant ($T_{\text{start}}$) |
   | `end_time` | DATETIME(6) | No | None | Official server-authoritative deadline ($T_{\text{end}}$) |
@@ -496,36 +500,36 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 25: `eligibility_examination_eligibility_snapshot`
 * **Purpose:** Header for immutable snapshot compilation of eligible candidates.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
-  | `compiled_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
+  | `compiled_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `compiled_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Snapshot compilation instant |
   | `total_eligible_students`| INT UNSIGNED | No | 0 | Total verified eligible student count |
   | `is_locked` | BOOLEAN | No | FALSE | Immutable lock flag |
   | `locked_at` | DATETIME(6) | Yes | NULL | Locking timestamp |
-  | `locked_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `locked_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
 
 #### Table 26: `eligibility_student_eligibility`
 * **Purpose:** Granular eligibility record linking student to paper, derived strictly from approved enrollment.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `snapshot_id` | BIGINT UNSIGNED | No | None | FK -> `eligibility_examination_eligibility_snapshot.id` (`ON DELETE RESTRICT`) |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `paper_offering_id` | BIGINT UNSIGNED | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
-  | `enrollment_id` | BIGINT UNSIGNED | No | None | FK -> `enrollments_student_subject_enrollment.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `snapshot_id` | BIGINT | No | None | FK -> `eligibility_examination_eligibility_snapshot.id` (`ON DELETE RESTRICT`) |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `paper_offering_id` | BIGINT | No | None | FK -> `academics_paper_offering.id` (`ON DELETE RESTRICT`) |
+  | `enrollment_id` | BIGINT | No | None | FK -> `enrollments_student_subject_enrollment.id` (`ON DELETE RESTRICT`) |
   | `attendance_percentage`| DECIMAL(5,2) | Yes | NULL | Verified attendance |
   | `is_eligible` | BOOLEAN | No | TRUE | Authoritative eligibility flag |
   | `override_status` | VARCHAR(30) | No | 'NONE' | Enum: `NONE`, `ADMIN_OVERRIDE_APPROVED`, `ADMIN_OVERRIDE_REJECTED` |
   | `override_reason` | TEXT | Yes | NULL | Administrative justification |
-  | `override_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `override_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `override_at` | DATETIME(6) | Yes | NULL | Override timestamp |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Creation timestamp |
 * **Indexes & Constraints:**
@@ -534,19 +538,19 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 27: `examinations_examination_roll_number`
 * **Purpose:** Unique allocated examination roll number per candidate per examination cycle.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `roll_number_scheme_id`| BIGINT UNSIGNED | No | None | FK -> `examinations_roll_number_scheme.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `roll_number_scheme_id`| BIGINT | No | None | FK -> `examinations_roll_number_scheme.id` (`ON DELETE RESTRICT`) |
   | `roll_number` | VARCHAR(50) | No | None | Formatted string e.g. `GU/2026/BA/0042` |
   | `sequence_number` | INT UNSIGNED | No | None | Raw sequential integer |
   | `is_manual_override`| BOOLEAN | No | FALSE | Flag indicating admin correction |
   | `override_reason` | TEXT | Yes | NULL | Justification for correction |
-  | `allocated_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `allocated_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `allocated_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Allocation timestamp |
 * **Indexes & Constraints:**
   - `UNIQUE (examination_id, student_id)`
@@ -555,13 +559,13 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 28: `pins_examination_pin`
 * **Purpose:** Salted, hashed examination PIN credential for dual-tier examination authorization.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
   | `pin_hash` | VARCHAR(255) | No | None | PBKDF2-SHA256 salted PIN hash |
   | `pin_salt` | VARCHAR(64) | No | None | Random 32-byte cryptographic hex salt |
   | `generated_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Generation timestamp |
@@ -569,7 +573,7 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   | `failed_attempts_count`| TINYINT UNSIGNED | No | 0 | Failed verification counter |
   | `locked_until` | DATETIME(6) | Yes | NULL | Progressive lockout cutoff |
   | `last_verified_at` | DATETIME(6) | Yes | NULL | Last successful verification timestamp |
-  | `reissued_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `reissued_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `reissued_at` | DATETIME(6) | Yes | NULL | Reissuance timestamp |
   | `reissue_reason` | TEXT | Yes | NULL | Administrative justification |
 * **Indexes & Constraints:**
@@ -578,14 +582,14 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 29: `admit_cards_admit_card`
 * **Purpose:** Generated admit card metadata, private PDF storage paths, and verification tokens.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `roll_number_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination_roll_number.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `roll_number_id` | BIGINT | No | None | FK -> `examinations_examination_roll_number.id` (`ON DELETE RESTRICT`) |
   | `admit_card_number` | VARCHAR(64) | No | None | Unique alphanumeric identifier (`UNIQUE`) |
   | `pdf_file_path` | VARCHAR(500) | No | None | Relative path within private media root |
   | `file_sha256` | VARCHAR(64) | No | None | Cryptographic integrity hash of generated PDF |
@@ -600,12 +604,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 30: `admit_cards_email_queue`
 * **Purpose:** Asynchronous email dispatch queue for admit card PDFs with error retry tracking.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `admit_card_id` | BIGINT UNSIGNED | No | None | FK -> `admit_cards_admit_card.id` (`ON DELETE CASCADE`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `admit_card_id` | BIGINT | No | None | FK -> `admit_cards_admit_card.id` (`ON DELETE CASCADE`) |
   | `recipient_email` | VARCHAR(254) | No | None | Destination email address |
   | `status` | VARCHAR(20) | No | 'PENDING' | Enum: `PENDING`, `SENDING`, `SENT`, `FAILED` |
   | `attempts_count` | TINYINT UNSIGNED | No | 0 | Retry counter |
@@ -617,13 +621,13 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 31: `pins_examination_access_session`
 * **Purpose:** Ephemeral examination session tokens issued upon successful PIN verification.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_paper_id`| BIGINT UNSIGNED | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE CASCADE`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE CASCADE`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_paper_id`| BIGINT | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE CASCADE`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE CASCADE`) |
   | `session_token_hash`| VARCHAR(64) | No | None | SHA-256 hash of ephemeral session token (`UNIQUE`) |
   | `issued_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Issuance timestamp |
   | `expires_at` | DATETIME(6) | No | None | Expiry timestamp |
@@ -634,32 +638,31 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   - `INDEX idx_exam_session_lookup (session_token_hash, is_revoked, expires_at)`
 
 ---
-
 ### DOMAIN D: Questions & Assessment
 
 #### Table 32: `questions_question_bank`
 * **Purpose:** Question repositories categorized by subject and academic paper.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `college_id` | BIGINT UNSIGNED | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
-  | `subject_id` | BIGINT UNSIGNED | No | None | FK -> `academics_subject.id` (`ON DELETE RESTRICT`) |
-  | `paper_offering_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `academics_paper_offering.id` (`ON DELETE SET NULL`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `college_id` | BIGINT | No | None | FK -> `academics_college.id` (`ON DELETE RESTRICT`) |
+  | `subject_id` | BIGINT | No | None | FK -> `academics_subject.id` (`ON DELETE RESTRICT`) |
+  | `paper_offering_id` | BIGINT | Yes | NULL | FK -> `academics_paper_offering.id` (`ON DELETE SET NULL`) |
   | `title` | VARCHAR(255) | No | None | Bank title |
   | `description` | TEXT | Yes | NULL | Description |
-  | `created_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `created_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Creation timestamp |
 
 #### Table 33: `questions_question`
 * **Purpose:** Individual question entity supporting MCQ and descriptive formats.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `question_bank_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question_bank.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `question_bank_id` | BIGINT | No | None | FK -> `questions_question_bank.id` (`ON DELETE RESTRICT`) |
   | `question_text` | MEDIUMTEXT | No | None | Rich text question prompt |
   | `question_type` | VARCHAR(30) | No | 'MCQ' | Enum: `MCQ`, `DESCRIPTIVE_TEXT`, `DESCRIPTIVE_UPLOAD`, `DESCRIPTIVE_HYBRID` |
   | `default_marks` | DECIMAL(5,2) | No | 1.00 | Mark value |
@@ -675,28 +678,29 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 34: `questions_question_option`
 * **Purpose:** Discrete multiple-choice answer options for MCQ questions.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `question_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question.id` (`ON DELETE CASCADE`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE CASCADE`) |
   | `option_text` | TEXT | No | None | Option text prompt |
   | `option_identifier` | VARCHAR(10) | No | None | e.g. 'A', 'B', 'C', 'D' |
   | `is_correct` | BOOLEAN | No | FALSE | Ground-truth correctness flag |
   | `display_order` | TINYINT UNSIGNED | No | 1 | Presentation sort order |
 * **Indexes & Constraints:**
   - `UNIQUE (question_id, option_identifier)`
+  - `UNIQUE KEY uk_option_id_qid (id, question_id)`: Enables composite foreign key reference from `attempts_answer`
   - `INDEX idx_option_correct (question_id, is_correct)`
 
 #### Table 35: `questions_question_paper_version`
 * **Purpose:** Assembled question paper version/set (e.g. Set A, Set B) for an examination paper.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_paper_id`| BIGINT UNSIGNED | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_paper_id`| BIGINT | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
   | `version_code` | VARCHAR(20) | No | 'SET_A' | e.g. `SET_A`, `SET_B` |
   | `total_marks` | DECIMAL(5,2) | No | 80.00 | Total question paper marks |
   | `instructions` | TEXT | Yes | NULL | General instructions |
@@ -707,13 +711,13 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 36: `questions_paper_question_mapping`
 * **Purpose:** Maps specific questions into a paper version with question numbering and sectioning.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `paper_version_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question_paper_version.id` (`ON DELETE CASCADE`) |
-  | `question_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `paper_version_id` | BIGINT | No | None | FK -> `questions_question_paper_version.id` (`ON DELETE CASCADE`) |
+  | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
   | `question_number` | SMALLINT UNSIGNED| No | None | Display number (1, 2, 3...) |
   | `section_name` | VARCHAR(50) | No | 'Section A' | e.g. `Section A (MCQ)`, `Section B (Long Answer)` |
   | `marks` | DECIMAL(5,2) | No | 1.00 | Allocated marks for this exam |
@@ -723,26 +727,26 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 * **Indexes & Constraints:**
   - `UNIQUE (paper_version_id, question_number)`
   - `UNIQUE (paper_version_id, question_id)`
+  - `UNIQUE KEY uk_mapping_id_qid (id, question_id)`: Enables composite foreign key reference from `attempts_answer`
 
 ---
-
 ### DOMAIN E: Examination Attempts, Answers & Concurrency
 
 #### Table 37: `attempts_exam_attempt`
 * **Purpose:** **Core concurrency serialization point**. Represents student's active or finalized exam attempt.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_paper_id`| BIGINT UNSIGNED | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `paper_version_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question_paper_version.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key (Django `BigAutoField`) |
+  | `examination_paper_id`| BIGINT | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `paper_version_id` | BIGINT | No | None | FK -> `questions_question_paper_version.id` (`ON DELETE RESTRICT`) |
   | `status` | VARCHAR(30) | No | 'IN_PROGRESS'| Enum: `IN_PROGRESS`, `SUBMITTED`, `AUTO_CLOSED_DEADLINE`, `ABANDONED`, `DISQUALIFIED` |
-  | `submission_uuid` | VARCHAR(64) | Yes | NULL | Client-generated UUID4 for idempotent retries (`UNIQUE`) |
+  | `submission_uuid` | VARCHAR(64) | Yes | NULL | Client-generated UUID4 for idempotent manual submissions (`UNIQUE`) |
   | `started_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Ingress timestamp of attempt start |
-  | `submitted_at` | DATETIME(6) | Yes | NULL | Authoritative $T_{\text{ingress}}$ of manual submission |
-  | `closed_at` | DATETIME(6) | Yes | NULL | Deadline instant for auto-closed attempts (`official_end_time`) |
+  | `submitted_at` | DATETIME(6) | Yes | NULL | Authoritative $T_{\text{ingress}}$ of manual submission (NULL for auto-closure) |
+  | `closed_at` | DATETIME(6) | Yes | NULL | Deadline cutoff instant for auto-closed attempts (`official_end_time`) |
   | `committed_at` | DATETIME(6) | Yes | NULL | Application server transaction recorded timestamp |
   | `total_score_mcq` | DECIMAL(5,2) | Yes | NULL | Automated MCQ score sum |
   | `total_score_descriptive`| DECIMAL(5,2) | Yes | NULL | Faculty evaluated descriptive score sum |
@@ -762,15 +766,16 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 * **Sensitive Classification:** `encrypted_cache_dek`. Plaintext DEK is never stored.
 
 #### Table 38: `attempts_answer`
-* **Purpose:** Persisted student answers updated monotonically under attempt row lock.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **Purpose:** Persisted student answers with strictly enforced question and option membership integrity.
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
-  | `question_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
-  | `selected_option_id`| BIGINT UNSIGNED | Yes | NULL | FK -> `questions_question_option.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `paper_question_mapping_id`| BIGINT | No | None | FK -> `questions_paper_question_mapping.id` (`ON DELETE RESTRICT`) |
+  | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
+  | `selected_option_id`| BIGINT | Yes | NULL | FK -> `questions_question_option.id` (`ON DELETE RESTRICT`) |
   | `answer_text` | MEDIUMTEXT | Yes | NULL | Typed descriptive draft/answer text |
   | `version_sequence` | INT UNSIGNED | No | 1 | Monotonic sequence counter (`WHERE seq < incoming_seq`) |
   | `ingress_timestamp`| DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Reverse-proxy $T_{\text{ingress}}$ of this update |
@@ -780,45 +785,51 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | First save timestamp |
   | `updated_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Last update timestamp |
 * **Indexes & Constraints:**
-  - `UNIQUE (attempt_id, question_id)`
+  - `UNIQUE KEY uk_attempt_mapping (attempt_id, paper_question_mapping_id)`: Exactly one answer per mapped question per attempt.
+  - `CONSTRAINT fk_ans_map_q FOREIGN KEY (paper_question_mapping_id, question_id) REFERENCES questions_paper_question_mapping(id, question_id) ON DELETE RESTRICT`: **Enforces that `question_id` matches the exact question mapped to `paper_question_mapping_id`**.
+  - `CONSTRAINT fk_ans_opt_q FOREIGN KEY (selected_option_id, question_id) REFERENCES questions_question_option(id, question_id) ON DELETE RESTRICT`: **Enforces that `selected_option_id` belongs to the exact `question_id` being answered**.
+  - `CONSTRAINT chk_answer_payload CHECK ((selected_option_id IS NOT NULL AND answer_text IS NULL) OR (selected_option_id IS NULL AND answer_text IS NOT NULL) OR (selected_option_id IS NOT NULL AND answer_text IS NOT NULL) OR (selected_option_id IS NULL AND answer_text IS NULL))`: Validates allowed answer modes.
   - `INDEX idx_answer_eval (attempt_id, is_evaluated)`
 
 #### Table 39: `attempts_submission_receipt`
-* **Purpose:** Cryptographically signed, immutable digital receipt issued upon examination completion.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **Purpose:** Cryptographically signed, immutable digital receipt issued upon examination completion with rigorous status-dependent timestamps.
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
   | `receipt_uuid` | VARCHAR(64) | No | None | Unique receipt identifier (`UNIQUE`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `examination_paper_id`| BIGINT UNSIGNED | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
-  | `submission_status`| VARCHAR(30) | No | None | `SUBMITTED` or `AUTO_CLOSED_DEADLINE` |
-  | `submitted_at` | DATETIME(6) | No | None | Authoritative perimeter ingress timestamp ($T_{\text{ingress}}$) |
-  | `committed_at` | DATETIME(6) | No | None | Application server transaction recorded timestamp |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `examination_paper_id`| BIGINT | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
+  | `submission_status`| VARCHAR(30) | No | None | Enum: `SUBMITTED`, `AUTO_CLOSED_DEADLINE` |
+  | `submission_uuid` | VARCHAR(64) | Yes | NULL | Client submission UUID; present ONLY if `SUBMITTED`, NULL if `AUTO_CLOSED_DEADLINE` |
+  | `submitted_at` | DATETIME(6) | Yes | NULL | Authoritative perimeter ingress timestamp $T_{\text{ingress}}$; present ONLY if `SUBMITTED`, NULL if `AUTO_CLOSED_DEADLINE` |
+  | `official_end_time`| DATETIME(6) | No | None | Authoritative examination deadline snapshot (`paper.end_time`) |
+  | `closed_at` | DATETIME(6) | Yes | NULL | Deadline cutoff instant; populated ONLY for `AUTO_CLOSED_DEADLINE` as `official_end_time` |
+  | `committed_at` | DATETIME(6) | No | None | Application server transaction recorded timestamp when finalization executed |
   | `last_sequence_number`| INT UNSIGNED | No | 1 | Last synchronized answer sequence number |
   | `total_answers_count`| SMALLINT UNSIGNED| No | 0 | Total saved question answers count |
   | `receipt_payload_json`| JSON | No | None | Canonical JSON snapshot of submission metadata |
   | `server_hmac_signature`| VARCHAR(64) | No | None | HMAC-SHA256 digest generated with server secret key |
-  | `issued_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Receipt issuance instant |
+  | `issued_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Receipt generation instant |
 * **Indexes & Constraints:**
   - `UNIQUE (receipt_uuid)`
   - `INDEX idx_receipt_student (student_id, examination_paper_id)`
+  - `CONSTRAINT chk_receipt_status_timestamps CHECK ((submission_status = 'SUBMITTED' AND submitted_at IS NOT NULL AND submission_uuid IS NOT NULL AND closed_at IS NULL) OR (submission_status = 'AUTO_CLOSED_DEADLINE' AND submitted_at IS NULL AND submission_uuid IS NULL AND closed_at IS NOT NULL))`: **Prevents fabricating manual submission timestamps or UUIDs for deadline auto-closures**.
 
 ---
-
 ### DOMAIN F: Encrypted Evidence Recovery
 
 #### Table 40: `evidence_key_recovery_log`
 * **Purpose:** Audit ledger recording all Data Encryption Key release requests (Track A & Track B).
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
   | `track` | VARCHAR(30) | No | None | Enum: `TRACK_A_LIVE`, `TRACK_B_POST_DEADLINE` |
   | `requested_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Request timestamp |
   | `ip_address` | VARCHAR(45) | No | None | Ingress client IP |
@@ -830,20 +841,20 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 41: `evidence_audit_recovery_bundle`
 * **Purpose:** Stores formal student grievance appeal submissions accompanied by diagnostic recovery bundles.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
   | `grievance_reference`| VARCHAR(64) | No | None | Formal grievance case number (`UNIQUE`) |
   | `bundle_sha256` | VARCHAR(64) | No | None | Client-provided SHA-256 integrity hash of JSON export |
   | `bundle_payload_json`| MEDIUMTEXT | No | None | Complete exported diagnostic bundle payload |
   | `uploaded_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Appeal submission timestamp |
   | `appeal_status` | VARCHAR(30) | No | 'SUBMITTED'| Enum: `SUBMITTED`, `UNDER_REVIEW`, `RESOLVED_ACCEPTED`, `RESOLVED_REJECTED` |
   | `review_notes` | TEXT | Yes | NULL | Examination committee findings |
-  | `reviewed_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `reviewed_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `reviewed_at` | DATETIME(6) | Yes | NULL | Committee resolution timestamp |
 * **Indexes & Constraints:**
   - `UNIQUE (grievance_reference)`
@@ -851,19 +862,19 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 42: `evidence_legal_hold`
 * **Purpose:** Legal hold declarations suspending scheduled evidence key deletion for disputed attempts.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
   | `formal_case_number`| VARCHAR(100) | No | None | Official court or grievance registry number |
   | `reason` | TEXT | No | None | Written legal/administrative justification |
-  | `placed_by_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`) |
+  | `placed_by_id` | BIGINT | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`) |
   | `placed_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Placement timestamp |
   | `is_active` | BOOLEAN | No | TRUE | Active suspension flag |
   | `released_at` | DATETIME(6) | Yes | NULL | Resolution release timestamp |
-  | `released_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `released_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `release_reason` | TEXT | Yes | NULL | Justification for releasing hold |
 * **Indexes & Constraints:**
   - `INDEX idx_legal_hold_active (attempt_id, is_active)`
@@ -874,13 +885,13 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 43: `uploads_descriptive_upload`
 * **Purpose:** Metadata and private filesystem references for handwritten answer sheets.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
-  | `question_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
   | `file_uuid` | VARCHAR(64) | No | None | Random sanitized UUID filename e.g. `9f8e7d6c.pdf` (`UNIQUE`) |
   | `original_file_name`| VARCHAR(255) | No | None | Sanitized client filename for metadata |
   | `file_path` | VARCHAR(500) | No | None | Path in private media storage outside webroot |
@@ -898,18 +909,17 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 * **Design Rule:** Raw file binaries are **never stored in MySQL blobs**. They reside in private filesystem storage outside public HTTP webroot with authenticated streaming endpoints.
 
 ---
-
 ### DOMAIN H: Evaluation & Results Publishing
 
 #### Table 44: `evaluations_evaluation_assignment`
 * **Purpose:** Workload distribution mapping faculty evaluators to examination paper batches.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_paper_id`| BIGINT UNSIGNED | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
-  | `faculty_id` | BIGINT UNSIGNED | No | None | FK -> `faculty_faculty_profile.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_paper_id`| BIGINT | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
+  | `faculty_id` | BIGINT | No | None | FK -> `faculty_faculty_profile.id` (`ON DELETE RESTRICT`) |
   | `role` | VARCHAR(30) | No | 'FIRST_EVALUATOR'| Enum: `FIRST_EVALUATOR`, `SECOND_EVALUATOR`, `HEAD_EXAMINER` |
   | `assigned_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Assignment timestamp |
   | `status` | VARCHAR(20) | No | 'ASSIGNED' | Enum: `ASSIGNED`, `IN_PROGRESS`, `COMPLETED` |
@@ -918,14 +928,14 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 45: `evaluations_descriptive_evaluation`
 * **Purpose:** Individual question scores and marks awarded by faculty evaluators.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
-  | `question_id` | BIGINT UNSIGNED | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
-  | `evaluator_id` | BIGINT UNSIGNED | No | None | FK -> `faculty_faculty_profile.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `question_id` | BIGINT | No | None | FK -> `questions_question.id` (`ON DELETE RESTRICT`) |
+  | `evaluator_id` | BIGINT | No | None | FK -> `faculty_faculty_profile.id` (`ON DELETE RESTRICT`) |
   | `marks_awarded` | DECIMAL(5,2) | No | None | Evaluated mark score |
   | `evaluation_stage` | VARCHAR(20) | No | 'INITIAL' | Enum: `INITIAL`, `MODERATED`, `RE_EVALUATION` |
   | `remarks` | TEXT | Yes | NULL | Evaluator comments |
@@ -936,12 +946,12 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 #### Table 46: `evaluations_mcq_evaluation_log`
 * **Purpose:** Execution audit record of automated MCQ grading jobs.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `attempt_id` | BIGINT UNSIGNED | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`, `UNIQUE`) |
   | `evaluated_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Processing instant |
   | `total_mcq_questions`| SMALLINT UNSIGNED| No | 0 | Total MCQ items in attempt |
   | `correct_count` | SMALLINT UNSIGNED| No | 0 | Correctly answered count |
@@ -951,18 +961,45 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   | `is_successful` | BOOLEAN | No | TRUE | Job execution success flag |
   | `error_message` | TEXT | Yes | NULL | Error diagnostics if failed |
 
-#### Table 47: `results_student_paper_result`
-* **Purpose:** Immutable compiled result record combining internal continuous assessment and external scores.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+#### Table 47: `evaluations_grading_outbox`
+* **Purpose:** **Transactional Outbox Table**. Guarantees durable, atomic, and recoverable post-finalization grading dispatch, surviving process and network crashes.
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
-  | `examination_paper_id`| BIGINT UNSIGNED | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
-  | `student_id` | BIGINT UNSIGNED | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
-  | `attempt_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
-  | `roll_number_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination_roll_number.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `event_id` | VARCHAR(64) | No | None | Unique outbox event UUID4 (`UNIQUE`) |
+  | `attempt_id` | BIGINT | No | None | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `event_type` | VARCHAR(50) | No | 'EVALUATE_MCQ_ATTEMPT'| Event classification code |
+  | `payload_json` | JSON | No | None | Serialized attempt metadata, paper version, and student ID |
+  | `idempotency_key` | VARCHAR(128) | No | None | Deterministic key `attempt_{attempt_id}_mcq_grading` (`UNIQUE`) |
+  | `status` | VARCHAR(20) | No | 'PENDING' | Enum: `PENDING`, `DISPATCHED`, `COMPLETED`, `FAILED`, `DEAD_LETTER` |
+  | `retry_count` | TINYINT | No | 0 | Number of dispatch/execution attempts |
+  | `max_retries` | TINYINT | No | 5 | Maximum retry attempts before transitioning to `DEAD_LETTER` |
+  | `next_retry_at` | DATETIME(6) | Yes | NULL | Timestamp for exponential backoff retry |
+  | `claimed_by` | VARCHAR(100) | Yes | NULL | Hostname / Worker ID that claimed this event |
+  | `claimed_at` | DATETIME(6) | Yes | NULL | Timestamp when claimed |
+  | `last_error` | TEXT | Yes | NULL | Stack trace / error message from failed dispatch |
+  | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Creation timestamp (inserted inside finalization transaction) |
+  | `processed_at` | DATETIME(6) | Yes | NULL | Completion timestamp |
+* **Indexes & Constraints:**
+  - `UNIQUE (event_id)`
+  - `UNIQUE (idempotency_key)`
+  - `INDEX idx_outbox_claim (status, next_retry_at, created_at)`
+  - `INDEX idx_outbox_attempt (attempt_id)`
+
+#### Table 48: `results_student_paper_result`
+* **Purpose:** Immutable compiled result record combining internal continuous assessment and external scores.
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
+* **Fields:**
+  | Column Name | SQL Type | Nullable | Default | Constraints & Description |
+  | :--- | :--- | :---: | :---: | :--- |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
+  | `examination_paper_id`| BIGINT | No | None | FK -> `examinations_examination_paper.id` (`ON DELETE RESTRICT`) |
+  | `student_id` | BIGINT | No | None | FK -> `students_student_profile.id` (`ON DELETE RESTRICT`) |
+  | `attempt_id` | BIGINT | Yes | NULL | FK -> `attempts_exam_attempt.id` (`ON DELETE RESTRICT`) |
+  | `roll_number_id` | BIGINT | No | None | FK -> `examinations_examination_roll_number.id` (`ON DELETE RESTRICT`) |
   | `marks_internal` | DECIMAL(5,2) | No | 0.00 | Internal college evaluation score |
   | `marks_external_mcq`| DECIMAL(5,2) | No | 0.00 | External MCQ auto-evaluated score |
   | `marks_external_descriptive`| DECIMAL(5,2)| No| 0.00 | External faculty-evaluated descriptive score |
@@ -975,47 +1012,47 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   | `is_pass` | BOOLEAN | No | FALSE | Passing status |
   | `status` | VARCHAR(20) | No | 'COMPILED' | Enum: `DRAFT`, `COMPILED`, `MODERATED`, `APPROVED`, `PUBLISHED`, `WITHHELD` |
   | `compiled_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Compilation timestamp |
-  | `approved_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `approved_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `approved_at` | DATETIME(6) | Yes | NULL | Approval timestamp |
 * **Indexes & Constraints:**
   - `UNIQUE (examination_paper_id, student_id)`
   - `INDEX idx_result_exam_student (examination_id, student_id)`
   - `INDEX idx_result_status (status)`
 
-#### Table 48: `results_result_publication`
+#### Table 49: `results_result_publication`
 * **Purpose:** Formal result gazette publication header approving release to student dashboards.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `examination_id` | BIGINT UNSIGNED | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
-  | `programme_id` | BIGINT UNSIGNED | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
-  | `semester_id` | BIGINT UNSIGNED | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `examination_id` | BIGINT | No | None | FK -> `examinations_examination.id` (`ON DELETE RESTRICT`) |
+  | `programme_id` | BIGINT | No | None | FK -> `academics_programme.id` (`ON DELETE RESTRICT`) |
+  | `semester_id` | BIGINT | No | None | FK -> `academics_semester.id` (`ON DELETE RESTRICT`) |
   | `publication_date` | DATE | No | None | Official declared publication date |
   | `notification_reference`| VARCHAR(100) | No | None | Gazette notification order number (`UNIQUE`) |
   | `publication_status`| VARCHAR(20) | No | 'DRAFT' | Enum: `DRAFT`, `APPROVED`, `PUBLISHED`, `WITHHELD` |
   | `remarks` | TEXT | Yes | NULL | Declaration notes |
-  | `published_by_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `published_by_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `published_at` | DATETIME(6) | Yes | NULL | Official release timestamp |
 * **Indexes & Constraints:**
   - `UNIQUE (examination_id, programme_id, semester_id)`
   - `UNIQUE (notification_reference)`
 
-#### Table 49: `results_result_revision_history`
+#### Table 50: `results_result_revision_history`
 * **Purpose:** Immutable audit trail for re-evaluation, grievance corrections, and mark revisions.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `result_id` | BIGINT UNSIGNED | No | None | FK -> `results_student_paper_result.id` (`ON DELETE RESTRICT`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `result_id` | BIGINT | No | None | FK -> `results_student_paper_result.id` (`ON DELETE RESTRICT`) |
   | `previous_marks_obtained`| DECIMAL(5,2)| No | None | Original marks |
   | `new_marks_obtained`| DECIMAL(5,2) | No | None | Revised marks |
   | `previous_grade` | VARCHAR(10) | No | None | Original letter grade |
   | `new_grade` | VARCHAR(10) | No | None | Revised letter grade |
   | `reason_for_revision`| TEXT | No | None | Official committee resolution text |
-  | `authorized_by_id` | BIGINT UNSIGNED | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`) |
+  | `authorized_by_id` | BIGINT | No | None | FK -> `accounts_user.id` (`ON DELETE RESTRICT`) |
   | `revised_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Revision timestamp |
 * **Indexes & Constraints:**
   - `INDEX idx_revision_result (result_id, revised_at)`
@@ -1024,14 +1061,14 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
 
 ### DOMAIN I: System Audit & Task Operations
 
-#### Table 50: `audit_system_audit_log`
+#### Table 51: `audit_system_audit_log`
 * **Purpose:** Centralized, append-only security and administrative audit trail.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
-  | `actor_id` | BIGINT UNSIGNED | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
+  | `id` | BIGINT | No | AUTO | Primary Key |
+  | `actor_id` | BIGINT | Yes | NULL | FK -> `accounts_user.id` (`ON DELETE SET NULL`) |
   | `actor_role` | VARCHAR(50) | No | 'ANONYMOUS' | Role of actor at execution time |
   | `action` | VARCHAR(100) | No | None | Unique action code e.g. `ELIGIBILITY_OVERRIDE`, `RETENTION_POLICY_CONFIGURED` |
   | `entity_type` | VARCHAR(100) | No | None | Target model e.g. `ExamAttempt`, `Result` |
@@ -1047,17 +1084,17 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   - `INDEX idx_audit_action (action, created_at)`
 * **Design Rule:** Append-only table. No `UPDATE` or `DELETE` permissions are granted to application database users.
 
-#### Table 51: `operations_background_task_log`
+#### Table 52: `operations_background_task_log`
 * **Purpose:** Celery worker task execution tracking, failure recovery, and dead-letter supervision.
-* **PK:** `id` (BIGINT UNSIGNED, AUTO_INCREMENT)
+* **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
-  | `id` | BIGINT UNSIGNED | No | AUTO | Primary Key |
+  | `id` | BIGINT | No | AUTO | Primary Key |
   | `task_name` | VARCHAR(150) | No | None | e.g. `evaluate_mcq_attempt`, `purge_expired_evidence_keys` |
   | `task_uuid` | VARCHAR(64) | No | None | Celery task UUID (`UNIQUE`) |
   | `status` | VARCHAR(20) | No | 'PENDING' | Enum: `PENDING`, `STARTED`, `SUCCESS`, `FAILURE`, `RETRY` |
-  | `retries_count` | TINYINT UNSIGNED | No | 0 | Retry counter |
+  | `retries_count` | TINYINT | No | 0 | Retry counter |
   | `runtime_seconds` | DECIMAL(8,3) | Yes | NULL | Task execution duration |
   | `error_details` | MEDIUMTEXT | Yes | NULL | Stack trace if failed |
   | `created_at` | DATETIME(6) | No | CURRENT_TIMESTAMP(6) | Task creation timestamp |
@@ -1067,36 +1104,68 @@ The schema is partitioned into nine cohesive domain modules comprising **51 rela
   - `INDEX idx_task_name_status (task_name, status, created_at)`
 
 ---
-
 ## 3. Database Normalization & 3NF Assessment
 
 ### 3.1 Normalization Verification
 1. **First Normal Form (1NF):**
-   - All tables possess a unique primary key (`id BIGINT UNSIGNED`).
+   - All tables possess a unique signed primary key (`id BIGINT AUTO_INCREMENT`).
    - Every column contains atomic values (no repeating groups, comma-separated lists, or nested unnormalized arrays for relational attributes).
 2. **Second Normal Form (2NF):**
    - All entities use single-column surrogate primary keys.
    - All non-key attributes are fully functionally dependent on the entire primary key, eliminating partial functional dependencies.
 3. **Third Normal Form (3NF):**
-   - Transitive dependencies are removed.
-   - For example, student programme enrollment references `Programme`, which in turn references `College`. The student table does not redundantly duplicate department names, programme titles, or semester configurations.
+   - Transitive dependencies are removed across core academic entities. Student profiles link to programmes, programmes link to colleges, eliminating redundant institutional names.
 
 ### 3.2 Explicitly Justified Denormalizations
-To ensure bulletproof historical integrity and sub-millisecond query performance during live examinations, four specific denormalizations are introduced with formal architectural justification:
-1. **`attempts_submission_receipt.receipt_payload_json`:**
-   - *Justification:* An immutable, self-contained JSON snapshot of student submission state accompanied by a cryptographic HMAC. Normalizing this would require joining 10 tables years later; if questions or options are subsequently edited, historical proof of what the student saw would be lost.
-2. **`results_student_paper_result` (`marks_internal`, `marks_external_mcq`, `total_marks_obtained`):**
-   - *Justification:* Final approved grades must remain permanently frozen once published. Deriving scores on-the-fly via real-time sums across thousands of individual answer rows introduces vulnerability to retroactive edits and severe performance degradation on student grade sheet generation.
-3. **`eligibility_student_eligibility` (`attendance_percentage` snapshot):**
-   - *Justification:* Freezes the candidate's attendance and enrollment eligibility state at the moment examination admit cards are locked, isolating examination eligibility from post-hoc changes in college attendance registers.
-4. **`examinations_examination.evidence_key_retention_days`:**
-   - *Justification:* Captures an immutable snapshot of the institutional retention policy at examination scheduling time, ensuring that future college policy modifications never retroactively alter the retention lifecycle of past examination attempts.
+To balance pure theoretical relational normalization with real-world database engine constraints, historical immutability, and sub-millisecond live examination query performance, five specific denormalizations are introduced with formal architectural justification:
+
+1. **`attempts_answer.question_id` (Composite Foreign Key Trade-Off):**
+   - *Normalization Status:* Denormalized. `question_id` is already functionally determined by `paper_question_mapping_id` (since each mapping row uniquely points to a specific `question_id`).
+   - *Architectural Justification:* MySQL InnoDB requires all columns in a foreign key reference to exist directly on the referencing table. Storing `question_id` alongside `paper_question_mapping_id` on `attempts_answer` enables two vital composite foreign keys:
+     - `FOREIGN KEY (paper_question_mapping_id, question_id) REFERENCES questions_paper_question_mapping(id, question_id)`
+     - `FOREIGN KEY (selected_option_id, question_id) REFERENCES questions_question_option(id, question_id)`
+   - Without this intentional denormalization, MySQL could not physically prevent a student from submitting an option belonging to Question 5 as the answer to Question 10. The 3NF trade-off is strictly justified to achieve hardware-level integrity enforcement.
+2. **`attempts_submission_receipt.receipt_payload_json`:**
+   - *Normalization Status:* Denormalized JSON snapshot.
+   - *Architectural Justification:* Provides an immutable, self-contained snapshot of student submission state accompanied by a cryptographic HMAC. Normalizing this would require querying across 10 tables years later; if questions or options are subsequently edited in the question bank, historical legal proof of what the candidate submitted would be corrupted.
+3. **`results_student_paper_result` (`marks_internal`, `marks_external_mcq`, `total_marks_obtained`):**
+   - *Normalization Status:* Denormalized aggregate marks.
+   - *Architectural Justification:* Final approved grades must remain permanently frozen once published. Deriving scores on-the-fly via real-time sums across thousands of individual answer rows introduces vulnerability to retroactive edits and severe performance degradation on student grade sheet generation.
+4. **`eligibility_student_eligibility` (`attendance_percentage` snapshot):**
+   - *Normalization Status:* Denormalized attendance snapshot.
+   - *Architectural Justification:* Freezes candidate attendance and enrollment eligibility at the moment examination admit cards are locked, isolating examination eligibility from post-hoc changes in college attendance registers.
+5. **`examinations_examination.evidence_key_retention_days`:**
+   - *Normalization Status:* Denormalized configuration snapshot.
+   - *Architectural Justification:* Captures an immutable snapshot of the institutional retention policy at examination scheduling time, ensuring that future college policy modifications never retroactively alter the retention lifecycle of past examination attempts.
+
+---
+## 4. Critical Transaction Design & Concurrency Controls
+
+### 4.1 Deadlock Detection, Rollback & Bounded Retry Architecture
+A structured lock hierarchy minimizes lock contention across concurrent workflows. However, in MySQL InnoDB, concurrent transactions can still experience deadlocks due to lock escalations, gap locks, next-key locks on unique secondary indexes, and foreign key verification locks.
+
+The application and database layers enforce a **comprehensive deadlock handling protocol**:
+1. **Lock Hierarchy Compliance:** All application views acquire locks strictly in descending order of domain entity hierarchy:
+   1. `examinations_examination` or `examinations_roll_number_scheme`
+   2. `attempts_exam_attempt`
+   3. `attempts_answer` / dependent line items
+2. **Short-Lived Transactions:** Transactions perform in-memory validation prior to acquiring database row locks. No network I/O, email dispatch, or hashing occurs while holding row locks.
+3. **Deadlock Exception Handling:** The application database wrapper catches:
+   - MySQL Error 1213 (`ER_LOCK_DEADLOCK` / SQLSTATE `40001`)
+   - MySQL Error 1205 (`ER_LOCK_WAIT_TIMEOUT`)
+4. **Automatic Rollback & Bounded Retries:**
+   - Upon encountering Error 1213 or 1205, the transaction immediately issues a complete `ROLLBACK`.
+   - The operation executes up to **3 automated retries** with exponential backoff and randomized jitter:
+     $$T_{\text{wait}} = 2^{\text{retry}} \times 50\text{ms} \pm \text{rand}(10\text{ms}, 30\text{ms})$$
+5. **Context Preservation Across Retries:**
+   - Retries preserve the original validated request parameters: reverse-proxy arrival timestamp ($T_{\text{ingress}}$), client monotonic sequence counter, and submission UUID.
+   - **Deadline Invariant:** A retry cannot resurrect an attempt if the official deadline has passed, nor can it bypass state checks. If a retry encounters `status == 'AUTO_CLOSED_DEADLINE'`, it aborts and returns HTTP 410.
 
 ---
 
-## 4. Critical Transaction Design & Concurrency Controls
+### 4.2 Core Transaction Specifications (13 Workflows)
 
-### Transaction 1: Student Registration & Approval
+#### Transaction 1: Student Registration & Approval
 * **Trigger:** Administrative approval of self-registered student account.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1109,7 +1178,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - Emit `audit_system_audit_log` entry.
   - Commit transaction.
 
-### Transaction 2: Subject Enrollment Approval
+#### Transaction 2: Subject Enrollment Approval
 * **Trigger:** Academic advisor approves student subject selection.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1119,7 +1188,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - Update `status = 'APPROVED'`, `approved_by_id = :admin_id`, `approved_at = NOW()`.
   - Commit transaction.
 
-### Transaction 3: Eligibility Snapshot Generation
+#### Transaction 3: Eligibility Snapshot Generation
 * **Trigger:** Examination coordinator compiles eligible candidate list.
 * **Isolation Level:** `REPEATABLE READ`
 * **Operations:**
@@ -1141,7 +1210,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - Update examination status to `ELIGIBILITY_GENERATED`.
   - Commit transaction.
 
-### Transaction 4: Sequential Roll-Number Allocation
+#### Transaction 4: Sequential Roll-Number Allocation
 * **Trigger:** Administrator transitions examination to `ROLL_NUMBERS_ALLOCATED`.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1155,7 +1224,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - Update `examinations_roll_number_scheme` with latest sequence counter.
   - Commit transaction. Guarantees zero duplicate roll numbers and sequential gapless numbering.
 
-### Transaction 5: Examination Attempt Creation & PIN Verification
+#### Transaction 5: Examination Attempt Creation & PIN Verification
 * **Trigger:** Student enters live exam interface with Examination PIN.
 * **Isolation Level:** `READ COMMITTED`
 * **Operations:**
@@ -1174,7 +1243,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - Issue ephemeral session token into `pins_examination_access_session`.
   - Commit transaction.
 
-### Transaction 6: Autosave with Monotonic Sequence Enforcement
+#### Transaction 6: Autosave with Membership Integrity & Monotonic Sequence Enforcement
 * **Trigger:** Student inputs answer in browser (`PATCH /api/attempts/{id}/answers/`).
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1183,23 +1252,26 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - **Verify Dual Conditions:**
     - Verify ingress timestamp: $T_{\text{ingress}} \le \text{official\_end\_time}$.
     - Verify attempt status: `status == 'IN_PROGRESS'`.
+  - **Application Verification:**
+    - Verify `paper_question_mapping.paper_version_id == attempt.paper_version_id`.
   - If verified:
     ```sql
     INSERT INTO attempts_answer 
-      (attempt_id, question_id, selected_option_id, answer_text, version_sequence, ingress_timestamp)
+      (attempt_id, paper_question_mapping_id, question_id, selected_option_id, answer_text, version_sequence, ingress_timestamp)
     VALUES 
-      (:attempt_id, :qid, :opt_id, :text, :seq, :T_ingress)
+      (:attempt_id, :mapping_id, :qid, :opt_id, :text, :seq, :T_ingress)
     ON DUPLICATE KEY UPDATE
       selected_option_id = IF(version_sequence < VALUES(version_sequence), VALUES(selected_option_id), selected_option_id),
       answer_text = IF(version_sequence < VALUES(version_sequence), VALUES(answer_text), answer_text),
       ingress_timestamp = IF(version_sequence < VALUES(version_sequence), VALUES(ingress_timestamp), ingress_timestamp),
       version_sequence = IF(version_sequence < VALUES(version_sequence), VALUES(version_sequence), version_sequence);
     ```
+  - Note: Composite foreign keys physically verify that `:qid` matches `:mapping_id` and `:opt_id` belongs to `:qid`.
   - Commit transaction and release row lock.
   - Return HTTP 200 `{ status: "SAVED", sequence: :seq }`.
   - If attempt already finalized: rollback and return HTTP 410 (`WRITE_REJECTED_FINALIZATION_COMPLETED`).
 
-### Transaction 7: Manual Submission with Idempotency
+#### Transaction 7: Manual Submission with Idempotency & Outbox Event Insertion
 * **Trigger:** Student clicks "Submit Examination" (`POST /api/attempts/{id}/submit/`).
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1207,6 +1279,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
 * **Operations:**
   - Check `submission_uuid`:
     - If `status == 'SUBMITTED'` and `submission_uuid == :incoming_uuid`: release lock, return cached receipt (HTTP 200 OK, idempotent retry).
+    - If `status == 'SUBMITTED'` and `submission_uuid != :incoming_uuid`: release lock, return HTTP 409 (`ATTEMPT_ALREADY_FINALIZED`).
   - Verify $T_{\text{ingress}} \le \text{official\_end\_time}$ and `status == 'IN_PROGRESS'`.
   - Transition attempt:
     ```sql
@@ -1218,12 +1291,18 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
         evidence_key_expires_at = DATE_ADD(NOW(), INTERVAL :retention_days DAY)
     WHERE id = :attempt_id;
     ```
-  - Generate and insert signed `attempts_submission_receipt`.
+  - Insert signed `attempts_submission_receipt` (`submitted_at = :T_ingress`, `submission_uuid = :incoming_uuid`, `closed_at = NULL`).
+  - **Durable Grading Outbox Insertion (Atomic with Finalization):**
+    ```sql
+    INSERT INTO evaluations_grading_outbox 
+      (event_id, attempt_id, event_type, payload_json, idempotency_key, status, created_at)
+    VALUES 
+      (:uuid4, :attempt_id, 'EVALUATE_MCQ_ATTEMPT', :payload_json, CONCAT('attempt_', :attempt_id, '_mcq_grading'), 'PENDING', NOW());
+    ```
   - Commit transaction and release row lock.
-  - **Post-Commit Hook:** Dispatch Celery task `evaluate_mcq_attempt.delay(attempt_id)`.
   - Return HTTP 200 with signed receipt.
 
-### Transaction 8: Deadline Supervisor Finalization
+#### Transaction 8: Deadline Supervisor Finalization & Outbox Insertion
 * **Trigger:** Celery beat worker checks expired examination papers.
 * **Isolation Level:** `READ COMMITTED`
 * **Wait Boundary:** Strictly executes only when $\text{server\_time} \ge \text{official\_end\_time} + \Delta_{\text{drain}}$ (15s).
@@ -1239,24 +1318,33 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
         evidence_key_expires_at = DATE_ADD(NOW(), INTERVAL :retention_days DAY)
     WHERE id = :attempt_id;
     ```
-    - Insert auto-closed `attempts_submission_receipt`.
+    - Insert `attempts_submission_receipt` (`submitted_at = NULL`, `submission_uuid = NULL`, `official_end_time = :official_end_time`, `closed_at = :official_end_time`).
+    - **Durable Grading Outbox Insertion (Atomic with Closure):**
+      ```sql
+      INSERT INTO evaluations_grading_outbox 
+        (event_id, attempt_id, event_type, payload_json, idempotency_key, status, created_at)
+      VALUES 
+        (:uuid4, :attempt_id, 'EVALUATE_MCQ_ATTEMPT', :payload_json, CONCAT('attempt_', :attempt_id, '_mcq_grading'), 'PENDING', NOW());
+      ```
     - Commit transaction and release row lock.
-    - **Post-Commit Hook:** Dispatch Celery task `evaluate_mcq_attempt.delay(attempt_id)`.
   - If already `SUBMITTED` or `AUTO_CLOSED_DEADLINE`: rollback / release lock (idempotent no-op).
 
-### Transaction 9: Post-Commit MCQ Evaluation
-* **Trigger:** Asynchronous Celery task dispatched strictly post-finalization commit.
+#### Transaction 9: Outbox Dispatcher & Idempotent MCQ Evaluation
+* **Trigger:** Outbox dispatcher process polling `evaluations_grading_outbox`.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
-  1. `SELECT * FROM attempts_exam_attempt WHERE id = :attempt_id FOR UPDATE`
+  1. `SELECT * FROM evaluations_grading_outbox WHERE status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= NOW()) ORDER BY created_at ASC LIMIT 10 FOR UPDATE SKIP LOCKED`
+  2. `SELECT * FROM attempts_exam_attempt WHERE id = :attempt_id FOR UPDATE`
 * **Operations:**
-  - Check `is_mcq_evaluated`: if TRUE, release lock and exit (duplicate execution prevention).
+  - Mark outbox event `status = 'DISPATCHED'`, `claimed_by = :worker_id`, `claimed_at = NOW()`.
+  - Check attempt `is_mcq_evaluated`: if TRUE, update outbox `status = 'COMPLETED'` and exit.
   - Compute scores by comparing `attempts_answer.selected_option_id` against `questions_question_option.is_correct`.
   - Update `attempts_exam_attempt` set `total_score_mcq = :total_mcq`, `is_mcq_evaluated = TRUE`.
-  - Insert audit log into `evaluations_mcq_evaluation_log`.
-  - Commit transaction and release lock.
+  - Insert audit record into `evaluations_mcq_evaluation_log`.
+  - Update outbox event set `status = 'COMPLETED'`, `processed_at = NOW()`.
+  - Commit transaction and release row locks.
 
-### Transaction 10: Faculty Descriptive Grading
+#### Transaction 10: Faculty Descriptive Grading
 * **Trigger:** Faculty evaluator submits score for descriptive question.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1268,7 +1356,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - Recalculate total descriptive score and update `attempts_exam_attempt.total_score_descriptive`.
   - Commit transaction.
 
-### Transaction 11: Result Approval & Publication
+#### Transaction 11: Result Approval & Publication
 * **Trigger:** Examination committee publishes approved results.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1278,7 +1366,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
   - Update `results_result_publication` set `publication_status = 'PUBLISHED'`, `published_at = NOW()`.
   - Commit transaction.
 
-### Transaction 12: Scheduled Evidence-Key Purging
+#### Transaction 12: Scheduled Evidence-Key Purging
 * **Trigger:** Daily Celery task `purge_expired_evidence_keys` (02:00 AM).
 * **Isolation Level:** `READ COMMITTED`
 * **Operations:**
@@ -1296,7 +1384,7 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
     - Emit `audit_system_audit_log` with action `EVIDENCE_KEY_PURGED`.
   - Commit transaction.
 
-### Transaction 13: Legal-Hold Activation & Release
+#### Transaction 13: Legal-Hold Activation & Release
 * **Trigger:** Administrative hold placed on disputed candidate attempt.
 * **Isolation Level:** `READ COMMITTED`
 * **Locking Order:**
@@ -1309,6 +1397,26 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
 
 ---
 
+### 4.3 Transactional Outbox Failure Scenario Analysis (12 Scenarios)
+
+The Transactional Outbox pattern guarantees **at-least-once durable dispatch intent**. All downstream grading logic is strictly idempotent:
+
+| # | Failure Scenario | Failure Timing & System State | Recovery Mechanism & Invariant Preserved |
+| :-: | :--- | :--- | :--- |
+| **1** | **Crash before commit** | Web worker crashes during submission transaction before MySQL commit. | MySQL detects connection loss and rolls back attempt status, receipt, and outbox event cleanly. Client retries with identical UUID; zero orphaned state. |
+| **2** | **Crash immediately after commit** | Worker crashes after MySQL transaction commits but before responding to client. | Attempt status is durably `SUBMITTED`, receipt exists, and outbox event is persisted. Outbox dispatcher picks up event on schedule. Client retry receives cached receipt (HTTP 200). |
+| **3** | **Crash before Celery publication** | Outbox dispatcher claims event (`SKIP LOCKED`), marks `DISPATCHED`, then dies before pushing task to broker. | Periodic outbox reconciliation beat worker detects events in `DISPATCHED` state older than 5 minutes with no running task, and resets status to `PENDING` with retry increment. |
+| **4** | **Crash after publication before ack** | Celery task enqueued, but dispatcher crashes before updating outbox event status. | Celery worker executes grading idempotently (`is_mcq_evaluated = TRUE`). Reconciliation worker detects attempt is evaluated and updates outbox status to `COMPLETED`. |
+| **5** | **Duplicate event delivery** | Network hiccup causes outbox dispatcher to deliver duplicate task messages to queue. | Both tasks carry identical `idempotency_key`. Celery worker acquires lock on `attempts_exam_attempt`. First task grades; second task sees `is_mcq_evaluated == TRUE` and exits cleanly. |
+| **6** | **Duplicate Celery task execution** | Celery broker redelivers message due to worker ACK timeout. | Row lock `SELECT ... FOR UPDATE` on `attempts_exam_attempt` serializes execution. Second execution detects `is_mcq_evaluated == TRUE` and skips score calculation. Zero score alteration. |
+| **7** | **Worker crash during grading** | Worker crashes (OOM / SIGKILL) mid-calculation during MCQ evaluation. | Active MySQL transaction rolls back automatically. Attempt `is_mcq_evaluated` remains `FALSE`. Outbox dispatcher observes pending event and retries with backoff. |
+| **8** | **MySQL temporarily unavailable** | Transient database deadlock, timeout, or connection drop during finalization. | Submission transaction rolls back and returns HTTP 503. Local client cache safely retains answers in IndexedDB (`SYNC_PENDING`) and retries. |
+| **9** | **Redis/Celery broker unavailable** | Redis broker is offline or unreachable when attempt is finalized. | Finalization commits cleanly because outbox record is stored in MySQL. Outbox events accumulate safely in MySQL in `PENDING` state and drain automatically once Redis recovers. |
+| **10** | **Dispatcher restart** | Dispatcher daemon restarted during normal maintenance. | Stateless dispatcher resumes querying `evaluations_grading_outbox WHERE status = 'PENDING'` ordered by `created_at`. Zero event loss. |
+| **11** | **Multiple concurrent dispatchers** | Multiple dispatcher processes execute across clustered application servers. | MySQL 8.0 `SELECT ... FOR UPDATE SKIP LOCKED` allows workers to concurrently claim distinct batches of outbox events with zero lock contention or duplicate claims. |
+| **12** | **Permanently failing grading tasks** | Buggy question data or corrupted attempt answers cause grading task to raise repeated exceptions. | Outbox retry counter increments up to `max_retries` (5). Upon exceeding threshold, event transitions to `DEAD_LETTER`, emits high-severity alert to admin monitor, and leaves attempt inspectable for manual intervention. |
+
+---
 ## 5. Security, Cryptography & Retention Architecture
 
 ```
@@ -1325,24 +1433,39 @@ To ensure bulletproof historical integrity and sub-millisecond query performance
 +---------------------------------------------------------------------------------------------------+
 ```
 
-### 5.1 Cryptographic Storage Policies
-1. **Zero Plaintext Secrets:** Under no circumstances are plaintext authentication passwords, Examination PINs, or Data Encryption Keys (DEKs) persisted to MySQL storage.
-2. **Salted Examination PINs:** Examination PINs use independent 32-byte random cryptographic salts (`pins_examination_pin.pin_salt`) and are hashed using PBKDF2-SHA256 with $\ge 100,000$ iterations. Even if the database is dumped, brute-force dictionary recovery of short numeric PINs is computationally unfeasible.
-3. **Envelope Encryption for DEKs:** The `attempts_exam_attempt.encrypted_cache_dek` field stores a key wrapped using AES-256-KeyWrap (RFC 3394) under a server-managed Master Key Encryption Key (KEK) held in environment variables or hardware security modules (AWS KMS / Vault).
+### 5.1 Realistic Examination PIN Security & Entropy Limitations
+A standard 6-digit numeric examination PIN possesses only $10^6$ combinations ($pprox 20$ bits of entropy). Even when hashed using salted PBKDF2-SHA256 or Argon2, $10^6$ candidate values can be evaluated within minutes on modern GPU hardware if a raw database dump is compromised.
 
-### 5.2 Descriptive File Upload Isolation
+**The architecture explicitly rejects the false claim that hashing alone makes short PINs immune to offline recovery.** Instead, it enforces a **defense-in-depth security model**:
+1. **Cryptographically Secure Random Generation:** PINs are generated using Python's `secrets` module (backed by `/dev/urandom`), ensuring maximum uniform entropy.
+2. **Configurable PIN Format & Entropy:** Institutional administrators can configure PIN format via `academics_institutional_config` (e.g. 6-digit numeric, 8-character alphanumeric, or base58 strings) to meet institutional risk appetites.
+3. **Per-Credential Random Salts:** Every PIN credential record in `pins_examination_pin` possesses a unique, random 32-byte cryptographic salt (`pin_salt`), completely defeating precomputed rainbow tables and multi-target attacks.
+4. **Tunable Work Factor:** The hashing scheme utilizes PBKDF2-SHA256 with a minimum of 100,000 iterations (or Argon2id with memory cost 64MB), substantially raising the hardware cost of offline dictionary scans.
+5. **Strict Online Rate Limiting & Lockout:** The online verification API enforces progressive lockouts: 5 consecutive failed attempts trigger an immediate 15-minute lockout recorded in `pins_examination_pin.locked_until`, defeating online brute-force attacks.
+6. **Temporal Entry Window Restrictions:** PIN verification is accepted strictly during the narrow entry window:
+   $$T_{\text{now}} \in [T_{\text{start}} - \Delta_{\text{buffer}}, T_{\text{entry\_cutoff}}]$$
+   After $T_{\text{entry\_cutoff}}$, new attempts are rejected regardless of PIN validity.
+7. **Session Binding & Single-Attempt Invalidation:** Successful PIN verification issues a cryptographically random session token bound to the student and paper. Once the attempt is finalized (`SUBMITTED` or `AUTO_CLOSED_DEADLINE`), subsequent PIN verifications are rejected.
+8. **Unconfigured Delivery Gate:** The PIN delivery method is initialized as `UNCONFIGURED`. Examination publication is strictly blocked until college leadership confirms the distribution policy.
+
+---
+
+### 5.2 Cryptographic Protection of Offline Evidence
+1. **Zero Plaintext Secrets:** Plaintext passwords, Examination PINs, and client Data Encryption Keys (DEKs) are never stored in MySQL.
+2. **Envelope Encryption for DEKs:** The `attempts_exam_attempt.encrypted_cache_dek` field stores a key wrapped using AES-256-KeyWrap (RFC 3394) under a server-managed Master Key Encryption Key (KEK) held in environment variables or hardware security modules (AWS KMS / Vault).
+
+### 5.3 Descriptive File Upload Isolation
 1. **Filesystem vs. Database Separation:** Binary image and PDF files are stored on private disk storage located completely outside the web server root.
 2. **Random UUID Filenames:** Uploaded files are immediately renamed to random UUID4 identifiers (`uploads_descriptive_upload.file_uuid`), preventing path traversal, file overwrites, and direct URL guessing.
 3. **Malware Quarantine:** Files with `validation_status == 'INFECTED'` are quarantined and never served to evaluators.
 
-### 5.3 Evidence Retention State Machine Enforcement
+### 5.4 Evidence Retention State Machine Enforcement
 1. **Hard Production Activation Gate:** Examination activation is blocked unless `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` is configured.
 2. **Immutable Expiry Timestamp:** `attempts_exam_attempt.evidence_key_expires_at` is set at attempt finalization and cannot be updated retroactively.
 3. **Request-Time Hard Check:** Any attempt to recover a DEK past `evidence_key_expires_at` is rejected at the API layer with HTTP 410, even before the daily purge batch executes.
 4. **Legal Hold Immunity:** `attempts_exam_attempt.is_under_legal_hold == TRUE` completely exempts the record from scheduled deletion.
 
 ---
-
 ## 6. Mermaid Entity Relationship Diagrams
 
 ### 6.1 Domain ERD 1: Identity & Access Control
@@ -1501,7 +1624,7 @@ erDiagram
     }
 ```
 
-### 6.4 Domain ERD 4: Questions & Examination Attempts
+### 6.4 Domain ERD 4: Questions & Examination Attempts (Membership Integrity)
 
 ```mermaid
 erDiagram
@@ -1516,8 +1639,9 @@ erDiagram
     QUESTIONS_QUESTION_PAPER_VERSION ||--o{ ATTEMPTS_EXAM_ATTEMPT : "assigned version"
 
     ATTEMPTS_EXAM_ATTEMPT ||--o{ ATTEMPTS_ANSWER : "contains"
-    QUESTIONS_QUESTION ||--o{ ATTEMPTS_ANSWER : "answered"
-    QUESTIONS_QUESTION_OPTION ||--o{ ATTEMPTS_ANSWER : "selected"
+    QUESTIONS_PAPER_QUESTION_MAPPING ||--o{ ATTEMPTS_ANSWER : "answers mapped question"
+    QUESTIONS_QUESTION ||--o{ ATTEMPTS_ANSWER : "answers question"
+    QUESTIONS_QUESTION_OPTION ||--o{ ATTEMPTS_ANSWER : "selects option"
     ATTEMPTS_EXAM_ATTEMPT ||--o| ATTEMPTS_SUBMISSION_RECEIPT : "produces"
 
     ATTEMPTS_EXAM_ATTEMPT {
@@ -1536,6 +1660,7 @@ erDiagram
     ATTEMPTS_ANSWER {
         bigint id PK
         bigint attempt_id FK
+        bigint paper_question_mapping_id FK
         bigint question_id FK
         bigint selected_option_id FK
         mediumtext answer_text
@@ -1546,12 +1671,17 @@ erDiagram
         bigint id PK
         bigint attempt_id FK,UK
         string receipt_uuid UK
+        string submission_status
+        string submission_uuid
         datetime submitted_at
+        datetime official_end_time
+        datetime closed_at
+        datetime committed_at
         string server_hmac_signature
     }
 ```
 
-### 6.5 Domain ERD 5: Descriptive Uploads & Evaluation
+### 6.5 Domain ERD 5: Descriptive Uploads & Evaluation (Outbox Dispatch)
 
 ```mermaid
 erDiagram
@@ -1566,6 +1696,7 @@ erDiagram
     FACULTY_FACULTY_PROFILE ||--o{ EVALUATIONS_DESCRIPTIVE_EVALUATION : "scored by"
 
     ATTEMPTS_EXAM_ATTEMPT ||--o| EVALUATIONS_MCQ_EVALUATION_LOG : "auto-scored"
+    ATTEMPTS_EXAM_ATTEMPT ||--o{ EVALUATIONS_GRADING_OUTBOX : "enqueues grading"
     ATTEMPTS_EXAM_ATTEMPT ||--o| RESULTS_STUDENT_PAPER_RESULT : "yields"
 
     UPLOADS_DESCRIPTIVE_UPLOAD {
@@ -1578,13 +1709,15 @@ erDiagram
         string mime_type
         string validation_status
     }
-    EVALUATIONS_DESCRIPTIVE_EVALUATION {
+    EVALUATIONS_GRADING_OUTBOX {
         bigint id PK
+        string event_id UK
         bigint attempt_id FK
-        bigint question_id FK
-        bigint evaluator_id FK
-        decimal marks_awarded
-        string evaluation_stage
+        string event_type
+        string idempotency_key UK
+        string status
+        tinyint retry_count
+        datetime next_retry_at
     }
     RESULTS_STUDENT_PAPER_RESULT {
         bigint id PK
@@ -1667,6 +1800,7 @@ erDiagram
     ATTEMPTS_EXAM_ATTEMPT ||--o{ ATTEMPTS_ANSWER : "answers"
     ATTEMPTS_EXAM_ATTEMPT ||--o{ UPLOADS_DESCRIPTIVE_UPLOAD : "uploads"
     ATTEMPTS_EXAM_ATTEMPT ||--o| ATTEMPTS_SUBMISSION_RECEIPT : "receipt"
+    ATTEMPTS_EXAM_ATTEMPT ||--o{ EVALUATIONS_GRADING_OUTBOX : "outbox"
     
     ATTEMPTS_EXAM_ATTEMPT ||--o{ EVALUATIONS_DESCRIPTIVE_EVALUATION : "graded"
     ATTEMPTS_EXAM_ATTEMPT ||--o| RESULTS_STUDENT_PAPER_RESULT : "concludes"
@@ -1692,4 +1826,4 @@ To guarantee that the schema accommodates varied college and university regulati
 
 ---
 
-> **STOP:** Database architecture documentation is complete. No Django models, migrations, or database tables have been generated. Awaiting independent GitHub audit and user review before proceeding.\n
+> **STOP:** Database architecture documentation is complete. No Django models, migrations, or database tables have been generated. Awaiting independent GitHub audit and user review before proceeding.
