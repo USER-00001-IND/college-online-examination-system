@@ -1,11 +1,11 @@
-# Chunk 04: Authentication and Roles Audit Report (Round 3 Rate-Limiting & Concurrency Corrections)
+# Chunk 04: Authentication and Roles Audit Report (Round 4 Redis Throttling & Security Corrections)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 3 Revision)  
+**Date:** 2026-11-03 (Round 4 Revision)  
 **Stage:** Chunk 04 — Authentication and Roles  
-**Last Audited Commit:** `784341672bff82651435a5a1f71addf80a3b7ffe`  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 3 Round 3 findings [1 HIGH, 1 MEDIUM, 1 LOW] and the client IP fallback review have been resolved, verified, and backed by 123 passing automated tests; Chunk 05 onward remains strictly gated).
+**Last Audited Commit:** `c33fe126c54e06fa29570a4a24d772c36e2e5daa`  
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 3 Round 4 findings [1 HIGH, 2 MEDIUM] have been resolved, verified, and backed by 145 passing automated tests and 1 cleanly skipped live-redis integration test; Chunk 05 onward remains strictly gated).
 
 ---
 
@@ -558,30 +558,171 @@ In Round 2, `get_validated_client_ip()` defaulted candidate IP strings to `'127.
 
 ---
 
-## 10. Verification and Test Results Summary
+## 10. Verification and Test Results Summary (Round 3 Baseline)
+
+- **Round 3 Test Suite:** 123 passing tests.
+- **Round 3 Audit Verdict:** Revision required (1 HIGH, 2 MEDIUM).
+
+---
+
+## 11. Round 4 — Redis Atomic Throttling and Production Fail-Closed Corrections
+
+### 11.1 Summary of Addressed Findings
+
+| Finding ID | Severity | Description | Status |
+| :--- | :---: | :--- | :---: |
+| **Finding 1** | **HIGH** | Unsafe production fallback: silent drop-through to local process `threading.RLock` | **RESOLVED** |
+| **Finding 2** | **MEDIUM** | Redis key mismatch: Lua script used raw keys while Django cache applied prefixes/versions | **RESOLVED** |
+| **Finding 3** | **MEDIUM** | Sensitive exception logging: raw Redis error messages could leak connection URLs and secrets | **RESOLVED** |
+
+---
+
+### 11.2 Finding 1 (HIGH) — Elimination of Unsafe Production Fallback
+
+#### 1. Root Cause
+In Round 3, `AuthenticationThrottle.acquire_admission()` attempted to acquire `redis_client = self._get_raw_redis_client()`. If this call returned `None` (e.g. if the Redis client could not be obtained), execution silently dropped through to the local `threading.RLock` cache implementation (`with _local_throttle_lock:`). In a multi-worker production deployment (Gunicorn with 4–8 worker processes), a process-level lock only coordinates threads inside a single Python worker, fragmenting rate-limiting state and violating cross-process coordination.
+
+#### 2. Resolution & Production Fail-Closed Gate
+- Implemented `_is_production_environment()` in [`backend/apps/accounts/throttling.py`](file:///home/zero/Documents/college/backend/apps/accounts/throttling.py#L182-L196) (lines 182–196):
+  - Strictly inspects `settings.ENVIRONMENT_NAME`. If `'production'`, marks environment as production.
+  - If `ENVIRONMENT_NAME in ('development', 'dev', 'test', 'testing')`, marks environment as non-production.
+  - Defense-in-depth: if unconfigured, verifies `not bool(getattr(settings, 'DEBUG', True))`. Never relies on `DEBUG` alone.
+- In `acquire_admission()` (lines 230–241):
+  - When `_is_production_environment()` is `True` and `redis_client is None`, immediately logs a sanitized critical alert (`REDIS_CLIENT_UNAVAILABLE`) and raises `ThrottleBackendError("Production authentication throttle requires an operational Redis client.")`.
+  - Execution in production **NEVER** reaches `with _local_throttle_lock:`.
+- In [`backend/apps/accounts/views.py`](file:///home/zero/Documents/college/backend/apps/accounts/views.py#L125-L141) (lines 125–141):
+  - Catches `ThrottleBackendError` and immediately returns HTTP 503 `SERVICE_UNAVAILABLE`.
+  - Completely bypasses password verification and dummy hashing (`mock_check_password.assert_not_called()`).
+  - Completely blocks session creation.
+- Preserved the local-lock implementation strictly for development and test environments (`ENVIRONMENT_NAME in ('development', 'test')`).
+
+#### 3. Verification
+- `ProductionEnvironmentFallbackTests`:
+  - `test_production_redis_available_uses_atomic_redis_path`: Proves Redis path is taken and `_local_throttle_lock` is never acquired.
+  - `test_production_redis_unavailable_raises_throttle_backend_error`: Proves `ThrottleBackendError` is raised when Redis client is `None` in production.
+  - `test_production_redis_unavailable_never_enters_local_fallback`: Proves `_local_throttle_lock.__enter__` is never invoked.
+  - `test_production_redis_eval_failure_fails_closed_http_503`: Proves HTTP 503 is returned and password check is never called.
+  - `test_production_environment_gate_does_not_rely_on_debug_alone`: Proves `DEBUG=True` with `ENVIRONMENT_NAME='production'` still enforces Redis.
+  - `test_test_environment_permits_local_fallback_when_debug_false`: Proves `ENVIRONMENT_NAME='test'` permits local lock.
+  - `test_dev_environment_permits_local_fallback`: Proves development environment permits local lock.
+
+---
+
+### 11.3 Finding 2 (MEDIUM) — Consistent Redis Key Namespace & Generation-Aware Reset
+
+#### 1. Root Cause
+In Round 3, the Redis Lua script operated directly on raw keys (`auth_throttle:ip:<sha256>`, `auth_throttle:target:<sha256>`). However, `reset_target()` called `cache.delete(raw_target_key)`. Django's cache layer applies configured prefixes (`KEY_PREFIX`) and versioning (`VERSION`) via `cache.make_key()`. Consequently, Django's cache deleted `college:1:auth_throttle:target:...` while the Lua script created `auth_throttle:target:...`. The keys in Redis did not match! Furthermore, a naive deletion on successful login could erase failed-attempt reservations made by newer concurrent requests.
+
+#### 2. Resolution: Namespace Parity & Generation-Aware Reset
+- **Namespace Parity via `_make_effective_cache_key()`:**
+  - Implemented `_make_effective_cache_key(raw_key)` in [`backend/apps/accounts/throttling.py`](file:///home/zero/Documents/college/backend/apps/accounts/throttling.py#L143-L153) (lines 143–153):
+    Passes raw throttle keys through `cache.make_key(raw_key)` before providing them to Redis Lua scripts.
+  - Guarantees 100% namespace parity: raw Redis operations, Django cache API calls, and expiration handlers operate on the exact same underlying Redis keys.
+- **Generation-Aware Atomic Reset Policy (`REDIS_RESET_TARGET_LUA`):**
+  - Updated `acquire_admission()` to return `AdmissionResult(admitted, retry_after, reason, reservation_count)`.
+  - On admission, `reservation_count` captures the reserved counter generation (lines 60–66, 260–262).
+  - On successful login, `views.py` invokes `throttle.reset_target(ip, identifier, reserved_count=admission.reservation_count)` (lines 253–254).
+  - Executed atomic Lua script `REDIS_RESET_TARGET_LUA` in Redis (lines 78–108, 305–326):
+    - If `current_count <= reserved_count` (no newer concurrent requests arrived): `redis.call('DEL', target_key)` clears the counter.
+    - If `current_count > reserved_count` (newer concurrent requests arrived during password verification): deducts `reserved_count` from `current_count` and preserves the remaining attempts and TTL (`redis.call('SET', target_key, remaining, 'EX', ttl)`).
+    - Concurrent failed attempts are **NEVER erased**!
+  - Local thread-locked cache mirrors identical generation-aware logic (lines 330–355).
+
+#### 3. Verification
+- `RedisLuaThrottlingUnitTests`:
+  - `test_initial_redis_key_creation_and_increments`: Confirms keys are created and incremented in Redis.
+  - `test_target_limit_enforcement_redis`: Confirms target limit (5) blocks 6th attempt with HTTP 429.
+  - `test_ip_limit_enforcement_redis`: Confirms IP limit (15) blocks 16th attempt with `IP_LIMIT`.
+  - `test_redis_key_prefix_and_version_compatibility`: Confirms effective keys match `cache.make_key()`.
+  - `test_concurrency_same_ip_burst_redis` (Test A): 30 concurrent threads against limit 15 -> 15 admitted, 15 denied.
+  - `test_concurrency_same_identifier_burst_redis` (Test B): 20 concurrent threads against limit 5 -> 5 admitted, 15 denied.
+  - `test_independent_worker_instances_share_redis_state` (Test C): Separate instances observe synchronized state.
+  - `test_last_slot_race_redis` (Test D): 1 slot left, 10 concurrent requests -> 1 admitted, 9 denied.
+  - `test_expiration_redis` (Test E): Short window TTL expires and renewed attempt is admitted.
+  - `test_concurrent_success_failure_preserves_concurrent_security_evidence` (Test H): Proves generation-aware reset preserves concurrent attacker attempts.
+  - `test_no_unexpected_deletion_of_unrelated_keys` (Test I): Proves resetting user_a does not affect user_b.
+
+---
+
+### 11.4 Finding 3 (MEDIUM) — Safe Diagnostic Redis Exception Logging
+
+#### 1. Root Cause
+In Round 3, exceptions in `throttling.py` were logged via `logger.critical("... %s", exc)`. Raw exception objects (`exc` or `str(exc)`) from Redis drivers can embed connection strings, passwords, Redis URLs (`redis://:password@host:6379`), or internal hostnames.
+
+#### 2. Resolution: Diagnostic Sanitization
+- In [`backend/apps/accounts/throttling.py`](file:///home/zero/Documents/college/backend/apps/accounts/throttling.py):
+  - Evaluated every logging call (`_get_raw_redis_client`, `acquire_admission`, `reset_target`).
+  - Completely eliminated `str(exc)`, `exc.args`, and `exc` from log messages.
+  - Logs structured diagnostic metadata only:
+    `logger.critical("Authentication throttle backend failure [category=%s, type=%s]", "REDIS_EVALUATION_FAILED", exc.__class__.__name__, exc_info=False)`
+  - Explicitly suppressed traceback attachments in production (`exc_info=False`).
+  - Suppressed exception chaining (`raise ThrottleBackendError(...) from None`) to ensure tracebacks printed in production cannot expose the underlying connection exception.
+- In [`backend/apps/accounts/views.py`](file:///home/zero/Documents/college/backend/apps/accounts/views.py#L128-L132):
+  - Emits structured alert `[category=THROTTLE_BACKEND_UNAVAILABLE]` with `exc_info=False`.
+  - Returns generic HTTP 503 payload with zero server details.
+
+#### 3. Verification
+- `SafeRedisExceptionLoggingTests`:
+  - `test_redis_eval_exception_does_not_leak_secrets_in_logs`: Injects Redis exception with sensitive connection token; verifies token and host are absent from logs, while safe category `REDIS_EVALUATION_FAILED` and exception class `ConnectionError` are present.
+  - `test_redis_client_acquisition_exception_does_not_leak_secrets`: Injects acquisition failure with password; verifies password is absent and `REDIS_CLIENT_ACQUISITION_FAILED` is logged.
+  - `test_redis_reset_exception_does_not_leak_secrets`: Injects reset timeout with internal hostname; verifies host is absent and `REDIS_RESET_FAILED` is logged.
+  - `test_throttle_backend_error_does_not_chain_sensitive_exceptions`: Confirms `__cause__ is None` and sensitive text is not present in exception string.
+
+---
+
+### 11.5 Redis Integration Test Evidence & Infrastructure Boundaries
+
+In compliance with Round 4 verification standards:
+
+1. **Unit & Local-Cache Tests:** Executed 145 tests covering Django models, permissions, views, audit metadata, and local-lock concurrency.
+2. **Mocked Redis Concurrency Tests (`RedisLuaThrottlingUnitTests`):** Executed 10 comprehensive multi-threaded test cases against `MockRedisClient` simulating single-threaded Redis Lua engine atomicity (Tests A–E, G, H, I).
+3. **Live Redis Integration (`LiveRedisIntegrationTests`):**
+   - Attempted probe of local Redis daemon at `redis://127.0.0.1:6379/15`.
+   - Result:
+     > [!IMPORTANT]
+     > **REAL REDIS INTEGRATION: NOT EXECUTED**
+     > No live Redis service daemon is active on the test host (`redis-cli: command not found`).
+     > `LiveRedisIntegrationTests.test_live_redis_concurrency_same_ip_burst` cleanly skipped with message:
+     > `"REAL REDIS INTEGRATION: NOT EXECUTED — No live Redis server available at redis://127.0.0.1:6379/15"`.
+     > Multi-process cross-worker cluster verification remains an operational deployment verification requirement (Chunk 16).
+
+---
+
+### 11.6 Protected Architectural Documentation Integrity
+
+The four protected architectural documents remain completely unmodified and intact:
+1. [`design.md`](file:///home/zero/Documents/college/design.md) — Unmodified
+2. [`handover.txt`](file:///home/zero/Documents/college/handover.txt) — Unmodified
+3. [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md) — Unmodified
+4. [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md) — Unmodified
+
+---
+
+## 12. Verification and Test Results Summary
 
 ```bash
 $ .venv/bin/python backend/manage.py test tests --settings=config.settings.test
-Found 123 test(s).
+Found 146 test(s).
 Creating test database for alias 'default'...
 System check identified no issues (0 silenced).
-...........................................................................................................................
+..................................................................................................................................................s
 ----------------------------------------------------------------------
-Ran 123 tests in 1.537s
+Ran 146 tests in 3.210s
 
-OK
+OK (skipped=1)
 Destroying test database for alias 'default'...
 ```
 
 ```bash
 $ .venv/bin/pytest backend/tests --ds=config.settings.test
-============================= 123 passed in 1.79s ==============================
+======================== 145 passed, 1 skipped in 4.02s ========================
 ```
 
 - **Django Development Check:** `System check identified no issues (0 silenced).`
 - **Django Migration Dry-Run:** `No changes detected.`
 - **Django Production Deploy Check:** `System check identified no issues (0 silenced).`
-- **Protected Files Integrity:** [`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), and [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md) remain strictly unmodified.
-- **Stage Gating:** Chunk 04 is complete and submitted for independent audit. Chunk 05 onward remains strictly gated.
+- **Protected Files Integrity:** All 4 protected documents remain strictly unmodified.
+- **Stage Gating:** Chunk 04 is in `IN REVIEW` status. Chunk 05 onward remains strictly gated.
+
 
 

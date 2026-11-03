@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from typing import Optional, Tuple
+
 from django.conf import settings
 from django.core.cache import cache
 
@@ -18,16 +19,39 @@ from apps.accounts.audit import sanitize_identifier
 
 logger = logging.getLogger('college.accounts.throttling')
 
-# Process-level reentrant lock for thread-safe atomicity on local-memory / generic caches
+# Process-level reentrant lock for thread-safe atomicity on local-memory / generic caches (dev/test only)
 _local_throttle_lock = threading.RLock()
 
+
+class AdmissionResult(tuple):
+    """
+    Result of a throttle admission acquisition.
+    Maintains backward compatibility with 3-element tuple unpacking (admitted, retry_after, reason),
+    while exposing named attributes including the reserved counter generation.
+    """
+    def __new__(cls, admitted: bool, retry_after: int, reason: str, reservation_count: int = 0):
+        obj = super().__new__(cls, (admitted, retry_after, reason))
+        obj.admitted = admitted
+        obj.retry_after = retry_after
+        obj.reason = reason
+        obj.reservation_count = reservation_count
+        return obj
+
+    def __repr__(self):
+        return (
+            f"AdmissionResult(admitted={self.admitted}, retry_after={self.retry_after}, "
+            f"reason='{self.reason}', reservation_count={self.reservation_count})"
+        )
+
+
 # Redis Lua Script for Atomic Check-and-Reserve
-# KEYS[1]: ip_key
-# KEYS[2]: target_key
+# KEYS[1]: ip_key (effective key including cache prefix/version)
+# KEYS[2]: target_key (effective key including cache prefix/version)
 # ARGV[1]: ip_limit
 # ARGV[2]: ip_window
 # ARGV[3]: target_limit
 # ARGV[4]: target_window
+# Returns: {admitted (0/1), ttl, reason, reservation_count}
 REDIS_CHECK_AND_RESERVE_LUA = """
 local ip_key = KEYS[1]
 local target_key = KEYS[2]
@@ -45,13 +69,13 @@ local target_count = tonumber(target_val or '0')
 if ip_count >= ip_limit then
     local ttl = redis.call('TTL', ip_key)
     if ttl < 0 then ttl = ip_window end
-    return {0, ttl, 'IP_LIMIT'}
+    return {0, ttl, 'IP_LIMIT', 0}
 end
 
 if target_count >= target_limit then
     local ttl = redis.call('TTL', target_key)
     if ttl < 0 then ttl = target_window end
-    return {0, ttl, 'TARGET_LIMIT'}
+    return {0, ttl, 'TARGET_LIMIT', 0}
 end
 
 local new_ip = redis.call('INCR', ip_key)
@@ -64,7 +88,40 @@ if new_target == 1 then
     redis.call('EXPIRE', target_key, target_window)
 end
 
-return {1, 0, 'ADMITTED'}
+return {1, 0, 'ADMITTED', new_target}
+"""
+
+# Redis Lua Script for Generation-Aware Atomic Target Reset
+# KEYS[1]: target_key (effective key including cache prefix/version)
+# ARGV[1]: reserved_count (count at time of admission reservation)
+# Concurrency Policy:
+# - If current_count <= reserved_count (no newer concurrent attempts arrived):
+#     DEL target_key (safe to clear completely)
+# - If current_count > reserved_count (newer concurrent attempts arrived while this session authenticated):
+#     Deduct reserved_count from current_count and preserve remaining attempts + TTL (cannot erase concurrent failures!)
+REDIS_RESET_TARGET_LUA = """
+local target_key = KEYS[1]
+local reserved_count = tonumber(ARGV[1] or '0')
+
+local current_val = redis.call('GET', target_key)
+if not current_val then
+    return 0
+end
+
+local current_count = tonumber(current_val)
+if reserved_count == nil or reserved_count <= 0 or current_count <= reserved_count then
+    redis.call('DEL', target_key)
+    return 0
+else
+    local remaining = current_count - reserved_count
+    local ttl = redis.call('TTL', target_key)
+    if ttl > 0 then
+        redis.call('SET', target_key, remaining, 'EX', ttl)
+    else
+        redis.call('SET', target_key, remaining)
+    end
+    return remaining
+end
 """
 
 
@@ -74,9 +131,20 @@ class ThrottleBackendError(Exception):
 
 
 def _hash_throttle_key(dimension: str, raw_value: str) -> str:
-    """Computes a SHA-256 digest cache key for a throttling dimension."""
+    """Computes a SHA-256 digest logical cache key for a throttling dimension."""
     digest = hashlib.sha256(raw_value.encode('utf-8')).hexdigest()
     return f"auth_throttle:{dimension}:{digest}"
+
+
+def _make_effective_cache_key(raw_key: str) -> str:
+    """
+    Transforms a logical throttle key into the effective Redis/cache key
+    by applying Django's configured cache key prefix and version.
+    Guarantees 100% namespace parity between raw Redis operations and Django cache API.
+    """
+    if hasattr(cache, 'make_key'):
+        return cache.make_key(raw_key)
+    return raw_key
 
 
 class AuthenticationThrottle:
@@ -102,6 +170,20 @@ class AuthenticationThrottle:
         sanitized = sanitize_identifier(raw_identifier)
         return sanitized.lower()
 
+    def _is_production_environment(self) -> bool:
+        """
+        Determines whether the application is running in a production environment.
+        Checks explicit ENVIRONMENT_NAME setting first, followed by strict defense checks.
+        Never relies on DEBUG alone.
+        """
+        env_name = str(getattr(settings, 'ENVIRONMENT_NAME', '')).lower()
+        if env_name == 'production':
+            return True
+        if env_name in ('development', 'dev', 'test', 'testing'):
+            return False
+        # Defense-in-depth: if ENVIRONMENT_NAME is unconfigured or unknown, check non-debug status
+        return not bool(getattr(settings, 'DEBUG', True))
+
     def _get_raw_redis_client(self):
         """Attempts to obtain the raw redis client from Django's cache backend."""
         try:
@@ -113,7 +195,13 @@ class AuthenticationThrottle:
             client = getattr(cache, 'client', None)
             if client and hasattr(client, 'get_client'):
                 return client.get_client()
-        except Exception:
+        except Exception as exc:
+            logger.critical(
+                "Authentication throttle backend failure [category=%s, type=%s]",
+                "REDIS_CLIENT_ACQUISITION_FAILED",
+                exc.__class__.__name__,
+                exc_info=False,
+            )
             return None
         return None
 
@@ -121,31 +209,45 @@ class AuthenticationThrottle:
         self,
         ip_address: str,
         raw_identifier: str,
-    ) -> Tuple[bool, int, str]:
+    ) -> AdmissionResult:
         """
         Atomically checks limits and reserves an admission attempt BEFORE password verification.
 
         Returns:
-            (admitted: bool, retry_after_seconds: int, reason: str)
+            AdmissionResult(admitted: bool, retry_after: int, reason: str, reservation_count: int)
             Where reason is 'ADMITTED', 'IP_LIMIT', or 'TARGET_LIMIT'.
 
         Raises:
             ThrottleBackendError if the rate-limiting infrastructure fails.
         """
         normalized_id = self._normalize(raw_identifier)
-        ip_key = _hash_throttle_key('ip', ip_address)
+        raw_ip_key = _hash_throttle_key('ip', ip_address)
         compound_val = f"{ip_address}:{normalized_id}"
-        target_key = _hash_throttle_key('target', compound_val)
+        raw_target_key = _hash_throttle_key('target', compound_val)
 
-        # 1. Try atomic Redis Lua execution if connected to Redis
+        is_prod = self._is_production_environment()
         redis_client = self._get_raw_redis_client()
+
+        # In production, an operational Redis backend is MANDATORY. Never fall back to local lock!
+        if is_prod and redis_client is None:
+            logger.critical(
+                "Authentication throttle backend failure [category=%s, type=%s]",
+                "REDIS_CLIENT_UNAVAILABLE",
+                "NoneType",
+                exc_info=False,
+            )
+            raise ThrottleBackendError("Production authentication throttle requires an operational Redis client.")
+
+        # 1. Execute atomic Redis Lua script if Redis client is available
         if redis_client is not None:
+            effective_ip_key = _make_effective_cache_key(raw_ip_key)
+            effective_target_key = _make_effective_cache_key(raw_target_key)
             try:
                 result = redis_client.eval(
                     REDIS_CHECK_AND_RESERVE_LUA,
                     2,
-                    ip_key,
-                    target_key,
+                    effective_ip_key,
+                    effective_target_key,
                     self.ip_limit,
                     self.ip_window,
                     self.target_limit,
@@ -154,66 +256,141 @@ class AuthenticationThrottle:
                 admitted = bool(result[0])
                 ttl = int(result[1])
                 reason = str(result[2])
-                return admitted, ttl, reason
+                reservation_count = int(result[3]) if len(result) > 3 else 0
+                return AdmissionResult(admitted, ttl, reason, reservation_count=reservation_count)
             except Exception as exc:
-                logger.critical("CRITICAL: Redis throttle Lua evaluation failed: %s", exc)
-                raise ThrottleBackendError(f"Redis throttling failure: {exc}") from exc
+                logger.critical(
+                    "Authentication throttle backend failure [category=%s, type=%s]",
+                    "REDIS_EVALUATION_FAILED",
+                    exc.__class__.__name__,
+                    exc_info=False,
+                )
+                raise ThrottleBackendError("Authentication rate-limiting infrastructure failure.") from None
 
-        # 2. Concurrency-safe atomic check-and-reserve for generic / test caches
+        # 2. Concurrency-safe atomic check-and-reserve for generic / test caches (DEV/TEST ONLY)
         with _local_throttle_lock:
             try:
                 now = time.time()
 
                 # Evaluate IP limit
-                ip_count = cache.get(ip_key) or 0
+                ip_count = cache.get(raw_ip_key) or 0
                 if ip_count >= self.ip_limit:
-                    start_time = cache.get(f"{ip_key}:start")
+                    start_time = cache.get(f"{raw_ip_key}:start")
                     elapsed = (now - start_time) if start_time else 0
                     retry_after = max(1, int(self.ip_window - elapsed))
-                    return False, retry_after, 'IP_LIMIT'
+                    return AdmissionResult(False, retry_after, 'IP_LIMIT', 0)
 
                 # Evaluate Target compound limit
-                target_count = cache.get(target_key) or 0
+                target_count = cache.get(raw_target_key) or 0
                 if target_count >= self.target_limit:
-                    start_time = cache.get(f"{target_key}:start")
+                    start_time = cache.get(f"{raw_target_key}:start")
                     elapsed = (now - start_time) if start_time else 0
                     retry_after = max(1, int(self.target_window - elapsed))
-                    return False, retry_after, 'TARGET_LIMIT'
+                    return AdmissionResult(False, retry_after, 'TARGET_LIMIT', 0)
 
                 # Both counters are below threshold: atomically reserve one attempt!
                 if ip_count == 0:
-                    cache.set(ip_key, 1, timeout=self.ip_window)
-                    cache.set(f"{ip_key}:start", now, timeout=self.ip_window)
+                    cache.set(raw_ip_key, 1, timeout=self.ip_window)
+                    cache.set(f"{raw_ip_key}:start", now, timeout=self.ip_window)
                 else:
                     try:
-                        cache.incr(ip_key)
+                        cache.incr(raw_ip_key)
                     except Exception:
-                        cache.set(ip_key, ip_count + 1, timeout=self.ip_window)
+                        cache.set(raw_ip_key, ip_count + 1, timeout=self.ip_window)
 
+                new_target_count = target_count + 1
                 if target_count == 0:
-                    cache.set(target_key, 1, timeout=self.target_window)
-                    cache.set(f"{target_key}:start", now, timeout=self.target_window)
+                    cache.set(raw_target_key, 1, timeout=self.target_window)
+                    cache.set(f"{raw_target_key}:start", now, timeout=self.target_window)
                 else:
                     try:
-                        cache.incr(target_key)
+                        new_target_count = cache.incr(raw_target_key)
                     except Exception:
-                        cache.set(target_key, target_count + 1, timeout=self.target_window)
+                        cache.set(raw_target_key, new_target_count, timeout=self.target_window)
 
-                return True, 0, 'ADMITTED'
+                return AdmissionResult(True, 0, 'ADMITTED', reservation_count=new_target_count)
             except Exception as exc:
-                logger.critical("CRITICAL: Local throttle cache evaluation failed: %s", exc)
-                raise ThrottleBackendError(f"Throttling infrastructure failure: {exc}") from exc
+                logger.critical(
+                    "Authentication throttle backend failure [category=%s, type=%s]",
+                    "LOCAL_CACHE_EVALUATION_FAILED",
+                    exc.__class__.__name__,
+                    exc_info=False,
+                )
+                raise ThrottleBackendError("Authentication rate-limiting infrastructure failure.") from None
 
-    def reset_target(self, ip_address: str, raw_identifier: str) -> None:
+    def reset_target(
+        self,
+        ip_address: str,
+        raw_identifier: str,
+        reserved_count: Optional[int] = None,
+    ) -> None:
         """
-        Clears the compound (IP + Target) counter upon successful authentication.
-        Leaves IP-level counter intact to prevent distributed credential stuffing.
+        Resets the compound (IP + Target) counter upon successful authentication using
+        an atomic, generation-aware policy.
+
+        Security Policy:
+        - Leaves IP-level counter intact to prevent distributed credential stuffing.
+        - If newer concurrent requests arrived while this session authenticated (current_count > reserved_count),
+          only this session's attempts are deducted; concurrent failures are preserved.
+        - In production, uses Redis Lua exclusively; if Redis is unavailable, logs a sanitized alert
+          and fails securely (counter naturally expires via TTL without blocking user session).
         """
-        try:
-            normalized_id = self._normalize(raw_identifier)
-            compound_val = f"{ip_address}:{normalized_id}"
-            target_key = _hash_throttle_key('target', compound_val)
-            cache.delete(target_key)
-            cache.delete(f"{target_key}:start")
-        except Exception as exc:
-            logger.warning("Failed to reset target throttle key: %s", exc)
+        normalized_id = self._normalize(raw_identifier)
+        compound_val = f"{ip_address}:{normalized_id}"
+        raw_target_key = _hash_throttle_key('target', compound_val)
+
+        is_prod = self._is_production_environment()
+        redis_client = self._get_raw_redis_client()
+
+        if is_prod and redis_client is None:
+            logger.warning(
+                "Authentication throttle reset failure [category=%s, type=%s]",
+                "REDIS_CLIENT_UNAVAILABLE",
+                "NoneType",
+                exc_info=False,
+            )
+            return
+
+        if redis_client is not None:
+            effective_target_key = _make_effective_cache_key(raw_target_key)
+            try:
+                redis_client.eval(
+                    REDIS_RESET_TARGET_LUA,
+                    1,
+                    effective_target_key,
+                    reserved_count or 0,
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Authentication throttle reset failure [category=%s, type=%s]",
+                    "REDIS_RESET_FAILED",
+                    exc.__class__.__name__,
+                    exc_info=False,
+                )
+                return
+
+        # Local cache atomic generation-aware reset (DEV/TEST ONLY)
+        with _local_throttle_lock:
+            try:
+                current_val = cache.get(raw_target_key)
+                if current_val is None:
+                    return
+                current_count = int(current_val)
+                if reserved_count is None or reserved_count <= 0 or current_count <= reserved_count:
+                    cache.delete(raw_target_key)
+                    cache.delete(f"{raw_target_key}:start")
+                else:
+                    new_count = current_count - reserved_count
+                    start_time = cache.get(f"{raw_target_key}:start")
+                    now = time.time()
+                    elapsed = (now - start_time) if start_time else 0
+                    remaining_ttl = max(1, int(self.target_window - elapsed))
+                    cache.set(raw_target_key, new_count, timeout=remaining_ttl)
+            except Exception as exc:
+                logger.warning(
+                    "Authentication throttle reset failure [category=%s, type=%s]",
+                    "LOCAL_RESET_FAILED",
+                    exc.__class__.__name__,
+                    exc_info=False,
+                )

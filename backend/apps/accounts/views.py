@@ -120,13 +120,18 @@ class LoginView(APIView):
         raw_identifier = request.data.get('identifier', '') if isinstance(request.data, dict) else ''
 
         # ----------------------------------------------------------------------
-        # Round 3: Atomic Pre-Auth Admission & Throttling (Fails Closed on Failure)
+        # Round 3/4: Atomic Pre-Auth Admission & Throttling (Fails Closed on Failure)
         # ----------------------------------------------------------------------
         throttle = AuthenticationThrottle()
         try:
-            admitted, retry_after, reason = throttle.acquire_admission(ip_address, str(raw_identifier))
+            admission = throttle.acquire_admission(ip_address, str(raw_identifier))
+            admitted, retry_after, reason = admission
         except ThrottleBackendError:
-            logger.critical("Authentication request rejected: Throttle infrastructure failure.")
+            logger.critical(
+                "Authentication request rejected: Throttle infrastructure failure [category=%s]",
+                "THROTTLE_BACKEND_UNAVAILABLE",
+                exc_info=False,
+            )
             return Response(
                 {
                     "error": {
@@ -246,7 +251,7 @@ class LoginView(APIView):
             )
 
         # Clear compound rate-limiting throttle on successful authentication
-        throttle.reset_target(ip_address, identifier)
+        throttle.reset_target(ip_address, identifier, reserved_count=admission.reservation_count)
 
         # Establish Django session and cycle session key to prevent session fixation
         django_login(request, user, backend='apps.accounts.backends.EmailOrUsernameModelBackend')

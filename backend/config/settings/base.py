@@ -23,6 +23,7 @@ if env_file.exists():
 # Application definition
 APP_VERSION = '1.0.0'
 SYSTEM_NAME = 'College Online Examination System'
+ENVIRONMENT_NAME = env.str('ENVIRONMENT_NAME', default='development')
 
 INSTALLED_APPS = [
     # Django Core Applications
