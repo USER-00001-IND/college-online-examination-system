@@ -250,9 +250,6 @@ class LoginView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # Clear compound rate-limiting throttle on successful authentication
-        throttle.reset_target(ip_address, identifier, reserved_count=admission.reservation_count)
-
         # Establish Django session and cycle session key to prevent session fixation
         django_login(request, user, backend='apps.accounts.backends.EmailOrUsernameModelBackend')
         user.last_login = timezone.now()

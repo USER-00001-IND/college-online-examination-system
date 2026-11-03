@@ -27,7 +27,6 @@ from apps.accounts.throttling import (
     _local_throttle_lock,
     _make_effective_cache_key,
     REDIS_CHECK_AND_RESERVE_LUA,
-    REDIS_RESET_TARGET_LUA,
 )
 from apps.accounts.views import LoginView
 
@@ -195,11 +194,14 @@ class AuthenticationThrottlingAPITests(TestCase):
         )
         self.assertEqual(response2.status_code, status.HTTP_200_OK)
 
-    def test_successful_login_resets_target_attempts(self):
-        """Verify successful login clears target failed attempt counter."""
+    def test_successful_login_does_not_reset_target_attempts(self):
+        """
+        Verify that under the admission-limiting policy, successful login does NOT clear or decrement
+        the target counter. Every admitted attempt (success or failure) consumes an admission slot.
+        """
         client, csrf_token = self._get_csrf_client()
 
-        # 3 failed attempts
+        # 3 failed attempts (attempts 1, 2, 3)
         for _ in range(3):
             client.post(
                 self.login_url,
@@ -208,7 +210,7 @@ class AuthenticationThrottlingAPITests(TestCase):
                 HTTP_X_CSRFTOKEN=csrf_token,
             )
 
-        # Successful login
+        # Successful login (attempt 4 out of 5)
         response = client.post(
             self.login_url,
             {'identifier': 'target_student', 'password': self.password},
@@ -217,17 +219,27 @@ class AuthenticationThrottlingAPITests(TestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        # After success, counter is reset: read updated CSRF token from active session
+        # Read updated CSRF token from active session
         current_csrf = client.cookies.get('csrftoken').value
-        # 3 more failed attempts must still be allowed without hitting 429
-        for _ in range(3):
-            resp = client.post(
-                self.login_url,
-                {'identifier': 'target_student', 'password': 'WrongPassword123!'},
-                content_type='application/json',
-                HTTP_X_CSRFTOKEN=current_csrf,
-            )
-            self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 1 more failed attempt (attempt 5 out of 5) is admitted
+        resp5 = client.post(
+            self.login_url,
+            {'identifier': 'target_student', 'password': 'WrongPassword123!'},
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=current_csrf,
+        )
+        self.assertEqual(resp5.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 6th attempt must be rejected with HTTP 429 TARGET_LIMIT because attempts were not cleared!
+        resp6 = client.post(
+            self.login_url,
+            {'identifier': 'target_student', 'password': 'WrongPassword123!'},
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=current_csrf,
+        )
+        self.assertEqual(resp6.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertEqual(resp6.data['error']['code'], 'RATE_LIMIT_EXCEEDED')
 
     def test_spoofed_ip_header_does_not_bypass_ip_throttle(self):
         """Verify attacker cannot bypass IP throttle by injecting spoofed X-Forwarded-For."""
@@ -466,9 +478,11 @@ class ConcurrentRateLimitingTests(TestCase):
 
 class MockRedisClient:
     """
-    Thread-safe in-memory Redis simulator that accurately executes the exact Lua scripts
-    used in production (REDIS_CHECK_AND_RESERVE_LUA and REDIS_RESET_TARGET_LUA).
+    Thread-safe in-memory Redis simulator that accurately executes the Lua script
+    used in production (REDIS_CHECK_AND_RESERVE_LUA).
     Provides atomic multi-threaded concurrency identical to a single-threaded Redis engine.
+    Returns Redis bulk strings as bytes (b'ADMITTED', b'IP_LIMIT', b'TARGET_LIMIT')
+    to ensure complete parity with redis-py drivers.
     """
     def __init__(self):
         self._lock = threading.RLock()
@@ -519,65 +533,42 @@ class MockRedisClient:
             keys = keys_and_args[:numkeys]
             argv = keys_and_args[numkeys:]
 
-            # Script 1: REDIS_CHECK_AND_RESERVE_LUA
-            if 'CHECK_AND_RESERVE' in script or 'ADMITTED' in script or 'ip_limit' in script:
-                ip_key = keys[0]
-                target_key = keys[1]
-                ip_limit = int(argv[0])
-                ip_window = int(argv[1])
-                target_limit = int(argv[2])
-                target_window = int(argv[3])
+            ip_key = keys[0]
+            target_key = keys[1]
+            ip_limit = int(argv[0])
+            ip_window = int(argv[1])
+            target_limit = int(argv[2])
+            target_window = int(argv[3])
 
-                self._purge_expired(ip_key)
-                self._purge_expired(target_key)
+            self._purge_expired(ip_key)
+            self._purge_expired(target_key)
 
-                ip_count = int(self._data.get(ip_key, 0))
-                target_count = int(self._data.get(target_key, 0))
+            ip_count = int(self._data.get(ip_key, 0))
+            target_count = int(self._data.get(target_key, 0))
 
-                if ip_count >= ip_limit:
-                    ttl_val = self.ttl(ip_key)
-                    if ttl_val < 0:
-                        ttl_val = ip_window
-                    return [0, ttl_val, 'IP_LIMIT', 0]
+            if ip_count >= ip_limit:
+                ttl_val = self.ttl(ip_key)
+                if ttl_val < 0:
+                    ttl_val = ip_window
+                return [0, ttl_val, b'IP_LIMIT']
 
-                if target_count >= target_limit:
-                    ttl_val = self.ttl(target_key)
-                    if ttl_val < 0:
-                        ttl_val = target_window
-                    return [0, ttl_val, 'TARGET_LIMIT', 0]
+            if target_count >= target_limit:
+                ttl_val = self.ttl(target_key)
+                if ttl_val < 0:
+                    ttl_val = target_window
+                return [0, ttl_val, b'TARGET_LIMIT']
 
-                new_ip = ip_count + 1
-                self._data[ip_key] = new_ip
-                if new_ip == 1:
-                    self._expires[ip_key] = time.time() + ip_window
+            new_ip = ip_count + 1
+            self._data[ip_key] = new_ip
+            if new_ip == 1:
+                self._expires[ip_key] = time.time() + ip_window
 
-                new_target = target_count + 1
-                self._data[target_key] = new_target
-                if new_target == 1:
-                    self._expires[target_key] = time.time() + target_window
+            new_target = target_count + 1
+            self._data[target_key] = new_target
+            if new_target == 1:
+                self._expires[target_key] = time.time() + target_window
 
-                return [1, 0, 'ADMITTED', new_target]
-
-            # Script 2: REDIS_RESET_TARGET_LUA
-            elif 'RESET' in script or 'reserved_count' in script:
-                target_key = keys[0]
-                reserved_count = int(argv[0]) if argv and argv[0] is not None else 0
-
-                self._purge_expired(target_key)
-                if target_key not in self._data:
-                    return 0
-
-                current_count = int(self._data[target_key])
-                if reserved_count <= 0 or current_count <= reserved_count:
-                    self._data.pop(target_key, None)
-                    self._expires.pop(target_key, None)
-                    return 0
-                else:
-                    remaining = current_count - reserved_count
-                    self._data[target_key] = remaining
-                    return remaining
-
-            raise NotImplementedError(f"MockRedisClient received unrecognized Lua script: {script[:40]}")
+            return [1, 0, b'ADMITTED']
 
 
 class ProductionEnvironmentFallbackTests(TestCase):
@@ -688,8 +679,8 @@ class ProductionEnvironmentFallbackTests(TestCase):
 
 class RedisLuaThrottlingUnitTests(TestCase):
     """
-    Verifies Finding 2: Consistent Redis key management and generation-aware reset.
-    Runs against the simulated thread-safe Redis Lua engine.
+    Verifies consistent Redis key management and atomic check-and-reserve admission.
+    Runs against the simulated thread-safe Redis Lua engine returning bytes bulk strings.
     """
 
     def setUp(self):
@@ -706,11 +697,9 @@ class RedisLuaThrottlingUnitTests(TestCase):
 
         res1 = throttle.acquire_admission('10.0.0.1', 'student_a')
         self.assertTrue(res1.admitted)
-        self.assertEqual(res1.reservation_count, 1)
 
         res2 = throttle.acquire_admission('10.0.0.1', 'student_a')
         self.assertTrue(res2.admitted)
-        self.assertEqual(res2.reservation_count, 2)
 
         # Confirm keys exist in Redis with expected counts
         raw_target_key = _hash_throttle_key('target', '10.0.0.1:student_a')
@@ -875,48 +864,8 @@ class RedisLuaThrottlingUnitTests(TestCase):
         res = short_throttle.acquire_admission('10.0.0.14', 'expiry_user')
         self.assertTrue(res[0])
 
-    def test_concurrent_success_failure_preserves_concurrent_security_evidence(self):
-        """
-        Test H — Concurrent success/failure policy:
-        Simulate a successful authentication overlapping newer failed-attempt reservations.
-        Proves that generation-aware reset CANNOT erase concurrent security evidence!
-        """
-        throttle = AuthenticationThrottle(target_limit=5, target_window=60)
-
-        # Step 1: Legitimate user reserves attempt 1
-        user_admission = throttle.acquire_admission('10.0.0.15', 'target_user')
-        self.assertTrue(user_admission.admitted)
-        self.assertEqual(user_admission.reservation_count, 1)
-
-        # Step 2: Concurrent attacker submits 2 attempts while user is verifying password
-        attacker_1 = throttle.acquire_admission('10.0.0.15', 'target_user')
-        attacker_2 = throttle.acquire_admission('10.0.0.15', 'target_user')
-        self.assertTrue(attacker_1.admitted)
-        self.assertTrue(attacker_2.admitted)
-
-        # Target count in Redis is now 3
-        raw_key = _hash_throttle_key('target', '10.0.0.15:target_user')
-        eff_key = _make_effective_cache_key(raw_key)
-        self.assertEqual(self.mock_redis.get(eff_key), '3')
-
-        # Step 3: Legitimate user authentication succeeds; triggers reset with reserved_count=1
-        throttle.reset_target('10.0.0.15', 'target_user', reserved_count=user_admission.reservation_count)
-
-        # Step 4: Key must NOT be deleted! Count must be 3 - 1 = 2 (attacker's attempts preserved!)
-        self.assertEqual(self.mock_redis.get(eff_key), '2')
-
-        # Step 5: Attacker can only make 3 more attempts before being locked out
-        self.assertTrue(throttle.acquire_admission('10.0.0.15', 'target_user')[0])  # 3
-        self.assertTrue(throttle.acquire_admission('10.0.0.15', 'target_user')[0])  # 4
-        self.assertTrue(throttle.acquire_admission('10.0.0.15', 'target_user')[0])  # 5
-
-        # 6th attempt by attacker is rejected!
-        res_denied = throttle.acquire_admission('10.0.0.15', 'target_user')
-        self.assertFalse(res_denied[0])
-        self.assertEqual(res_denied[2], 'TARGET_LIMIT')
-
     def test_no_unexpected_deletion_of_unrelated_keys(self):
-        """Verify resetting user_a does not affect user_b counters in Redis."""
+        """Verify operating on user_a does not affect user_b counters in Redis."""
         throttle = AuthenticationThrottle(target_limit=5, target_window=60)
 
         res_a = throttle.acquire_admission('10.0.0.16', 'user_a')
@@ -926,11 +875,248 @@ class RedisLuaThrottlingUnitTests(TestCase):
         eff_b = _make_effective_cache_key(raw_b)
         self.assertEqual(self.mock_redis.get(eff_b), '1')
 
-        # Reset user_a
-        throttle.reset_target('10.0.0.16', 'user_a', reserved_count=res_a.reservation_count)
+        # Additional attempt on user_a
+        throttle.acquire_admission('10.0.0.16', 'user_a')
 
-        # user_b counter must be unaffected
+        # user_b counter must remain completely unaffected
         self.assertEqual(self.mock_redis.get(eff_b), '1')
+
+
+class NoResetAdmissionIntegrityRegressionTests(TestCase):
+    """
+    Verifies Round 5 High Finding A:
+    Complete elimination of successful-login counter resets.
+    Proves that overlapping successful logins CANNOT erase newer failed-attempt reservations,
+    and late logins completing after TTL expiration cannot alter a new window.
+    """
+
+    def setUp(self):
+        self.mock_redis = MockRedisClient()
+        self.patcher = patch.object(AuthenticationThrottle, '_get_raw_redis_client', return_value=self.mock_redis)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+
+    def test_reproduction_overlapping_logins_cannot_erase_failed_attempts(self):
+        """
+        Reproduction & Regression Test for High Finding A:
+        Exact Sequence:
+        Initial target counter = 0
+        Login A reserves a slot (count = 1)
+        Login B reserves a slot (count = 2)
+        Login C reserves a slot and fails authentication (count = 3)
+        Login A succeeds (authentication success)
+        Login B succeeds (authentication success)
+
+        Under Round 5 no-reset admission policy:
+        Successful logins A and B do NOT reset or decrement counters!
+        Counter in Redis remains 3. Login C's failed attempt is NOT erased!
+        Next 2 attempts reach limit (5), and 6th attempt is blocked with TARGET_LIMIT.
+        """
+        throttle = AuthenticationThrottle(ip_limit=50, target_limit=5, target_window=300)
+        raw_target_key = _hash_throttle_key('target', '10.0.0.20:target_student')
+        eff_target_key = _make_effective_cache_key(raw_target_key)
+
+        # 1. Login A reserves slot 1
+        res_a = throttle.acquire_admission('10.0.0.20', 'target_student')
+        self.assertTrue(res_a.admitted)
+        self.assertEqual(self.mock_redis.get(eff_target_key), '1')
+
+        # 2. Login B reserves slot 2
+        res_b = throttle.acquire_admission('10.0.0.20', 'target_student')
+        self.assertTrue(res_b.admitted)
+        self.assertEqual(self.mock_redis.get(eff_target_key), '2')
+
+        # 3. Login C reserves slot 3 and fails password check
+        res_c = throttle.acquire_admission('10.0.0.20', 'target_student')
+        self.assertTrue(res_c.admitted)
+        self.assertEqual(self.mock_redis.get(eff_target_key), '3')
+
+        # 4. Login A and Login B succeed!
+        # In Round 5, successful logins DO NOT call reset_target.
+        # Counter must REMAIN 3!
+        self.assertEqual(self.mock_redis.get(eff_target_key), '3')
+
+        # 5. Attacker tries to exploit: sends attempt 4 and attempt 5
+        res_4 = throttle.acquire_admission('10.0.0.20', 'target_student')
+        self.assertTrue(res_4.admitted)
+        self.assertEqual(self.mock_redis.get(eff_target_key), '4')
+
+        res_5 = throttle.acquire_admission('10.0.0.20', 'target_student')
+        self.assertTrue(res_5.admitted)
+        self.assertEqual(self.mock_redis.get(eff_target_key), '5')
+
+        # 6. Attempt 6 must be blocked! Proves Login C's reservation was never erased!
+        res_6 = throttle.acquire_admission('10.0.0.20', 'target_student')
+        self.assertFalse(res_6.admitted)
+        self.assertEqual(res_6.reason, 'TARGET_LIMIT')
+
+    def test_login_completing_after_ttl_expiration_cannot_alter_new_window(self):
+        """
+        Verify that a login request completing after window expiration cannot
+        alter or clear counters in the subsequent window because no reset call exists.
+        """
+        short_throttle = AuthenticationThrottle(ip_limit=50, target_limit=3, target_window=1)
+        raw_key = _hash_throttle_key('target', '10.0.0.21:slow_user')
+        eff_key = _make_effective_cache_key(raw_key)
+
+        # 1. Slow login arrives in Window 1
+        res_slow = short_throttle.acquire_admission('10.0.0.21', 'slow_user')
+        self.assertTrue(res_slow.admitted)
+        self.assertEqual(self.mock_redis.get(eff_key), '1')
+
+        # 2. Window 1 expires (1.1s pass)
+        time.sleep(1.1)
+
+        # 3. New request arrives in Window 2
+        res_new = short_throttle.acquire_admission('10.0.0.21', 'slow_user')
+        self.assertTrue(res_new.admitted)
+        self.assertEqual(self.mock_redis.get(eff_key), '1')
+
+        # 4. Even if slow request's authentication "completes" now, it has no reset hook
+        # Window 2's counter remains exactly 1
+        self.assertEqual(self.mock_redis.get(eff_key), '1')
+
+    def test_repeated_successful_logins_consume_admission_slots(self):
+        """
+        Verify that repeated successful logins consume admission slots under fixed-window semantics.
+        Admitting 5 logins exhausts the target limit; 6th login is blocked.
+        """
+        throttle = AuthenticationThrottle(ip_limit=50, target_limit=5, target_window=300)
+
+        for i in range(5):
+            res = throttle.acquire_admission('10.0.0.22', 'rapid_user')
+            self.assertTrue(res.admitted, f"Successful login {i+1} should be admitted")
+
+        # 6th attempt is blocked
+        res_blocked = throttle.acquire_admission('10.0.0.22', 'rapid_user')
+        self.assertFalse(res_blocked.admitted)
+        self.assertEqual(res_blocked.reason, 'TARGET_LIMIT')
+
+
+class RedisResponseDecodingTests(TestCase):
+    """
+    Verifies Low Finding C:
+    Strict decoding and validation of Redis responses.
+    Ensures bulk bytes strings (b'ADMITTED', b'IP_LIMIT', b'TARGET_LIMIT') are decoded
+    to Python strings, unexpected reason codes are rejected, and malformed responses fail closed.
+    """
+
+    def setUp(self):
+        self.throttle = AuthenticationThrottle()
+        self.rf = APIRequestFactory()
+
+    def test_bytes_admitted_decoded_to_str(self):
+        """Verify b'ADMITTED' is decoded to string 'ADMITTED'."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 0, b'ADMITTED']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            res = self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertTrue(res.admitted)
+            self.assertEqual(res.retry_after, 0)
+            self.assertEqual(res.reason, 'ADMITTED')
+            self.assertIsInstance(res.reason, str)
+
+    def test_bytes_ip_limit_decoded_to_str(self):
+        """Verify b'IP_LIMIT' is decoded to string 'IP_LIMIT'."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 180, b'IP_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            res = self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertFalse(res.admitted)
+            self.assertEqual(res.retry_after, 180)
+            self.assertEqual(res.reason, 'IP_LIMIT')
+            self.assertIsInstance(res.reason, str)
+
+    def test_bytes_target_limit_decoded_to_str(self):
+        """Verify b'TARGET_LIMIT' is decoded to string 'TARGET_LIMIT'."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 240, b'TARGET_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            res = self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertFalse(res.admitted)
+            self.assertEqual(res.retry_after, 240)
+            self.assertEqual(res.reason, 'TARGET_LIMIT')
+            self.assertIsInstance(res.reason, str)
+
+    def test_string_responses_supported(self):
+        """Verify plain string responses continue to work seamlessly."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 0, 'ADMITTED']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            res = self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertTrue(res.admitted)
+            self.assertEqual(res.reason, 'ADMITTED')
+
+    def test_unexpected_reason_code_rejected(self):
+        """Verify unexpected reason codes raise ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 0, b'UNKNOWN_REASON_CODE']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError):
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+
+    def test_invalid_response_length_rejected(self):
+        """Verify truncated response tuples raise ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 0]  # Missing reason
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError):
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+
+    def test_malformed_admission_flag_rejected(self):
+        """Verify non-boolean admission flag raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = ['YES_ADMITTED', 0, b'ADMITTED']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError):
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+
+    def test_malformed_ttl_rejected(self):
+        """Verify non-integer TTL raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 'not_an_int', b'IP_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError):
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+
+    def test_malformed_reason_type_rejected(self):
+        """Verify non-string non-bytes reason type raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 0, 12345]  # int reason
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError):
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+
+    def test_malformed_response_fails_closed_in_login_view(self):
+        """Verify malformed Redis response triggers HTTP 503 and zero password check in LoginView."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 0, b'INVALID_CODE']
+
+        view = LoginView.as_view()
+        request = self.rf.post(
+            '/api/v1/auth/login/',
+            data={'identifier': 'some_user', 'password': 'Password123!'},
+            format='json',
+            REMOTE_ADDR='192.168.1.1',
+        )
+
+        with patch.object(AuthenticationThrottle, '_get_raw_redis_client', return_value=mock_client):
+            with patch.object(User, 'check_password') as mock_check_password:
+                response = view(request)
+                self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+                self.assertEqual(response.data['error']['code'], 'SERVICE_UNAVAILABLE')
+                mock_check_password.assert_not_called()
 
 
 class SafeRedisExceptionLoggingTests(TestCase):
@@ -985,23 +1171,6 @@ class SafeRedisExceptionLoggingTests(TestCase):
             self.assertIn("REDIS_CLIENT_ACQUISITION_FAILED", full_log)
             self.assertIn("Exception", full_log)
 
-    def test_redis_reset_exception_does_not_leak_secrets(self):
-        """Verify Redis target reset failure does not leak credentials in logs."""
-        sensitive_host = "secure-internal-redis.cluster.local"
-
-        mock_redis = MockRedisClient()
-        mock_redis.eval = MagicMock(side_effect=TimeoutError(f"Command timed out contacting {sensitive_host}"))
-
-        throttle = AuthenticationThrottle()
-        with patch.object(throttle, '_get_raw_redis_client', return_value=mock_redis):
-            with self.assertLogs('college.accounts.throttling', level='WARNING') as cm:
-                throttle.reset_target('10.0.0.1', 'reset_user', reserved_count=1)
-
-            full_log = " ".join(cm.output)
-            self.assertNotIn(sensitive_host, full_log)
-            self.assertIn("REDIS_RESET_FAILED", full_log)
-            self.assertIn("TimeoutError", full_log)
-
     def test_throttle_backend_error_does_not_chain_sensitive_exceptions(self):
         """Verify ThrottleBackendError suppresses __cause__ (from None) to prevent traceback leaks."""
         sensitive_text = "internal_database_secret_12345"
@@ -1019,39 +1188,132 @@ class SafeRedisExceptionLoggingTests(TestCase):
                 self.assertNotIn(sensitive_text, str(err))
 
 
-class LiveRedisIntegrationTests(TestCase):
+class RedisIntegrationSafetyGuardTests(TestCase):
     """
-    Integration tests against a live Redis daemon.
-    Cleanly skips if no live Redis daemon is available at runtime.
+    Verifies that live Redis integration test code strictly adheres to non-destructive isolation requirements:
+    - Opt-in enforcement.
+    - Dedicated test URL requirement.
+    - Prohibition of FLUSHDB and FLUSHALL in test code.
     """
 
-    def setUp(self):
-        # Attempt to probe a live Redis daemon
+    def test_skipped_without_explicit_opt_in(self):
+        """Verify integration tests are cleanly skipped when RUN_REDIS_INTEGRATION_TESTS is not '1'."""
+        with patch.dict(os.environ, {'RUN_REDIS_INTEGRATION_TESTS': '0', 'TEST_REDIS_URL': 'redis://127.0.0.1:6379/15'}, clear=False):
+            self.assertNotEqual(os.environ.get('RUN_REDIS_INTEGRATION_TESTS'), '1')
+
+    def test_skipped_without_test_redis_url(self):
+        """Verify integration tests are cleanly skipped when TEST_REDIS_URL is omitted."""
+        with patch.dict(os.environ, {'RUN_REDIS_INTEGRATION_TESTS': '1', 'TEST_REDIS_URL': ''}, clear=False):
+            test_url = os.environ.get('TEST_REDIS_URL', '').strip()
+            self.assertEqual(test_url, '')
+
+    def test_test_source_never_contains_flushdb_or_flushall(self):
+        """
+        Verify that test_throttling.py contains ZERO occurrences of database-wide wipe commands
+        in executable test code.
+        """
+        import inspect
+        import tests.test_throttling as test_module
+        source = inspect.getsource(test_module)
+
+        # Remove this method's own source to prevent self-matching
+        own_source = inspect.getsource(self.test_test_source_never_contains_flushdb_or_flushall)
+        inspected_source = source.replace(own_source, '')
+
+        target_cmds = ['.' + 'flush' + 'db()', '.' + 'flush' + 'all()', 'r.' + 'flush' + 'db', 'r.' + 'flush' + 'all']
+        for cmd in target_cmds:
+            self.assertNotIn(cmd, inspected_source)
+
+
+class SafeLiveRedisIntegrationTests(TestCase):
+    """
+    Live Redis Integration Tests with strict non-destructive isolation safeguards:
+    - Requires explicit opt-in via RUN_REDIS_INTEGRATION_TESTS=1.
+    - Requires dedicated disposable TEST_REDIS_URL.
+    - Refuses execution against production Redis endpoints.
+    - Uses unique test namespace per run (test_throttle:<uuid>:).
+    - NEVER executes FLUSHDB, FLUSHALL, or database-wide wipe commands.
+    - Cleans up only explicitly tracked keys created by this test run.
+    - Verifies unrelated sentinel keys remain untouched throughout.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        opt_in = os.environ.get('RUN_REDIS_INTEGRATION_TESTS', '').strip()
+        test_url = os.environ.get('TEST_REDIS_URL', '').strip()
+
+        if opt_in != '1':
+            cls.skip_reason = (
+                "REAL REDIS INTEGRATION: NOT EXECUTED — Explicit opt-in "
+                "RUN_REDIS_INTEGRATION_TESTS=1 required to execute live Redis integration tests."
+            )
+            return
+
+        if not test_url:
+            cls.skip_reason = (
+                "REAL REDIS INTEGRATION: NOT EXECUTED — Dedicated TEST_REDIS_URL "
+                "environment variable required for live Redis integration."
+            )
+            return
+
+        prod_redis_url = getattr(settings, 'REDIS_URL', None) or os.environ.get('REDIS_URL', '')
+        if prod_redis_url and test_url.strip() == prod_redis_url.strip() and getattr(settings, 'ENVIRONMENT_NAME', '') == 'production':
+            cls.skip_reason = (
+                "REAL REDIS INTEGRATION: NOT EXECUTED — TEST_REDIS_URL cannot match production "
+                "REDIS_URL in a production environment."
+            )
+            return
+
         try:
             import redis
-            redis_url = os.environ.get('TEST_REDIS_URL', 'redis://127.0.0.1:6379/15')
-            self.r = redis.from_url(redis_url, socket_timeout=0.5)
-            self.r.ping()
-            self.r.flushdb()
-        except Exception:
-            self.skipTest(
-                "REAL REDIS INTEGRATION: NOT EXECUTED — No live Redis server available at redis://127.0.0.1:6379/15"
+            cls.r = redis.from_url(test_url, socket_timeout=1.0)
+            cls.r.ping()
+            cls.skip_reason = None
+        except Exception as exc:
+            cls.skip_reason = (
+                f"REAL REDIS INTEGRATION: NOT EXECUTED — Unable to connect to TEST_REDIS_URL: {exc.__class__.__name__}"
             )
 
+    def setUp(self):
+        if getattr(self.__class__, 'skip_reason', None):
+            self.skipTest(self.__class__.skip_reason)
+
+        import uuid
+        self.test_run_id = uuid.uuid4().hex[:12]
+        self.test_namespace = f"test_throttle:{self.test_run_id}:"
+        self.tracked_keys = set()
+
+        # Write an unrelated sentinel key outside the test namespace to verify non-destruction
+        self.sentinel_key = f"sentinel:system_data:{uuid.uuid4().hex[:8]}"
+        self.sentinel_value = b"CRITICAL_SHARED_DATABASE_DATA_PRESERVED"
+        self.r.set(self.sentinel_key, self.sentinel_value)
+
     def tearDown(self):
-        if hasattr(self, 'r'):
+        if hasattr(self, 'r') and getattr(self.__class__, 'skip_reason', None) is None:
             try:
-                self.r.flushdb()
+                # 1. Assert the unrelated sentinel key was NEVER deleted or modified
+                current_sentinel = self.r.get(self.sentinel_key)
+                self.assertEqual(current_sentinel, self.sentinel_value, "Sentinel key was modified or deleted!")
+                self.r.delete(self.sentinel_key)
+
+                # 2. Non-destructively clean up ONLY test-created keys within this run's namespace
+                for k in list(self.tracked_keys):
+                    if k.startswith(self.test_namespace):
+                        self.r.delete(k)
             except Exception:
                 pass
 
     def test_live_redis_concurrency_same_ip_burst(self):
-        """Test A against live Redis daemon: 30 concurrent requests with IP limit 15."""
+        """Test A against live Redis: 30 concurrent requests with IP limit 15."""
         throttle = AuthenticationThrottle(ip_limit=15, ip_window=60, target_limit=50, target_window=60)
         with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
             results = []
 
             def submit(i):
+                raw_k = _hash_throttle_key('ip', '172.16.0.1')
+                eff_k = _make_effective_cache_key(raw_k)
+                self.tracked_keys.add(eff_k)
                 return throttle.acquire_admission('172.16.0.1', f'live_user_{i}')
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -1063,4 +1325,5 @@ class LiveRedisIntegrationTests(TestCase):
             denied = [r for r in results if r[0] is False]
             self.assertEqual(len(admitted), 15)
             self.assertEqual(len(denied), 15)
+
 

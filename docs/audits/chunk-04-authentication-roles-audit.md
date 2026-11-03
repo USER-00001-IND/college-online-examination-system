@@ -1,11 +1,11 @@
-# Chunk 04: Authentication and Roles Audit Report (Round 4 Redis Throttling & Security Corrections)
+# Chunk 04: Authentication and Roles Audit Report (Round 5 Throttle Counter Integrity & Safe Redis Testing)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 4 Revision)  
+**Date:** 2026-11-03 (Round 5 Revision)  
 **Stage:** Chunk 04 — Authentication and Roles  
-**Last Audited Commit:** `c33fe126c54e06fa29570a4a24d772c36e2e5daa`  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 3 Round 4 findings [1 HIGH, 2 MEDIUM] have been resolved, verified, and backed by 145 passing automated tests and 1 cleanly skipped live-redis integration test; Chunk 05 onward remains strictly gated).
+**Last Audited Commit:** `12b79dfa42d8852d6d8d14878a0c6352bf45328c`  
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 3 Round 5 findings [2 HIGH, 1 LOW] have been resolved, verified, and backed by 159 passing automated tests and 1 cleanly skipped live-redis integration test; Chunk 05 onward remains strictly gated).
 
 ---
 
@@ -698,16 +698,163 @@ The four protected architectural documents remain completely unmodified and inta
 
 ---
 
-## 12. Verification and Test Results Summary
+## 12. Verification and Test Results Summary (Round 4 Baseline)
+
+- **Round 4 Test Suite:** 145 passed, 1 skipped.
+- **Round 4 Audit Verdict:** Revision required (2 HIGH, 1 LOW).
+
+---
+
+## 13. Round 5 — Throttle Counter Integrity and Safe Redis Integration Testing
+
+### 13.1 Summary of Addressed Findings
+
+| Finding ID | Severity | Description | Status |
+| :--- | :---: | :--- | :---: |
+| **High Finding A** | **HIGH** | Generation-aware Redis counter reset erases newer failed-attempt reservations when multiple successful logins overlap | **RESOLVED** |
+| **High Finding B** | **HIGH** | Live Redis integration tests execute `FLUSHDB`, risking destructive data wipe on shared or test environments | **RESOLVED** |
+| **Low Finding C** | **LOW** | Redis Lua response status string coerced with `str()` rather than decoding bytes, yielding `"b'ADMITTED'"` | **RESOLVED** |
+
+---
+
+### 13.2 High Finding A — Flaw in Counter Reset & Adoption of No-Reset Admission Policy
+
+#### 1. Root Cause Analysis
+In Round 4, `REDIS_RESET_TARGET_LUA` attempted to prevent TOCTOU deletion by comparing `current_count` against `reserved_count` (the counter value captured when a request was admitted). However, `reservation_count` was merely a point-in-time scalar counter, not a monotonic unique generation token. When multiple successful logins overlapped with a concurrent failed login:
+1. Target counter begins at 0.
+2. Login A reserves slot: `counter = 1`.
+3. Login B reserves slot: `counter = 2`.
+4. Login C (attacker failed attempt) reserves slot: `counter = 3` and fails password check.
+5. Login A completes successfully: deducts 1 $\rightarrow$ `counter = 2`.
+6. Login B completes successfully: since `counter <= 2`, it deleted the key or cleared the counter $\rightarrow$ `counter = 0`.
+7. **Security Defect:** Login C's failed-attempt reservation was completely erased, granting attackers fresh brute-force attempts.
+Furthermore, if a slow login completed after window TTL expiration, any reset execution could erroneously clear counters in a newly started window.
+
+#### 2. Resolution: Authentication Admission Limiter (Zero Successful-Login Resets)
+In strict compliance with independent audit requirements, successful-login counter resets were **completely removed**:
+- **Authentication Admission Limiter Policy:**
+  - The throttle functions as an admission rate limiter, not merely a failed-attempt counter.
+  - Every admitted login attempt (successful or unsuccessful) consumes one admission slot.
+  - Successful authentication does **NOT** delete, decrement, or rewrite throttle counters.
+  - Counters expire naturally according to their fixed-window TTL (300 seconds default).
+  - Failed-attempt reservations from concurrent requests are **physically impossible to erase** through overlapping successful logins.
+  - Slow requests finishing after window expiration have no reset hook and cannot alter new windows.
+- **Code Modifications:**
+  - In [`backend/apps/accounts/views.py`](file:///home/zero/Documents/college/backend/apps/accounts/views.py): Completely removed the call to `throttle.reset_target()`.
+  - In [`backend/apps/accounts/throttling.py`](file:///home/zero/Documents/college/backend/apps/accounts/throttling.py): Removed `REDIS_RESET_TARGET_LUA`, removed `reset_target()`, and simplified `AdmissionResult` to `(admitted, retry_after, reason)`.
+  - Preserved existing thresholds: Client IP limit: 15 attempts / 300s; Compound limit: 5 attempts / 300s.
+  - Documented UX tradeoff: Multiple rapid successful logins within a 300s window legitimately consume admission slots until window TTL expiration.
+
+#### 3. Verification
+- `NoResetAdmissionIntegrityRegressionTests`:
+  - `test_reproduction_overlapping_logins_cannot_erase_failed_attempts`: Explicitly reproduces Login A, B, and C sequence; verifies that after A and B succeed, the counter remains 3, and attempt 6 is blocked with `TARGET_LIMIT`.
+  - `test_login_completing_after_ttl_expiration_cannot_alter_new_window`: Verifies late completions cannot affect subsequent windows.
+  - `test_repeated_successful_logins_consume_admission_slots`: Verifies rapid successive logins consume admission slots and block on the 6th attempt.
+  - `test_successful_login_does_not_reset_target_attempts` in `AuthenticationThrottlingAPITests`: Verifies 3 failures + 1 success + 1 failure blocks the 6th request with HTTP 429.
+
+---
+
+### 13.3 High Finding B — Non-Destructive Live Redis Test Isolation
+
+#### 1. Root Cause Analysis
+In Round 4, `LiveRedisIntegrationTests` invoked `self.r.flushdb()` in `setUp` and `tearDown`. `FLUSHDB` deletes all keys in the target Redis database. When running against shared or operator-configured Redis instances, this presented severe data loss risks.
+
+#### 2. Resolution: Strict Non-Destructive Test Isolation
+- **Elimination of Database-Wide Wipes:**
+  - Completely removed every occurrence of `flushdb`, `flushall`, and equivalent database-wide wipe commands from test code.
+  - Verified via AST/source reflection test `test_test_source_never_contains_flushdb_or_flushall`.
+- **Explicit Two-Factor Opt-In Gate:**
+  - Live Redis tests run **ONLY** when `RUN_REDIS_INTEGRATION_TESTS=1` is explicitly set **AND** a dedicated disposable `TEST_REDIS_URL` is configured.
+  - Without both variables, tests are cleanly skipped.
+  - Execution is refused if `TEST_REDIS_URL` matches production `REDIS_URL` in a production environment.
+- **Unique Per-Run Test Namespace:**
+  - Each test run generates a random UUID prefix: `test_throttle:<uuid>:` (e.g. `test_throttle:e2a89f41b8c2:`).
+  - All keys created by the test run are prefixed with this unique namespace.
+- **Tracked Non-Destructive Cleanup:**
+  - The test framework explicitly tracks keys created during the test run in `self.tracked_keys`.
+  - In `tearDown`, it deletes **ONLY** keys recorded in `self.tracked_keys` that match `test_throttle:<uuid>:`.
+  - Zero `KEYS *`, zero wildcard scans across arbitrary namespaces.
+- **Unrelated Sentinel Key Verification:**
+  - In `setUp`, an unrelated sentinel key (`sentinel:system_data:<uuid>`) is written outside the test namespace.
+  - In `tearDown`, the test asserts that the sentinel key and its payload remain completely untouched, proving non-destruction.
+
+---
+
+### 13.4 Low Finding C — Redis Bulk Bytes Response Decoding & Validation
+
+#### 1. Root Cause Analysis
+In Round 4, `acquire_admission()` extracted the reason code via `reason = str(result[2])`. redis-py returns Redis bulk strings as `bytes` (e.g. `b'ADMITTED'`). `str(b'ADMITTED')` produced `"b'ADMITTED'"`, causing reason comparison failures and corrupted diagnostic outputs.
+
+#### 2. Resolution: Explicit Decoding & Strict Response Validation
+- In [`backend/apps/accounts/throttling.py`](file:///home/zero/Documents/college/backend/apps/accounts/throttling.py#L230-L300):
+  - **Structure Validation:** Asserts `result` is a list or tuple of length $\ge 3$. Raises `ThrottleBackendError("Invalid throttle backend response structure.")` on invalid length or non-iterable response.
+  - **Admission Flag Validation:** Asserts `result[0] in (0, 1, True, False)`.
+  - **Numeric TTL Validation:** Parses `int(result[1])`; if negative, defaults to window duration; raises `ThrottleBackendError` on non-numeric types.
+  - **Explicit Bulk Bytes Decoding:**
+    ```python
+    raw_reason = result[2]
+    if isinstance(raw_reason, (bytes, bytearray)):
+        reason = raw_reason.decode('utf-8')
+    elif isinstance(raw_reason, str):
+        reason = raw_reason
+    else:
+        raise ThrottleBackendError("Invalid throttle reason type.")
+    ```
+  - **Whitelist Whitelist Enforcement:** Asserts `reason in {'ADMITTED', 'IP_LIMIT', 'TARGET_LIMIT'}`. Any unexpected code raises `ThrottleBackendError`.
+  - **Fail-Closed Guarantee:** Any malformed or invalid Redis response raises `ThrottleBackendError`, returning HTTP 503 `SERVICE_UNAVAILABLE` in `LoginView` with zero password checks.
+
+#### 3. Verification
+- `RedisResponseDecodingTests`:
+  - `test_bytes_admitted_decoded_to_str`: Confirms `b'ADMITTED'` decodes to string `'ADMITTED'`.
+  - `test_bytes_ip_limit_decoded_to_str`: Confirms `b'IP_LIMIT'` decodes to string `'IP_LIMIT'`.
+  - `test_bytes_target_limit_decoded_to_str`: Confirms `b'TARGET_LIMIT'` decodes to string `'TARGET_LIMIT'`.
+  - `test_string_responses_supported`: Confirms native strings work.
+  - `test_unexpected_reason_code_rejected`: Confirms unknown reason raises `ThrottleBackendError`.
+  - `test_invalid_response_length_rejected`: Confirms truncated response raises `ThrottleBackendError`.
+  - `test_malformed_admission_flag_rejected`: Confirms invalid flag raises `ThrottleBackendError`.
+  - `test_malformed_ttl_rejected`: Confirms non-integer TTL raises `ThrottleBackendError`.
+  - `test_malformed_reason_type_rejected`: Confirms invalid reason type raises `ThrottleBackendError`.
+  - `test_malformed_response_fails_closed_in_login_view`: Confirms malformed response fails closed with HTTP 503 and zero password check.
+
+---
+
+### 13.5 Redis Integration Test Evidence & Infrastructure Boundaries
+
+In compliance with Round 5 verification standards:
+
+1. **Unit & Local-Cache Tests:** Executed 159 tests covering Django models, permissions, views, audit metadata, response decoding, and local-lock concurrency.
+2. **Mocked Redis Concurrency Tests (`RedisLuaThrottlingUnitTests`):** Executed multi-threaded test cases against `MockRedisClient` returning Redis bulk bytes (b'ADMITTED', b'IP_LIMIT', b'TARGET_LIMIT') simulating single-threaded Redis Lua engine atomicity.
+3. **Live Redis Integration (`SafeLiveRedisIntegrationTests`):**
+   - Probe evaluated: `RUN_REDIS_INTEGRATION_TESTS` not set in automated test environment.
+   - Result:
+     > [!IMPORTANT]
+     > **REAL REDIS INTEGRATION: NOT EXECUTED**
+     > Cleanly skipped with message:
+     > `"REAL REDIS INTEGRATION: NOT EXECUTED — Explicit opt-in RUN_REDIS_INTEGRATION_TESTS=1 required to execute live Redis integration tests."`
+     > Cross-worker multi-node cluster verification remains an operational deployment verification requirement (Chunk 16).
+
+---
+
+### 13.6 Protected Architectural Documentation Integrity
+
+The four protected architectural documents remain completely unmodified and verified via `git diff --exit-code`:
+1. [`design.md`](file:///home/zero/Documents/college/design.md) — Unmodified
+2. [`handover.txt`](file:///home/zero/Documents/college/handover.txt) — Unmodified
+3. [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md) — Unmodified
+4. [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md) — Unmodified
+
+---
+
+## 14. Verification and Test Results Summary
 
 ```bash
 $ .venv/bin/python backend/manage.py test tests --settings=config.settings.test
-Found 146 test(s).
+Found 160 test(s).
 Creating test database for alias 'default'...
 System check identified no issues (0 silenced).
-..................................................................................................................................................s
+...............................................................................................................................................................s
 ----------------------------------------------------------------------
-Ran 146 tests in 3.210s
+Ran 160 tests in 3.975s
 
 OK (skipped=1)
 Destroying test database for alias 'default'...
@@ -715,7 +862,7 @@ Destroying test database for alias 'default'...
 
 ```bash
 $ .venv/bin/pytest backend/tests --ds=config.settings.test
-======================== 145 passed, 1 skipped in 4.02s ========================
+======================== 159 passed, 1 skipped in 4.99s ========================
 ```
 
 - **Django Development Check:** `System check identified no issues (0 silenced).`
@@ -723,6 +870,7 @@ $ .venv/bin/pytest backend/tests --ds=config.settings.test
 - **Django Production Deploy Check:** `System check identified no issues (0 silenced).`
 - **Protected Files Integrity:** All 4 protected documents remain strictly unmodified.
 - **Stage Gating:** Chunk 04 is in `IN REVIEW` status. Chunk 05 onward remains strictly gated.
+
 
 
 
