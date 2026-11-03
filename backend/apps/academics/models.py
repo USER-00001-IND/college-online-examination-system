@@ -407,6 +407,14 @@ class PaperOffering(models.Model):
             if cat_college_id != session_college_id:
                 errors["subject_category"] = "Subject category does not belong to the same college as the academic session."
 
+        # Common-paper invariant: cannot set is_common_paper=False while programme mappings exist
+        if self.pk and not self.is_common_paper:
+            if self.programme_mappings.exists():
+                errors["is_common_paper"] = (
+                    "Cannot set is_common_paper to False while programme mappings exist. "
+                    "Remove all programme mappings first."
+                )
+
         if errors:
             raise ValidationError(errors)
 
@@ -531,8 +539,8 @@ class InstitutionalConfig(models.Model):
             elif self.data_type == ConfigDataType.JSON:
                 try:
                     json.loads(self.config_value)
-                except Exception as e:
-                    raise ValidationError({"config_value": f"Value must be valid JSON: {e}"})
+                except (json.JSONDecodeError, ValueError):
+                    raise ValidationError({"config_value": "Value must be valid JSON."})
 
     def get_parsed_value(self):
         """Returns the Python-typed representation of config_value."""

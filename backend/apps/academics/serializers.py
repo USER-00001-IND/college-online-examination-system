@@ -5,6 +5,8 @@ Provides serialization, complete-state validation, and relational integrity chec
 
 from decimal import Decimal
 import json
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from rest_framework import exceptions, serializers
 
 from apps.academics.models import (
@@ -316,6 +318,17 @@ class PaperOfferingSerializer(serializers.ModelSerializer):
         if errors:
             raise serializers.ValidationError(errors)
 
+        # Common-paper invariant: cannot set is_common_paper to False while programme mappings exist
+        if self.instance and self.instance.pk:
+            new_is_common = attrs.get("is_common_paper", self.instance.is_common_paper)
+            if not new_is_common and self.instance.programme_mappings.exists():
+                raise serializers.ValidationError({
+                    "is_common_paper": (
+                        "Cannot set is_common_paper to False while programme mappings exist. "
+                        "Remove all programme mappings first."
+                    )
+                })
+
         try:
             validate_paper_offering_relationships(
                 academic_session=session,
@@ -327,10 +340,10 @@ class PaperOfferingSerializer(serializers.ModelSerializer):
                 max_marks_external=ext_marks,
                 pass_marks_external=pass_marks,
             )
-        except Exception as exc:
+        except DjangoValidationError as exc:
             if hasattr(exc, "message_dict"):
                 raise serializers.ValidationError(exc.message_dict)
-            raise serializers.ValidationError(str(exc))
+            raise serializers.ValidationError(exc.messages if hasattr(exc, "messages") else [str(exc)])
 
         return attrs
 
@@ -367,28 +380,36 @@ class PaperProgrammeMappingSerializer(serializers.ModelSerializer):
 
         try:
             validate_paper_programme_mapping(paper, prog)
-        except Exception as exc:
+        except DjangoValidationError as exc:
             if hasattr(exc, "message_dict"):
                 raise serializers.ValidationError(exc.message_dict)
-            raise serializers.ValidationError(str(exc))
+            raise serializers.ValidationError(exc.messages if hasattr(exc, "messages") else [str(exc)])
 
         return attrs
 
     def create(self, validated_data):
-        mapping = super().create(validated_data)
-        paper = mapping.paper_offering
-        if not paper.is_common_paper:
-            paper.is_common_paper = True
-            paper.save(update_fields=["is_common_paper"])
-        return mapping
+        with transaction.atomic():
+            paper = PaperOffering.objects.select_for_update().get(pk=validated_data["paper_offering"].pk)
+            mapping = super().create(validated_data)
+            if not paper.is_common_paper:
+                paper.is_common_paper = True
+                paper.save(update_fields=["is_common_paper"])
+            return mapping
 
     def update(self, instance, validated_data):
-        mapping = super().update(instance, validated_data)
-        paper = mapping.paper_offering
-        if not paper.is_common_paper:
-            paper.is_common_paper = True
-            paper.save(update_fields=["is_common_paper"])
-        return mapping
+        with transaction.atomic():
+            target_paper_offering = validated_data.get("paper_offering", instance.paper_offering)
+            pks = sorted({instance.paper_offering_id, target_paper_offering.pk})
+            locked_offerings = {
+                po.pk: po
+                for po in PaperOffering.objects.select_for_update().filter(pk__in=pks)
+            }
+            mapping = super().update(instance, validated_data)
+            paper = locked_offerings[target_paper_offering.pk]
+            if not paper.is_common_paper:
+                paper.is_common_paper = True
+                paper.save(update_fields=["is_common_paper"])
+            return mapping
 
 
 class InstitutionalConfigSerializer(serializers.ModelSerializer):
@@ -487,8 +508,8 @@ class InstitutionalConfigSerializer(serializers.ModelSerializer):
             elif d_type == ConfigDataType.JSON:
                 try:
                     json.loads(val)
-                except Exception as e:
-                    raise serializers.ValidationError({"config_value": f"Value must be valid JSON: {e}"})
+                except (json.JSONDecodeError, ValueError):
+                    raise serializers.ValidationError({"config_value": "Value must be valid JSON."})
 
         return attrs
 

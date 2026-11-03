@@ -11,6 +11,8 @@ Covers:
 import json
 from decimal import Decimal
 from datetime import date, timedelta
+from unittest.mock import patch
+from django.contrib.auth.models import AnonymousUser
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, models, transaction
 from django.test import TestCase
@@ -502,6 +504,12 @@ class AcademicServicesTests(TestCase):
         self.college = College.objects.create(
             name="Model College", code="MC-GU", contact_email="admin@mc.edu"
         )
+        self.superadmin = User.objects.create_superuser(
+            username="super_service",
+            email="super_service@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.SUPERADMIN,
+        )
         self.session1 = AcademicSession.objects.create(
             college=self.college, name="2025-2026", start_date=date(2025, 7, 1), end_date=date(2026, 6, 30), is_current=True
         )
@@ -578,9 +586,11 @@ class AcademicServicesTests(TestCase):
             data_type=ConfigDataType.JSON,
             is_sensitive=True,
             description="Official GU 10-point scale",
+            user=self.superadmin,
         )
         self.assertEqual(cfg.config_key, "OFFICIAL_GRADING_SCALE")
         self.assertTrue(cfg.is_sensitive)
+        self.assertEqual(cfg.updated_by, self.superadmin)
 
 
 class AcademicAuthorizationTests(TestCase):
@@ -1115,7 +1125,6 @@ class SensitiveInstitutionalConfigAuthorizationRegressionTests(TestCase):
                 config_value="secret",
                 is_sensitive=True,
                 user=self.admin,
-                enforce_authorization=True,
             )
 
 
@@ -1440,3 +1449,450 @@ class MapProgrammesReplaceBooleanAndExceptionSafetyRegressionTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         # Original mapping MUST still exist
         self.assertTrue(PaperProgrammeMapping.objects.filter(pk=self.mapping1.id).exists())
+
+
+class MandatoryInstitutionalConfigServiceAuthorizationRegressionTests(TestCase):
+    """
+    Round 3 Regression Tests for Finding A:
+    Enforces mandatory user argument and RBAC authorization in set_institutional_config().
+    """
+
+    def setUp(self):
+        self.college = College.objects.create(
+            name="Model College", code="MC-GU", contact_email="admin@mc.edu"
+        )
+        self.superadmin = User.objects.create_superuser(
+            username="super_user",
+            email="super@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.SUPERADMIN,
+        )
+        self.admin = User.objects.create_user(
+            username="admin_user",
+            email="admin@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.ADMIN,
+        )
+        self.faculty = User.objects.create_user(
+            username="faculty_user",
+            email="faculty@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.FACULTY,
+        )
+        self.student = User.objects.create_user(
+            username="student_user",
+            email="student@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.STUDENT,
+        )
+
+    def test_admin_creates_nonsensitive_config_allowed(self):
+        cfg = set_institutional_config(
+            college=self.college,
+            config_key="PORTAL_NAME",
+            config_value="GU Portal",
+            is_sensitive=False,
+            user=self.admin,
+        )
+        self.assertEqual(cfg.config_key, "PORTAL_NAME")
+        self.assertFalse(cfg.is_sensitive)
+        self.assertEqual(cfg.updated_by, self.admin)
+
+    def test_admin_creates_sensitive_config_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="API_SECRET",
+                config_value="secret123",
+                is_sensitive=True,
+                user=self.admin,
+            )
+
+    def test_superadmin_creates_sensitive_config_allowed(self):
+        cfg = set_institutional_config(
+            college=self.college,
+            config_key="API_SECRET",
+            config_value="secret123",
+            is_sensitive=True,
+            user=self.superadmin,
+        )
+        self.assertEqual(cfg.config_key, "API_SECRET")
+        self.assertTrue(cfg.is_sensitive)
+        self.assertEqual(cfg.updated_by, self.superadmin)
+
+    def test_admin_updates_nonsensitive_config_allowed(self):
+        cfg = set_institutional_config(
+            college=self.college,
+            config_key="MAX_STUDENTS",
+            config_value="100",
+            data_type=ConfigDataType.INTEGER,
+            is_sensitive=False,
+            user=self.admin,
+        )
+        updated = set_institutional_config(
+            college=self.college,
+            config_key="MAX_STUDENTS",
+            config_value="200",
+            data_type=ConfigDataType.INTEGER,
+            is_sensitive=False,
+            user=self.admin,
+        )
+        self.assertEqual(updated.config_value, "200")
+        self.assertEqual(updated.updated_by, self.admin)
+
+    def test_admin_updates_sensitive_config_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        set_institutional_config(
+            college=self.college,
+            config_key="PAYMENT_GATEWAY_KEY",
+            config_value="pg_secret",
+            is_sensitive=True,
+            user=self.superadmin,
+        )
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="PAYMENT_GATEWAY_KEY",
+                config_value="new_secret",
+                is_sensitive=True,
+                user=self.admin,
+            )
+
+    def test_admin_cannot_promote_nonsensitive_to_sensitive(self):
+        from rest_framework.exceptions import PermissionDenied
+        set_institutional_config(
+            college=self.college,
+            config_key="NOTICE_BOARD",
+            config_value="Open to all",
+            is_sensitive=False,
+            user=self.admin,
+        )
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="NOTICE_BOARD",
+                config_value="Now confidential",
+                is_sensitive=True,
+                user=self.admin,
+            )
+
+    def test_admin_cannot_demote_sensitive_to_nonsensitive(self):
+        from rest_framework.exceptions import PermissionDenied
+        set_institutional_config(
+            college=self.college,
+            config_key="VAULT_PASSCODE",
+            config_value="vault999",
+            is_sensitive=True,
+            user=self.superadmin,
+        )
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="VAULT_PASSCODE",
+                config_value="plaintext",
+                is_sensitive=False,
+                user=self.admin,
+            )
+
+    def test_student_invoking_service_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="STUDENT_KEY",
+                config_value="val",
+                user=self.student,
+            )
+
+    def test_faculty_invoking_service_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="FACULTY_KEY",
+                config_value="val",
+                user=self.faculty,
+            )
+
+    def test_student_with_is_staff_true_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        self.student.is_staff = True
+        self.student.save()
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="ATTEMPT_BYPASS",
+                config_value="val",
+                user=self.student,
+            )
+
+    def test_faculty_with_is_staff_true_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        self.faculty.is_staff = True
+        self.faculty.save()
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="ATTEMPT_BYPASS",
+                config_value="val",
+                user=self.faculty,
+            )
+
+    def test_anonymous_or_none_user_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="ANON_KEY",
+                config_value="val",
+                user=None,
+            )
+        anon = AnonymousUser()
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="ANON_KEY",
+                config_value="val",
+                user=anon,
+            )
+
+    def test_inactive_user_denied(self):
+        from rest_framework.exceptions import PermissionDenied
+        self.admin.is_active = False
+        self.admin.save()
+        with self.assertRaises(PermissionDenied):
+            set_institutional_config(
+                college=self.college,
+                config_key="INACTIVE_KEY",
+                config_value="val",
+                user=self.admin,
+            )
+
+    def test_missing_user_kwarg_raises_typeerror(self):
+        with self.assertRaises(TypeError):
+            # user argument omitted
+            set_institutional_config(
+                self.college,
+                "OMITTED_USER_KEY",
+                "val",
+            )
+
+    def test_enforce_authorization_param_rejected(self):
+        with self.assertRaises(TypeError):
+            # enforce_authorization was removed from service signature
+            set_institutional_config(
+                college=self.college,
+                config_key="PARAM_KEY",
+                config_value="val",
+                user=self.admin,
+                enforce_authorization=False,
+            )
+
+
+class CommonPaperInvariantAndRowLockingRegressionTests(TestCase):
+    """
+    Round 3 Regression Tests for Finding B:
+    Ensures that if paper offering has one or more programme mappings, is_common_paper MUST be True.
+    Setting is_common_paper to False while mappings exist is rejected across API and model layers.
+    Also verifies row-locking and atomic operations.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_superuser(
+            username="admin_common",
+            email="admin_common@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.SUPERADMIN,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        self.college = College.objects.create(name="Model College", code="MC-GU", contact_email="admin@mc.edu")
+        self.session = AcademicSession.objects.create(
+            college=self.college, name="2025-2026", start_date=date(2025, 7, 1), end_date=date(2026, 6, 30), is_current=True
+        )
+        self.prog1 = Programme.objects.create(college=self.college, name="BA", code="BA", duration_semesters=8)
+        self.prog2 = Programme.objects.create(college=self.college, name="BSc", code="BSC", duration_semesters=8)
+        self.sem1 = Semester.objects.create(programme=self.prog1, semester_number=1, name="Sem 1")
+        self.dept = Department.objects.create(college=self.college, name="Philosophy", code="PHIL")
+        self.subject = Subject.objects.create(department=self.dept, name="Ethics", code="ETH101")
+        self.category = SubjectCategory.objects.create(college=self.college, code="VAC", name="Value Added Course")
+
+        self.offering = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=self.sem1,
+            subject=self.subject,
+            subject_category=self.category,
+            paper_code="VAC101",
+            title="Ethics in Public Life",
+            credits=Decimal("2.0"),
+            is_common_paper=False,
+        )
+
+    def test_unmapped_paper_can_have_is_common_paper_false(self):
+        self.assertFalse(self.offering.is_common_paper)
+        self.offering.full_clean()  # Should not raise
+
+        url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+        res = self.client.patch(url, {"title": "Updated Title", "is_common_paper": False})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.is_common_paper)
+
+    def test_service_mapping_sets_is_common_paper_true(self):
+        self.assertFalse(self.offering.is_common_paper)
+        map_paper_to_programmes(self.offering, [self.prog1, self.prog2])
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+        self.assertEqual(self.offering.programme_mappings.count(), 2)
+
+    def test_direct_mapping_post_sets_is_common_paper_true(self):
+        self.assertFalse(self.offering.is_common_paper)
+        url = reverse("academics:paper-mapping-list")
+        res = self.client.post(url, {
+            "paper_offering": self.offering.id,
+            "programme": self.prog1.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+
+    def test_direct_mapping_patch_maintains_is_common_paper_true(self):
+        mapping = PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=self.prog1)
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        url = reverse("academics:paper-mapping-detail", kwargs={"pk": mapping.id})
+        res = self.client.patch(url, {"programme": self.prog2.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+
+    def test_mapped_paper_cannot_be_set_to_non_common_via_api(self):
+        PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=self.prog1)
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+        res = self.client.patch(url, {"is_common_paper": False})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("is_common_paper", str(res.content))
+
+        # Ensure database state remains unchanged
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+        self.assertTrue(self.offering.programme_mappings.exists())
+
+    def test_mapped_paper_cannot_be_set_to_non_common_via_model_clean(self):
+        PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=self.prog1)
+        self.offering.is_common_paper = False
+        with self.assertRaises(ValidationError) as cm:
+            self.offering.clean()
+        self.assertIn("is_common_paper", cm.exception.message_dict)
+
+    def test_unmapping_all_allows_setting_is_common_paper_false(self):
+        mapping = PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=self.prog1)
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        # Delete the mapping
+        mapping.delete()
+
+        # Now setting is_common_paper to False should succeed
+        url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+        res = self.client.patch(url, {"is_common_paper": False})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.is_common_paper)
+
+    def test_bulk_mapping_atomic_rollback_preserves_state(self):
+        other_college = College.objects.create(name="Cross College", code="CC-GU", contact_email="cc@gu.edu")
+        other_prog = Programme.objects.create(college=other_college, name="Other", code="OTH", duration_semesters=8)
+        # Offering currently has no mappings and is_common_paper=False
+        self.assertFalse(self.offering.is_common_paper)
+
+        with self.assertRaises(ValidationError):
+            map_paper_to_programmes(self.offering, [self.prog1, other_prog])
+
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.is_common_paper)
+        self.assertEqual(self.offering.programme_mappings.count(), 0)
+
+
+class SanitizedExceptionHandlingRegressionTests(TestCase):
+    """
+    Round 3 Regression Tests for Finding C:
+    Guarantees internal exception details (SQL syntax, table names, tracebacks) are never leaked to clients.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_superuser(
+            username="admin_sec",
+            email="admin_sec@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.SUPERADMIN,
+        )
+        self.client.force_authenticate(user=self.admin)
+        self.college = College.objects.create(name="Model College", code="MC-GU", contact_email="admin@mc.edu")
+        self.session = AcademicSession.objects.create(
+            college=self.college, name="2025-2026", start_date=date(2025, 7, 1), end_date=date(2026, 6, 30), is_current=True
+        )
+
+    def test_restricted_deletion_returns_409_without_internal_details(self):
+        # AcademicSession references College with on_delete=RESTRICT
+        url = reverse("academics:college-detail", kwargs={"pk": self.college.id})
+        res = self.client.delete(url)
+        self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
+        data = res.json()
+        self.assertIn("error", data)
+        self.assertEqual(data["error"]["code"], "RESOURCE_CONFLICT")
+        self.assertEqual(data["error"]["message"], "Cannot delete record because it is referenced by existing academic data.")
+        # Ensure no internal SQL, table names, or details field leaked
+        self.assertNotIn("details", data["error"])
+        content_str = str(res.content)
+        self.assertNotIn("academics_academicsession", content_str)
+        self.assertNotIn("RESTRICT", content_str)
+        self.assertNotIn("foreign key", content_str.lower())
+
+    def test_unexpected_mapping_error_returns_500_without_internal_disclosure(self):
+        prog = Programme.objects.create(college=self.college, name="BA", code="BA", duration_semesters=8)
+        sem = Semester.objects.create(programme=prog, semester_number=1, name="Sem 1")
+        dept = Department.objects.create(college=self.college, name="Philosophy", code="PHIL")
+        sub = Subject.objects.create(department=dept, name="Ethics", code="ETH101")
+        cat = SubjectCategory.objects.create(college=self.college, code="VAC", name="VAC")
+        offering = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=sem,
+            subject=sub,
+            subject_category=cat,
+            paper_code="VAC101",
+            title="Ethics",
+            credits=Decimal("2.0"),
+        )
+        url = reverse("academics:paper-offering-map-programmes", kwargs={"pk": offering.id})
+
+        with patch("apps.academics.views.map_paper_to_programmes", side_effect=RuntimeError("SecretDatabaseConnectionFailed")):
+            res = self.client.post(url, {"programme_ids": [prog.id]}, format="json")
+            self.assertEqual(res.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+            content_str = str(res.content)
+            self.assertNotIn("SecretDatabaseConnectionFailed", content_str)
+            self.assertNotIn("RuntimeError", content_str)
+            data = res.json()
+            self.assertEqual(data["error"]["code"], "INTERNAL_SERVER_ERROR")
+
+    def test_json_decode_error_returns_sanitized_message(self):
+        url = reverse("academics:institutional-config-list")
+        res = self.client.post(url, {
+            "college": self.college.id,
+            "config_key": "BAD_JSON_KEY",
+            "config_value": "{malformed_json: true,",
+            "data_type": "JSON",
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        content_str = str(res.content)
+        # Should return clean validation message without raw Python JSONDecodeError internals
+        self.assertIn("Value must be valid JSON.", content_str)
+        self.assertNotIn("Expecting property name enclosed in double quotes", content_str)
+        self.assertNotIn("line 1 column", content_str)

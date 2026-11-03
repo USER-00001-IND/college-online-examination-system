@@ -1,10 +1,10 @@
-# Chunk 05: FYUGP Academic Management Backend Audit Report (Round 2 Revisions)
+# Chunk 05: FYUGP Academic Management Backend Audit Report (Round 3 Revisions)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 2 Revisions Completed)  
+**Date:** 2026-11-03 (Round 3 Revisions Completed)  
 **Stage:** Chunk 05 — FYUGP Academic Management  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Round 2 corrections complete, backed by 82 dedicated academic tests, 288 total discovered tests [278 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Round 3 corrections complete, backed by 108 dedicated academic tests, 314 total discovered tests [304 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
 
 ---
 
@@ -213,9 +213,9 @@ All 4 architectural specification documents remain strictly unmodified (`git dif
 ## 11. Gate Status & Conclusion
 
 - **Chunk 04 Status:** **APPROVED WITH WARNINGS — 2026-11-03**
-- **Chunk 05 Status:** **IN REVIEW (Round 2 Revisions Completed — Awaiting Independent Audit)**
+- **Chunk 05 Status:** **IN REVIEW (Round 3 Revisions Completed — Awaiting Independent Audit)**
 - **Chunk 06 onward:** **GATED — NOT AUTHORIZED**
-- **Implementation State:** All Round 2 corrections on Chunk 05 are complete. No Chunk 06 code has been written.
+- **Implementation State:** All Round 3 corrections on Chunk 05 are complete. No Chunk 06 code has been written.
 - **Git State:** Changes remain uncommitted in the working directory for project owner and independent audit review.
 
 ---
@@ -272,6 +272,58 @@ All 4 architectural specification documents remain strictly unmodified (`git dif
 | `MapProgrammesReplaceBooleanAndExceptionSafetyRegressionTests` | 10 | `replace: false` retains existing mappings; `replace: true` replaces mappings; `"replace": "false"`, `"replace": "true"`, `0`, `1` rejected (HTTP 400) without deleting mappings; empty/duplicate/unknown/cross-college programme IDs rejected; transaction failure preserves existing mappings; sanitized error responses. |
 
 - **Total New Regression Tests Added in Round 2:** 46 tests.
-- **Total Academic Tests:** 82 tests (all passed).
-- **Total Test Suite:** 288 tests discovered, 278 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+- **Total Academic Tests in Round 2:** 82 tests.
+- **Total Test Suite in Round 2:** 288 tests discovered, 278 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+
+---
+
+## 13. ROUND 3 — SERVICE AUTHORIZATION, COMMON-PAPER CONSISTENCY AND EXCEPTION SANITIZATION
+
+### 13.1 Independent Audit Findings Summary
+
+| Finding | Severity | Description | Resolution Status |
+| :--- | :---: | :--- | :--- |
+| **High Finding A** | **HIGH** | `set_institutional_config()` accepted an omitted user or `enforce_authorization=False`, allowing programmatic callers to bypass RBAC and modify sensitive configurations without authorization checks. | **RESOLVED** — Made `user` a mandatory keyword-only argument (`user`). Completely removed `enforce_authorization`. Required authenticated, active administrator user for all configuration mutations. Enforced Superadministrator role whenever existing or proposed configuration is sensitive (`is_sensitive=True`). Blocked ordinary admin sensitivity promotions and demotions. Maintained database audit attribution (`updated_by = user`). |
+| **Medium Finding B** | **MEDIUM** | Common-paper flags could become inconsistent with programme mappings: `is_common_paper` could be set to `False` while mappings existed, and concurrent direct mapping mutations lacked row locking discipline. | **RESOLVED** — Formalized and enforced invariant: *If a paper offering has one or more programme mappings, its `is_common_paper` value must be `True`.* Blocked setting `is_common_paper=False` when mappings exist across `PaperOffering.clean()`, `PaperOfferingSerializer.validate()`, and `PaperOfferingViewSet.perform_update()`. In `PaperProgrammeMappingSerializer.create()`, `update()`, and `map_paper_to_programmes()`, acquired exclusive row lock on `PaperOffering` (`select_for_update()`) and maintained `is_common_paper = True` atomically. |
+| **Medium Finding C** | **MEDIUM** | Reference-protected deletion error envelopes in `BaseAcademicViewSet.destroy()` leaked internal table names and SQL details (`"details": str(exc)`), and broad exception handlers converted arbitrary exceptions into `str(exc)`. | **RESOLVED** — Completely removed `"details": str(exc)` from `BaseAcademicViewSet.destroy()` and replaced with sanitized warning log. Targeted exception catching specifically to `(DjangoValidationError, DRFValidationError)`. In action endpoints (`map_programmes`), structured logging (`logger.error("... [category=..., type=%s]", type(exc).__name__)`) logs diagnostic metadata while returning standardized generic envelopes without exposing database names, table names, or Python traces. Replaced raw JSON parsing exceptions in `InstitutionalConfig` model and serializer with clean validation messages (`"Value must be valid JSON."`). |
+
+---
+
+### 13.2 Exact Code Locations & Structural Changes
+
+1. **`backend/apps/academics/services.py`:**
+   - Lines 195–230: In `map_paper_to_programmes`, acquired exclusive `select_for_update()` lock on `PaperOffering` first to establish strict lock-order discipline before mutating or deleting mappings. Enforced `is_common_paper = True` under atomic transaction.
+   - Lines 235–295: In `set_institutional_config`, transformed `user` into a mandatory keyword-only argument (`user`), eliminating default `None` and removing `enforce_authorization`. Added mandatory authorization checks rejecting unauthenticated, inactive, student, and faculty users (including those with `is_staff=True`). Required Superadministrator role whenever existing or proposed config is sensitive. Persisted `config.updated_by = user`.
+2. **`backend/apps/academics/models.py`:**
+   - Lines 410–420: In `PaperOffering.clean()`, added invariant validation: `if self.pk and not self.is_common_paper and self.programme_mappings.exists(): raise ValidationError({"is_common_paper": "Cannot set is_common_paper to False while programme mappings exist. Remove all programme mappings first."})`.
+   - Lines 539–543: In `InstitutionalConfig.clean()`, replaced broad `except Exception as e:` with `except (json.JSONDecodeError, ValueError): raise ValidationError({"config_value": "Value must be valid JSON."})`.
+3. **`backend/apps/academics/serializers.py`:**
+   - Lines 320–332: In `PaperOfferingSerializer.validate()`, enforced invariant: rejected `is_common_paper=False` when `self.instance.programme_mappings.exists()`.
+   - Lines 334–345: In `PaperOfferingSerializer.validate()`, replaced broad exception catch with `except DjangoValidationError as exc:`.
+   - Lines 380–395: In `PaperProgrammeMappingSerializer.validate()`, replaced broad exception catch with `except DjangoValidationError as exc:`.
+   - Lines 397–420: In `PaperProgrammeMappingSerializer.create()` and `update()`, wrapped mutations in `@transaction.atomic`, acquired exclusive `select_for_update()` row locks on `PaperOffering`, and guaranteed `is_common_paper = True`.
+   - Lines 510–515: In `InstitutionalConfigSerializer.validate()`, replaced broad exception catch with `except (json.JSONDecodeError, ValueError):` returning sanitized `"Value must be valid JSON."`.
+4. **`backend/apps/academics/views.py`:**
+   - Lines 58–73: In `BaseAcademicViewSet.destroy()`, removed `"details": str(exc)`, returning clean HTTP 409 envelope `{"error": {"code": "RESOURCE_CONFLICT", "message": "Cannot delete record because it is referenced by existing academic data."}}` and logging structured warning without leaking table/constraint names to client.
+   - Lines 88–102: In `AcademicSessionViewSet.set_current()`, caught `(DjangoValidationError, DRFValidationError)` specifically.
+   - Lines 166–180: In `PaperOfferingViewSet`, implemented `perform_update()` wrapped in `@transaction.atomic`, acquiring row lock via `select_for_update()` on `PaperOffering` and rejecting `is_common_paper=False` when mappings exist.
+   - Lines 200–228: In `PaperOfferingViewSet.map_programmes()`, caught `(DjangoValidationError, DRFValidationError)` specifically for HTTP 400; caught unexpected exceptions with structured error logging (`logger.error("... [offering_id=%s, error_type=%s]", offering.pk, type(exc).__name__)`) and returned generic HTTP 500 error envelope.
+5. **`backend/tests/test_academics.py`:**
+   - Added 3 dedicated regression test suites (26 new tests), expanding academic test coverage from 82 to 108 tests.
+
+---
+
+### 13.3 Round 3 Regression Test Coverage Summary
+
+| Test Class | Tests Added | Scope Verified |
+| :--- | :---: | :--- |
+| `MandatoryInstitutionalConfigServiceAuthorizationRegressionTests` | 14 | Admin allowed to create/update non-sensitive config; admin denied sensitive config creation (PermissionDenied); superadmin allowed sensitive config creation; admin denied editing existing sensitive config; admin denied promoting non-sensitive to sensitive; admin denied demoting sensitive to non-sensitive; student denied; faculty denied; student with `is_staff=True` denied; faculty with `is_staff=True` denied; anonymous / `None` user denied; inactive user denied; omitted `user` raises `TypeError`; passing `enforce_authorization` raises `TypeError`; database audit user recorded. |
+| `CommonPaperInvariantAndRowLockingRegressionTests` | 9 | Unmapped paper can have `is_common_paper=False`; service mapping automatically sets `is_common_paper=True`; direct mapping POST sets `is_common_paper=True`; direct mapping PATCH maintains `is_common_paper=True`; mapped paper cannot be set to `is_common_paper=False` via API PATCH (HTTP 400); mapped paper cannot be set to `is_common_paper=False` via model `clean()`; rejected update leaves database state intact; deleting all mappings allows setting `is_common_paper=False`; bulk mapping transactional rollback on failure preserves original state. |
+| `SanitizedExceptionHandlingRegressionTests` | 3 | Restricted deletion returns HTTP 409 without `"details"`, table names, or SQL fragments; unexpected error during `map_programmes` logs structured metadata and returns generic HTTP 500 without leaking exception strings or tracebacks; invalid JSON configuration returns clean `"Value must be valid JSON."` without Python json module error traces. |
+
+- **Total New Regression Tests Added in Round 3:** 26 tests.
+- **Total Academic Tests:** 108 tests (all passed).
+- **Total Full Test Suite:** 314 tests discovered, 304 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+- **Clean System Checks:** Zero issues identified across development and production checks (`check --deploy`).
+- **Protected Files Integrity:** All 4 protected architectural documents verified 100% byte-identical and unmodified.
 

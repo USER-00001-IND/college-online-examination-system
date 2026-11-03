@@ -193,32 +193,35 @@ def map_paper_to_programmes(
     """
     Maps a common paper offering to multiple eligible degree programmes.
     Ensures:
-    1. All programmes pre-validated BEFORE modifying any database records.
-    2. Cross-college isolation and duration coverage verified via validate_paper_programme_mapping.
-    3. Transaction atomicity: failed replacement preserves existing mappings.
-    4. is_common_paper flag is maintained.
+    1. Lock-order discipline: acquires select_for_update() on PaperOffering row first.
+    2. All programmes pre-validated BEFORE modifying any database records.
+    3. Cross-college isolation and duration coverage verified via validate_paper_programme_mapping.
+    4. Transaction atomicity: failed replacement preserves existing mappings.
+    5. Invariant: is_common_paper flag is maintained and persisted atomically.
     """
+    # Exclusively lock the PaperOffering row first to prevent race conditions with concurrent updates
+    locked_offering = PaperOffering.objects.select_for_update().get(pk=paper_offering.pk)
     prog_list = list(programmes)
 
     # Pre-validate all programmes before performing any deletions or mutations
     for prog in prog_list:
-        validate_paper_programme_mapping(paper_offering, prog)
+        validate_paper_programme_mapping(locked_offering, prog)
 
     if replace:
-        PaperProgrammeMapping.objects.filter(paper_offering=paper_offering).delete()
+        PaperProgrammeMapping.objects.filter(paper_offering=locked_offering).delete()
 
     mappings = []
     for prog in prog_list:
         mapping, _ = PaperProgrammeMapping.objects.get_or_create(
-            paper_offering=paper_offering,
+            paper_offering=locked_offering,
             programme=prog,
         )
         mappings.append(mapping)
 
-    # Ensure offering is marked as common paper if mapped
-    if mappings and not paper_offering.is_common_paper:
-        paper_offering.is_common_paper = True
-        paper_offering.save(update_fields=["is_common_paper"])
+    # Invariant: If mappings exist, offering must be marked as common paper
+    if mappings and not locked_offering.is_common_paper:
+        locked_offering.is_common_paper = True
+        locked_offering.save(update_fields=["is_common_paper"])
 
     return mappings
 
@@ -232,32 +235,42 @@ def set_institutional_config(
     data_type: str = ConfigDataType.STRING,
     is_sensitive: bool = False,
     description: Optional[str] = None,
-    user=None,
-    enforce_authorization: bool = True,
+    user,
 ) -> InstitutionalConfig:
     """
-    Creates or updates an institutional configuration key with type validation and RBAC checks.
+    Creates or updates an institutional configuration key with type validation and mandatory RBAC checks.
+    Authentication and authorization are strictly required; missing or unauthorized callers are rejected.
     """
+    if user is None or not getattr(user, "is_authenticated", False) or not getattr(user, "is_active", False):
+        raise PermissionDenied("Authenticated active user required for institutional configuration.")
+
+    user_role = getattr(user, "role", None)
+    if user_role in (RoleChoices.STUDENT, RoleChoices.FACULTY):
+        raise PermissionDenied("Student and faculty accounts cannot modify institutional configuration.")
+
+    is_admin = (
+        user_role in (RoleChoices.ADMIN, RoleChoices.SUPERADMIN)
+        or getattr(user, "is_superuser", False)
+        or (hasattr(user, "has_role") and user.has_role("COLLEGE_SUPERADMIN", "EXAM_OFFICER"))
+    )
+    if not is_admin:
+        raise PermissionDenied("Administrator privileges required for institutional configuration.")
+
     key_clean = config_key.strip()
     existing = InstitutionalConfig.objects.filter(college=college, config_key=key_clean).first()
     existing_sensitive = existing.is_sensitive if existing else False
 
-    if enforce_authorization and user is not None:
-        if is_sensitive or existing_sensitive:
-            is_superadmin = (
-                user.is_authenticated
-                and (
-                    user.role == RoleChoices.SUPERADMIN
-                    or user.is_superuser
-                    or (hasattr(user, "has_role") and user.has_role("COLLEGE_SUPERADMIN"))
-                )
-                and user.role != RoleChoices.STUDENT
-                and user.role != RoleChoices.FACULTY
+    # Whenever the existing or proposed configuration is sensitive, require Superadministrator authority
+    if is_sensitive or existing_sensitive:
+        is_superadmin = (
+            user_role == RoleChoices.SUPERADMIN
+            or getattr(user, "is_superuser", False)
+            or (hasattr(user, "has_role") and user.has_role("COLLEGE_SUPERADMIN"))
+        ) and user_role not in (RoleChoices.STUDENT, RoleChoices.FACULTY)
+        if not is_superadmin:
+            raise PermissionDenied(
+                "Superadministrator privileges required for sensitive institutional configuration."
             )
-            if not is_superadmin:
-                raise PermissionDenied(
-                    "Superadministrator privileges required for sensitive institutional configuration."
-                )
 
     if existing:
         config = existing
@@ -266,8 +279,7 @@ def set_institutional_config(
         config.is_sensitive = is_sensitive
         if description is not None:
             config.description = description
-        if user and user.is_authenticated:
-            config.updated_by = user
+        config.updated_by = user
     else:
         config = InstitutionalConfig(
             college=college,
@@ -276,7 +288,7 @@ def set_institutional_config(
             data_type=data_type,
             is_sensitive=is_sensitive,
             description=description,
-            updated_by=user if (user and user.is_authenticated) else None,
+            updated_by=user,
         )
 
     config.full_clean()

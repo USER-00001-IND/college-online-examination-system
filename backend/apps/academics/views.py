@@ -59,12 +59,16 @@ class BaseAcademicViewSet(viewsets.ModelViewSet):
         try:
             return super().destroy(request, *args, **kwargs)
         except (models.ProtectedError, models.RestrictedError) as exc:
+            logger.warning(
+                "Restricted deletion prevented for %s [error_type=%s]",
+                self.queryset.model.__name__ if hasattr(self, "queryset") and self.queryset is not None else "Model",
+                type(exc).__name__,
+            )
             return Response(
                 {
                     "error": {
                         "code": "RESOURCE_CONFLICT",
                         "message": "Cannot delete record because it is referenced by existing academic data.",
-                        "details": str(exc),
                     }
                 },
                 status=status.HTTP_409_CONFLICT,
@@ -95,7 +99,7 @@ class AcademicSessionViewSet(BaseAcademicViewSet):
                     "error": {
                         "code": "VALIDATION_ERROR",
                         "message": "Failed to update current academic session.",
-                        "details": exc.message_dict if hasattr(exc, "message_dict") else str(exc),
+                        "details": exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)]),
                     }
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -159,6 +163,21 @@ class PaperOfferingViewSet(BaseAcademicViewSet):
     ]
     search_fields = ["paper_code", "title"]
 
+    @transaction.atomic
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        # Exclusively lock the PaperOffering row before saving to coordinate with concurrent mapping operations
+        locked_offering = PaperOffering.objects.select_for_update().get(pk=instance.pk)
+        new_is_common = serializer.validated_data.get("is_common_paper", locked_offering.is_common_paper)
+        if not new_is_common and locked_offering.programme_mappings.exists():
+            raise DRFValidationError({
+                "is_common_paper": (
+                    "Cannot set is_common_paper to False while programme mappings exist. "
+                    "Remove all programme mappings first."
+                )
+            })
+        serializer.save()
+
     @action(detail=True, methods=["post"], url_path="map-programmes")
     def map_programmes(self, request, pk=None):
         """
@@ -204,14 +223,19 @@ class PaperOfferingViewSet(BaseAcademicViewSet):
                     "error": {
                         "code": "VALIDATION_ERROR",
                         "message": "Academic validation error.",
-                        "details": exc.message_dict if hasattr(exc, "message_dict") else str(exc),
+                        "details": exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)]),
                     }
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        except Exception:
+        except Exception as exc:
             # Sanitized logging under Chunk 03/04 policy: raw internal exception is never exposed to client
-            logger.exception("Unexpected error during paper-programme mapping")
+            logger.error(
+                "Unexpected error during paper-programme mapping [offering_id=%s, error_type=%s]",
+                offering.pk,
+                type(exc).__name__,
+                exc_info=True,
+            )
             return Response(
                 {
                     "error": {
