@@ -1,10 +1,10 @@
-# Chunk 05: FYUGP Academic Management Backend Audit Report (Round 3 Revisions)
+# Chunk 05: FYUGP Academic Management Backend Audit Report (Round 4 Revisions)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 3 Revisions Completed)  
+**Date:** 2026-11-04 (Round 4 Revisions Completed)  
 **Stage:** Chunk 05 — FYUGP Academic Management  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Round 3 corrections complete, backed by 108 dedicated academic tests, 314 total discovered tests [304 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Round 4 corrections complete, backed by 143 dedicated academic tests, 349 total discovered tests [339 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
 
 ---
 
@@ -213,9 +213,9 @@ All 4 architectural specification documents remain strictly unmodified (`git dif
 ## 11. Gate Status & Conclusion
 
 - **Chunk 04 Status:** **APPROVED WITH WARNINGS — 2026-11-03**
-- **Chunk 05 Status:** **IN REVIEW (Round 3 Revisions Completed — Awaiting Independent Audit)**
+- **Chunk 05 Status:** **IN REVIEW (Round 4 Revisions Completed — Awaiting Independent Audit)**
 - **Chunk 06 onward:** **GATED — NOT AUTHORIZED**
-- **Implementation State:** All Round 3 corrections on Chunk 05 are complete. No Chunk 06 code has been written.
+- **Implementation State:** All Round 4 corrections on Chunk 05 are complete. No Chunk 06 code has been written.
 - **Git State:** Changes remain uncommitted in the working directory for project owner and independent audit review.
 
 ---
@@ -322,8 +322,124 @@ All 4 architectural specification documents remain strictly unmodified (`git dif
 | `SanitizedExceptionHandlingRegressionTests` | 3 | Restricted deletion returns HTTP 409 without `"details"`, table names, or SQL fragments; unexpected error during `map_programmes` logs structured metadata and returns generic HTTP 500 without leaking exception strings or tracebacks; invalid JSON configuration returns clean `"Value must be valid JSON."` without Python json module error traces. |
 
 - **Total New Regression Tests Added in Round 3:** 26 tests.
-- **Total Academic Tests:** 108 tests (all passed).
-- **Total Full Test Suite:** 314 tests discovered, 304 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+- **Total Academic Tests in Round 3:** 108 tests.
+- **Total Full Test Suite in Round 3:** 314 tests discovered, 304 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
 - **Clean System Checks:** Zero issues identified across development and production checks (`check --deploy`).
 - **Protected Files Integrity:** All 4 protected architectural documents verified 100% byte-identical and unmodified.
+
+---
+
+## 14. ROUND 4 — STALE-WRITE PREVENTION, SENSITIVE CONFIGURATION TOCTOU AND SEMESTER MAPPING INTEGRITY
+
+### 14.1 Independent Audit Findings Summary
+
+| Finding | Severity | Description | Resolution Status |
+| :--- | :---: | :--- | :--- |
+| **High Finding A** | **HIGH** | `PaperOfferingViewSet.perform_update()` locked a fresh `PaperOffering` row for invariant checks, but persisted through `serializer.save()`, saving the stale `serializer.instance` loaded before the lock. This allowed concurrent mapping updates (`is_common_paper = True`) to be overwritten by stale academic updates. | **RESOLVED** — Created centralized `update_paper_offering()` service. Under `@transaction.atomic` and exclusive `select_for_update()` row lock on `PaperOffering`, reads authoritative database state, locks associated mappings, applies only explicitly supplied request fields, preserves concurrent field changes, revalidates complete proposed academic state, enforces the common-paper invariant, and persists the freshly locked instance. Updated `serializer.instance` to the newly persisted record. |
+| **High Finding B** | **HIGH** | Institutional configuration authorization checks occurred prior to database row locking, creating a Time-of-Check to Time-of-Use (TOCTOU) race where an ordinary administrator's stale request could overwrite or delete a configuration concurrently marked sensitive by a superadministrator. | **RESOLVED** — Formalized and enforced consistent lock-order policy across all configuration operations: **College lock (`select_for_update`) -> InstitutionalConfig lock (`select_for_update`) -> authorization recheck -> validation -> mutation.** Authoritative sensitivity state (`is_sensitive` of existing and proposed state) is re-evaluated under lock; ordinary administrators are rejected with `PermissionDenied` (HTTP 403) if either state is sensitive. Applied uniformly across `POST`, `PUT`, `PATCH`, `DELETE`, and service methods. |
+| **Medium Finding C** | **MEDIUM** | Moving a `PaperOffering` to a new semester (`semester_number`) did not revalidate existing `PaperProgrammeMapping` records, allowing papers to be moved to advanced semesters beyond the `duration_semesters` of currently mapped programmes. | **RESOLVED** — Enforced programme-duration coverage invariant across all existing mappings upon semester changes: `mapping.programme.duration_semesters >= proposed_semester.semester_number`. Revalidated under row locks in `update_paper_offering()`, `PaperOfferingSerializer.validate()`, and `PaperOffering.clean()`. Rejects incompatible semester moves with HTTP 400 Bad Request, atomically preserving original semester and all mappings. |
+
+---
+
+### 14.2 Exact Code Locations & Structural Changes
+
+1. **`backend/apps/academics/services.py`:**
+   - Lines 235–325: Implemented `update_paper_offering(*, paper_offering_id, validated_data)`. Acquires `select_for_update()` on `PaperOffering`, locks associated mappings in PK order, merges explicitly supplied fields, validates common-paper invariant and semester duration coverage against current mappings, re-runs complete relational validation, and persists the locked instance.
+   - Lines 328–365: Added centralized RBAC authority validators `check_institutional_admin_authority(user)` and `check_institutional_superadmin_authority(user, message)`.
+   - Lines 368–420: Refactored `set_institutional_config()` to acquire `select_for_update()` on `College` first, lock `InstitutionalConfig` second, and recheck authorization under lock.
+   - Lines 423–465: Implemented `create_institutional_config(*, college_id, validated_data, user)` enforcing College row lock, duplicate key check, sensitivity authorization recheck under lock, validation, and persistence.
+   - Lines 468–510: Implemented `update_institutional_config(*, config_id, validated_data, user)` locking College first, InstitutionalConfig second, rechecking sensitivity under lock, applying explicit fields, and updating `updated_by`.
+   - Lines 513–540: Implemented `delete_institutional_config(*, config_id, user)` locking College first, InstitutionalConfig second, rechecking sensitivity under lock, and deleting.
+   - Lines 200–225: In `map_paper_to_programmes()`, ensured associated mappings are locked in deterministic PK order (`order_by("pk")`).
+2. **`backend/apps/academics/models.py`:**
+   - Lines 418–432: In `PaperOffering.clean()`, added duration coverage check: iterates over `self.programme_mappings.select_related("programme")` and rejects moving to a semester exceeding any mapped programme's `duration_semesters`.
+3. **`backend/apps/academics/serializers.py`:**
+   - Lines 330–348: In `PaperOfferingSerializer.validate()`, added preliminary duration coverage check for `self.instance.programme_mappings` against proposed `semester`.
+   - Lines 362–374: In `PaperOfferingSerializer`, added `update()` method delegating directly to `update_paper_offering()`.
+   - Lines 435–445: In `PaperProgrammeMappingSerializer.update()`, enforced deterministic PK locking order (`order_by("pk")`).
+   - Lines 550–575: In `InstitutionalConfigSerializer`, updated `create()` and `update()` to delegate to `create_institutional_config()` and `update_institutional_config()`.
+4. **`backend/apps/academics/views.py`:**
+   - Lines 166–180: In `PaperOfferingViewSet.perform_update()`, replaced direct serializer save with `update_paper_offering()`, setting `serializer.instance = updated_offering`.
+   - Lines 265–310: In `InstitutionalConfigViewSet`, implemented `perform_create()` and `perform_update()` under `@transaction.atomic`, and implemented `destroy()` with `delete_institutional_config()` enforcing College and InstitutionalConfig row locks and sensitivity authorization.
+5. **`backend/tests/test_academics.py`:**
+   - Added 3 dedicated Round 4 regression test suites (35 new tests), expanding academic test coverage from 108 to 143 tests.
+
+---
+
+### 14.3 Paper-Offering Update Strategy & Lost-Update Prevention
+
+To eliminate the stale-instance vulnerability:
+1. `perform_update()` enters `@transaction.atomic`.
+2. `update_paper_offering()` executes `PaperOffering.objects.select_for_update().get(pk=paper_offering_id)`.
+3. The latest persisted database state is loaded while holding the row lock. Any concurrent transactions (such as mapping additions or title edits) are already committed and visible.
+4. Only fields explicitly present in `validated_data` are applied. Stale attributes from the serializer's initial read are completely discarded.
+5. If concurrent mappings were created, `locked_offering.is_common_paper` is already `True` and remains `True` unless the request explicitly attempts to set it to `False`, in which case it is rejected under lock with HTTP 400.
+6. The updated `locked_offering` is persisted.
+7. `serializer.instance` is reassigned to `locked_offering` so that DRF's response serialization matches the newly saved database state.
+
+---
+
+### 14.4 Institutional Configuration Lock-Order & TOCTOU Elimination
+
+To eliminate the TOCTOU authorization gap:
+1. Every configuration mutation (API create, API update, API delete, service update) enforces the strict lock hierarchy:
+   **College lock (`select_for_update`) -> InstitutionalConfig lock (`select_for_update`) -> authorization recheck -> validation -> mutation.**
+2. Locking the `College` row first serializes all configuration modifications for that institution, preventing concurrent creation races on the same key.
+3. Locking the `InstitutionalConfig` row guarantees that the authoritative sensitivity state is re-read directly from MySQL InnoDB storage while holding exclusive locks.
+4. If an ordinary administrator's stale request attempts to update or delete a configuration that a superadministrator sensitized in the interim, the recheck under lock detects `is_sensitive=True` and raises `PermissionDenied` (HTTP 403).
+5. Authorization failure causes an immediate transaction rollback, leaving the database completely unmodified.
+
+---
+
+### 14.5 Semester-to-Programme Mapping Compatibility & Invariant Enforcement
+
+To eliminate semester-change mapping divergence:
+1. When a paper offering update includes a change to `semester`:
+2. Under the row lock, all currently linked `PaperProgrammeMapping` records are retrieved.
+3. Every linked programme is verified: `mapping.programme.duration_semesters >= proposed_semester.semester_number` and `mapping.programme.college_id == proposed_semester.programme.college_id`.
+4. If any mapped programme cannot cover the proposed semester, the update is rejected with HTTP 400 Bad Request detailing the incompatible programme code and duration.
+5. Incompatible mappings are never deleted silently.
+6. The transaction rolls back, leaving the original semester and all mappings intact in the database.
+
+---
+
+### 14.6 Shared Lock-Order Policy
+
+Across all academic mutation paths, consistent lock acquisition order is strictly enforced:
+- **Paper Offering Operations:**
+  `PaperOffering (select_for_update)` -> `PaperProgrammeMapping (select_for_update, order_by('pk'))` -> Validation -> Persistence.
+- **Multiple Paper Offerings:**
+  Locks acquired in deterministic primary-key order (`filter(pk__in=pks).order_by('pk')`).
+- **Institutional Configuration Operations:**
+  `College (select_for_update)` -> `InstitutionalConfig (select_for_update)` -> Authorization Recheck -> Validation -> Mutation / Deletion.
+
+---
+
+### 14.7 Round 4 Regression Test Coverage Summary
+
+| Test Class | Tests Added | Scope Verified |
+| :--- | :---: | :--- |
+| `StalePaperOfferingWriteRegressionTests` | 10 | PATCH title after concurrent mapping preserves `is_common_paper=True`; PATCH credits preserves unrelated concurrent field edits; PATCH without `is_common_paper` preserves current database flag; PATCH explicitly setting `is_common_paper=False` with mappings returns HTTP 400; unmapped paper can be updated to `is_common_paper=False`; failed validation produces zero partial changes; cross-college semester updates rejected; marks and credit constraints enforced; stored values match API response; deterministic stale-object simulation passes. |
+| `SensitiveConfigTOCTOURegressionTests` | 16 | Ordinary admin updates non-sensitive config (HTTP 200); ordinary admin cannot create sensitive config (HTTP 403); ordinary admin cannot update sensitive config (HTTP 403); ordinary admin cannot downgrade sensitive config (HTTP 403); superadmin updates sensitive config (HTTP 200); ordinary admin stale request cannot overwrite sensitized config (HTTP 403); ordinary admin stale request cannot reset sensitivity to false (HTTP 403); ordinary admin stale request cannot delete sensitized config (HTTP 403); concurrent creation of same key under lock enforces authorization; student and faculty denied; `is_staff=True` alone denied; inactive/anonymous denied; missing user rejected; audit `updated_by` preserved; sensitive values unexposed on rejection; zero database changes on rejection. |
+| `SemesterChangeMappingRevalidationRegressionTests` | 9 | Moving unmapped paper between valid semesters succeeds; moving mapped paper to compatible semester succeeds (8 >= 6); moving mapped paper to incompatible semester rejected (4 < 6, HTTP 400); original semester preserved on rejection; all programme mappings preserved on rejection; multiple mappings checked and one incompatible fails whole update; cross-college semester updates prohibited; category and credit bounds enforced on semester change; model `clean()` enforces invariant. |
+
+- **Total New Regression Tests Added in Round 4:** 35 tests.
+- **Total Academic Tests:** 143 tests (all passed).
+- **Total Full Test Suite:** 349 tests discovered, 339 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+- **Clean System Checks:** Zero issues identified across development and production checks (`check --deploy`).
+- **Protected Files Integrity:** All 4 protected architectural documents verified 100% byte-identical and unmodified.
+
+---
+
+### 14.8 MySQL Concurrency Integration & Live Redis Status
+
+- **MySQL Concurrency Integration:** **NOT EXECUTED**. In accordance with audit instructions, real multi-connection MySQL InnoDB concurrency tests require an explicitly isolated MySQL database service. Automated test execution ran against the configured test database runner (SQLite in-memory) without claiming that SQLite establishes MySQL InnoDB engine row-lock proof. The code strictly utilizes ANSI SQL `SELECT ... FOR UPDATE` row-level locks, explicit transaction boundaries (`@transaction.atomic`), and deterministic lock-order discipline targeting production MySQL 8.x InnoDB.
+- **Live Redis Integration:** **DEFERRED (10 Tests Cleanly Skipped)**. The 10 opt-in live Redis integration tests (`SafeLiveRedisIntegrationTests`) skipped cleanly as expected due to the absence of the disposable test Redis service gate (`RUN_REDIS_INTEGRATION_TESTS=1`). Mocked Redis throttle tests (125 tests) ran and passed with 100% success.
+
+---
+
+### 14.9 Remaining Risks and Architectural Limitations
+
+1. **Deferred Production Database Concurrency Gate:** Multi-process concurrency verification on live MySQL 8 InnoDB remains an outstanding gate requirement before production activation (carried over from Chunk 04 Pass with Warnings).
+2. **Reverse Proxy Trust Gate:** TLS termination and arrival timestamp verification (`X-Request-Arrival-Time`, `X-Request-ID`) remain dependent on production Nginx deployment configuration.
 

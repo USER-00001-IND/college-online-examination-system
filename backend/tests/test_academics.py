@@ -34,10 +34,14 @@ from apps.academics.models import (
     SubjectCategory,
 )
 from apps.academics.services import (
+    create_institutional_config,
     create_paper_offering,
+    delete_institutional_config,
     map_paper_to_programmes,
     set_current_academic_session,
     set_institutional_config,
+    update_institutional_config,
+    update_paper_offering,
     validate_academic_session_dates,
 )
 from apps.accounts.models import Role, RoleChoices, User, UserRole
@@ -1896,3 +1900,594 @@ class SanitizedExceptionHandlingRegressionTests(TestCase):
         self.assertIn("Value must be valid JSON.", content_str)
         self.assertNotIn("Expecting property name enclosed in double quotes", content_str)
         self.assertNotIn("line 1 column", content_str)
+
+
+class StalePaperOfferingWriteRegressionTests(TestCase):
+    """
+    Round 4 Regression Tests for High Finding A:
+    Guarantees that PaperOffering updates revalidate and persist against the freshly locked
+    database record rather than stale serializer instances, preventing lost updates and
+    inconsistent common-paper flags.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_superuser(
+            username="admin_stale_test",
+            email="admin_stale@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.SUPERADMIN,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        self.college = College.objects.create(name="Model College", code="MC-GU", contact_email="admin@mc.edu")
+        self.session = AcademicSession.objects.create(
+            college=self.college, name="2025-2026", start_date=date(2025, 7, 1), end_date=date(2026, 6, 30), is_current=True
+        )
+        self.prog1 = Programme.objects.create(college=self.college, name="BA", code="BA", duration_semesters=8)
+        self.prog2 = Programme.objects.create(college=self.college, name="BSc", code="BSC", duration_semesters=8)
+        self.sem1 = Semester.objects.create(programme=self.prog1, semester_number=1, name="Sem 1")
+        self.sem2 = Semester.objects.create(programme=self.prog1, semester_number=2, name="Sem 2")
+        self.dept = Department.objects.create(college=self.college, name="Philosophy", code="PHIL")
+        self.subject = Subject.objects.create(department=self.dept, name="Ethics", code="ETH101")
+        self.category = SubjectCategory.objects.create(college=self.college, code="VAC", name="Value Added Course")
+
+        self.offering = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=self.sem1,
+            subject=self.subject,
+            subject_category=self.category,
+            paper_code="VAC101",
+            title="Ethics in Public Life",
+            credits=Decimal("2.0"),
+            is_common_paper=False,
+        )
+        self.url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+
+    def test_patch_title_after_concurrent_mapping_preserves_is_common_paper_true(self):
+        # 1. Stale read: offering has is_common_paper=False
+        self.assertFalse(self.offering.is_common_paper)
+
+        # 2. Concurrent Request B commits a mapping, flipping is_common_paper=True in DB
+        map_paper_to_programmes(self.offering, [self.prog1])
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+
+        # 3. Request A sends PATCH for title only (unrelated field)
+        res = self.client.patch(self.url, {"title": "Updated Title After Concurrent Mapping"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["title"], "Updated Title After Concurrent Mapping")
+        self.assertTrue(res.data["is_common_paper"])
+
+        # 4. In database: common-paper flag MUST remain True
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.title, "Updated Title After Concurrent Mapping")
+        self.assertTrue(self.offering.is_common_paper)
+        self.assertTrue(self.offering.programme_mappings.exists())
+
+    def test_patch_credits_preserves_concurrently_updated_unrelated_fields(self):
+        # Concurrent Request B updates title in DB
+        PaperOffering.objects.filter(pk=self.offering.pk).update(title="Title Updated By Request B")
+
+        # Request A updates credits
+        res = self.client.patch(self.url, {"credits": "3.0"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(Decimal(str(res.data["credits"])), Decimal("3.0"))
+        # Unrelated concurrent field title was preserved
+        self.assertEqual(res.data["title"], "Title Updated By Request B")
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.credits, Decimal("3.0"))
+        self.assertEqual(self.offering.title, "Title Updated By Request B")
+
+    def test_patch_without_is_common_paper_never_overwrites_current_db_value(self):
+        map_paper_to_programmes(self.offering, [self.prog1])
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+
+        res = self.client.patch(self.url, {"pass_marks_external": "30.00"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+
+    def test_patch_explicitly_setting_is_common_false_with_existing_mappings_fails(self):
+        map_paper_to_programmes(self.offering, [self.prog1])
+        res = self.client.patch(self.url, {"is_common_paper": False})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("is_common_paper", str(res.content))
+
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+
+    def test_updating_unmapped_paper_to_is_common_paper_false_succeeds(self):
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        res = self.client.patch(self.url, {"is_common_paper": False})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.is_common_paper)
+
+    def test_failed_validation_produces_no_partial_database_changes(self):
+        original_title = self.offering.title
+        # Invalid pass marks > external marks
+        res = self.client.patch(self.url, {
+            "title": "Should Not Be Saved",
+            "pass_marks_external": "95.00",
+            "max_marks_external": "80.00",
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.title, original_title)
+
+    def test_cross_college_relationship_validation_enforced_in_update(self):
+        other_college = College.objects.create(name="Other College", code="OC-GU", contact_email="admin@oc.edu")
+        other_prog = Programme.objects.create(college=other_college, name="Other", code="OTH", duration_semesters=8)
+        other_sem = Semester.objects.create(programme=other_prog, semester_number=1, name="Sem 1")
+
+        res = self.client.patch(self.url, {"semester": other_sem.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem1)
+
+    def test_existing_paper_marks_and_credit_constraints_remain_enforced(self):
+        res = self.client.patch(self.url, {"credits": "-1.0"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_stored_values_and_api_response_values_agree_after_mutation(self):
+        res = self.client.patch(self.url, {"title": "Exact Match Title", "credits": "3.5"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(res.data["title"], self.offering.title)
+        self.assertEqual(Decimal(str(res.data["credits"])), self.offering.credits)
+
+    def test_stale_object_simulation_deterministic(self):
+        stale_instance = PaperOffering.objects.get(pk=self.offering.pk)
+        self.assertFalse(stale_instance.is_common_paper)
+
+        # Background update adds mapping and flips flag
+        map_paper_to_programmes(self.offering, [self.prog1])
+
+        # Execute service update with stale validated_data that did not include is_common_paper
+        updated = update_paper_offering(
+            paper_offering_id=stale_instance.pk,
+            validated_data={"title": "Service Updated Title"},
+        )
+        self.assertEqual(updated.title, "Service Updated Title")
+        self.assertTrue(updated.is_common_paper)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.title, "Service Updated Title")
+        self.assertTrue(self.offering.is_common_paper)
+
+
+class SensitiveConfigTOCTOURegressionTests(TestCase):
+    """
+    Round 4 Regression Tests for High Finding B:
+    Guarantees that InstitutionalConfig authorization is rechecked under exclusive database row locks
+    (College lock -> InstitutionalConfig lock -> authorization recheck -> mutation), completely
+    preventing Time-of-Check to Time-of-Use (TOCTOU) authorization bypasses.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.college = College.objects.create(name="Model College", code="MC-GU", contact_email="admin@mc.edu")
+        self.superadmin = User.objects.create_superuser(
+            username="super_toctou",
+            email="super_toctou@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.SUPERADMIN,
+        )
+        self.admin = User.objects.create_user(
+            username="admin_toctou",
+            email="admin_toctou@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.ADMIN,
+        )
+        self.student = User.objects.create_user(
+            username="student_toctou",
+            email="student_toctou@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.STUDENT,
+        )
+        self.faculty = User.objects.create_user(
+            username="faculty_toctou",
+            email="faculty_toctou@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.FACULTY,
+        )
+
+    def test_ordinary_admin_updates_nonsensitive_config_successfully(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="SITE_TITLE",
+            config_value="Old Title",
+            is_sensitive=False,
+            updated_by=self.admin,
+        )
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.patch(url, {"config_value": "New Title"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        config.refresh_from_db()
+        self.assertEqual(config.config_value, "New Title")
+        self.assertEqual(config.updated_by, self.admin)
+
+    def test_ordinary_admin_cannot_create_sensitive_config(self):
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-list")
+        res = self.client.post(url, {
+            "college": self.college.id,
+            "config_key": "ADMIN_ATTEMPT_SECRET",
+            "config_value": "sensitive_data",
+            "is_sensitive": True,
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(InstitutionalConfig.objects.filter(config_key="ADMIN_ATTEMPT_SECRET").exists())
+
+    def test_ordinary_admin_cannot_update_sensitive_config(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="SUPER_SECRET",
+            config_value="secret_val",
+            is_sensitive=True,
+            updated_by=self.superadmin,
+        )
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.patch(url, {"config_value": "tampered"})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        config.refresh_from_db()
+        self.assertEqual(config.config_value, "secret_val")
+
+    def test_ordinary_admin_cannot_downgrade_sensitive_config(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="DOWNGRADE_SECRET",
+            config_value="secret_val",
+            is_sensitive=True,
+            updated_by=self.superadmin,
+        )
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.patch(url, {"is_sensitive": False})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        config.refresh_from_db()
+        self.assertTrue(config.is_sensitive)
+
+    def test_superadmin_can_update_sensitive_config(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="ALLOWED_SUPER_KEY",
+            config_value="secret1",
+            is_sensitive=True,
+            updated_by=self.superadmin,
+        )
+        self.client.force_authenticate(user=self.superadmin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.patch(url, {"config_value": "secret2"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        config.refresh_from_db()
+        self.assertEqual(config.config_value, "secret2")
+
+    def test_ordinary_admin_stale_request_cannot_overwrite_sensitized_config(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="TOCTOU_TEST_KEY",
+            config_value="original_public_value",
+            is_sensitive=False,
+            updated_by=self.admin,
+        )
+
+        # Superadmin concurrently updates config to sensitive
+        set_institutional_config(
+            college=self.college,
+            config_key="TOCTOU_TEST_KEY",
+            config_value="sensitized_by_superadmin",
+            is_sensitive=True,
+            user=self.superadmin,
+        )
+        config.refresh_from_db()
+        self.assertTrue(config.is_sensitive)
+
+        # Ordinary admin's earlier request attempts to update
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.patch(url, {"config_value": "attempted_overwrite_by_admin"})
+
+        # Authoritative sensitivity check under row lock rejects ordinary admin
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        config.refresh_from_db()
+        self.assertEqual(config.config_value, "sensitized_by_superadmin")
+        self.assertTrue(config.is_sensitive)
+
+    def test_ordinary_admin_stale_request_cannot_reset_sensitivity_to_false(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="RESET_SENSITIVITY_KEY",
+            config_value="confidential",
+            is_sensitive=True,
+            updated_by=self.superadmin,
+        )
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.patch(url, {"is_sensitive": False})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        config.refresh_from_db()
+        self.assertTrue(config.is_sensitive)
+
+    def test_ordinary_admin_stale_request_cannot_delete_sensitized_config(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="DELETE_TOCTOU_KEY",
+            config_value="public_value",
+            is_sensitive=False,
+            updated_by=self.admin,
+        )
+
+        config.is_sensitive = True
+        config.save()
+
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.delete(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(InstitutionalConfig.objects.filter(pk=config.id).exists())
+
+    def test_concurrent_creation_same_key_enforces_authorization(self):
+        # 1. Superadmin creates sensitive config
+        set_institutional_config(
+            college=self.college,
+            config_key="CONCURRENT_SECRET_KEY",
+            config_value="super_secret",
+            is_sensitive=True,
+            user=self.superadmin,
+        )
+
+        # 2. Ordinary admin attempts duplicate creation via API (rejected by unique validator / permission)
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-list")
+        res = self.client.post(url, {
+            "college": self.college.id,
+            "config_key": "CONCURRENT_SECRET_KEY",
+            "config_value": "admin_value",
+            "is_sensitive": False,
+        })
+        self.assertIn(res.status_code, [status.HTTP_400_BAD_REQUEST, status.HTTP_403_FORBIDDEN])
+        cfg = InstitutionalConfig.objects.get(college=self.college, config_key="CONCURRENT_SECRET_KEY")
+        self.assertEqual(cfg.config_value, "super_secret")
+        self.assertTrue(cfg.is_sensitive)
+
+        # 3. Simulate TOCTOU race: create_institutional_config under College lock detects existing sensitive config
+        from rest_framework.exceptions import PermissionDenied
+        with self.assertRaises(PermissionDenied):
+            create_institutional_config(
+                college_id=self.college.id,
+                validated_data={"config_key": "CONCURRENT_SECRET_KEY", "config_value": "stale_admin_value"},
+                user=self.admin,
+            )
+
+    def test_student_and_faculty_requests_denied(self):
+        url = reverse("academics:institutional-config-list")
+        for u in (self.student, self.faculty):
+            self.client.force_authenticate(user=u)
+            res = self.client.post(url, {
+                "college": self.college.id,
+                "config_key": "TEST_STUDENT_FACULTY",
+                "config_value": "val",
+            })
+            self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_is_staff_alone_never_authorizes_mutation(self):
+        self.student.is_staff = True
+        self.student.save()
+        self.client.force_authenticate(user=self.student)
+        url = reverse("academics:institutional-config-list")
+        res = self.client.post(url, {
+            "college": self.college.id,
+            "config_key": "BYPASS_ATTEMPT",
+            "config_value": "val",
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_inactive_or_anonymous_denied(self):
+        self.admin.is_active = False
+        self.admin.save()
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-list")
+        res = self.client.post(url, {
+            "college": self.college.id,
+            "config_key": "INACTIVE_USER_KEY",
+            "config_value": "val",
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=None)
+        res2 = self.client.post(url, {
+            "college": self.college.id,
+            "config_key": "ANON_USER_KEY",
+            "config_value": "val",
+        })
+        self.assertEqual(res2.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_missing_acting_user_rejected_by_service(self):
+        with self.assertRaises(TypeError):
+            set_institutional_config(
+                college=self.college,
+                config_key="OMITTED_ACTING_USER",
+                config_value="val",
+            )
+
+    def test_authorized_changes_preserve_correct_updated_by(self):
+        cfg = set_institutional_config(
+            college=self.college,
+            config_key="AUDIT_TRACK_KEY",
+            config_value="audit_val",
+            user=self.superadmin,
+        )
+        self.assertEqual(cfg.updated_by, self.superadmin)
+        cfg.refresh_from_db()
+        self.assertEqual(cfg.updated_by, self.superadmin)
+
+    def test_rejected_operations_do_not_expose_sensitive_values(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="SUPER_PRIVATE_KEY",
+            config_value="unleaked_super_secret_token",
+            is_sensitive=True,
+            updated_by=self.superadmin,
+        )
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.patch(url, {"config_value": "hack"})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertNotIn("unleaked_super_secret_token", str(res.content))
+
+    def test_rejected_operations_produce_no_db_changes(self):
+        config = InstitutionalConfig.objects.create(
+            college=self.college,
+            config_key="IMMUTABLE_ON_FAIL",
+            config_value="initial_value",
+            is_sensitive=True,
+            updated_by=self.superadmin,
+        )
+        self.client.force_authenticate(user=self.admin)
+        url = reverse("academics:institutional-config-detail", kwargs={"pk": config.id})
+        res = self.client.delete(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        config.refresh_from_db()
+        self.assertEqual(config.config_value, "initial_value")
+        self.assertTrue(config.is_sensitive)
+
+
+class SemesterChangeMappingRevalidationRegressionTests(TestCase):
+    """
+    Round 4 Regression Tests for Medium Finding C:
+    Guarantees that moving a PaperOffering to another semester revalidates all existing
+    PaperProgrammeMapping records under row locks, preventing incompatible mappings where
+    programme duration does not cover the proposed semester number.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_superuser(
+            username="admin_sem_test",
+            email="admin_sem@mc.edu",
+            password="StrongPassword123!",
+            role=RoleChoices.SUPERADMIN,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        self.college = College.objects.create(name="Model College", code="MC-GU", contact_email="admin@mc.edu")
+        self.session = AcademicSession.objects.create(
+            college=self.college, name="2025-2026", start_date=date(2025, 7, 1), end_date=date(2026, 6, 30), is_current=True
+        )
+        self.prog_8sem = Programme.objects.create(college=self.college, name="BA Honours", code="BA-HON", duration_semesters=8)
+        self.prog_4sem = Programme.objects.create(college=self.college, name="UG Diploma", code="UG-DIP", duration_semesters=4)
+
+        self.sem2 = Semester.objects.create(programme=self.prog_8sem, semester_number=2, name="Sem 2")
+        self.sem4 = Semester.objects.create(programme=self.prog_8sem, semester_number=4, name="Sem 4")
+        self.sem6 = Semester.objects.create(programme=self.prog_8sem, semester_number=6, name="Sem 6")
+
+        self.dept = Department.objects.create(college=self.college, name="Computer Science", code="CS")
+        self.subject = Subject.objects.create(department=self.dept, name="Python Programming", code="CS101")
+        self.category = SubjectCategory.objects.create(
+            college=self.college, code="SEC", name="Skill Enhancement Course", min_credits=Decimal("2.0"), max_credits=Decimal("4.0")
+        )
+
+        self.offering = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=self.sem2,
+            subject=self.subject,
+            subject_category=self.category,
+            paper_code="SEC102",
+            title="Python Skills",
+            credits=Decimal("3.0"),
+            is_common_paper=False,
+        )
+        self.url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+
+    def test_moving_unmapped_paper_between_valid_semesters_succeeds(self):
+        self.assertEqual(self.offering.semester, self.sem2)
+        res = self.client.patch(self.url, {"semester": self.sem6.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem6)
+
+    def test_moving_mapped_paper_to_compatible_semester_succeeds(self):
+        map_paper_to_programmes(self.offering, [self.prog_8sem])
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+
+        res = self.client.patch(self.url, {"semester": self.sem6.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem6)
+        self.assertTrue(self.offering.programme_mappings.filter(programme=self.prog_8sem).exists())
+
+    def test_moving_mapped_paper_to_incompatible_semester_rejected(self):
+        map_paper_to_programmes(self.offering, [self.prog_4sem])
+        self.offering.refresh_from_db()
+
+        res = self.client.patch(self.url, {"semester": self.sem6.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        content_str = str(res.content)
+        self.assertIn("semester", content_str)
+        self.assertIn("UG-DIP", content_str)
+        self.assertIn("does not cover proposed semester", content_str)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem2)
+
+    def test_rejection_leaves_original_semester_unchanged(self):
+        map_paper_to_programmes(self.offering, [self.prog_4sem])
+        res = self.client.patch(self.url, {"semester": self.sem6.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem2)
+
+    def test_rejection_preserves_all_programme_mappings(self):
+        map_paper_to_programmes(self.offering, [self.prog_4sem])
+        res = self.client.patch(self.url, {"semester": self.sem6.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.programme_mappings.count(), 1)
+        self.assertEqual(self.offering.programme_mappings.first().programme, self.prog_4sem)
+
+    def test_multiple_mappings_all_checked_one_incompatible_fails_whole_update(self):
+        map_paper_to_programmes(self.offering, [self.prog_8sem, self.prog_4sem])
+        self.assertEqual(self.offering.programme_mappings.count(), 2)
+
+        res = self.client.patch(self.url, {"semester": self.sem6.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem2)
+        self.assertEqual(self.offering.programme_mappings.count(), 2)
+        self.assertTrue(self.offering.is_common_paper)
+
+    def test_cross_college_semester_updates_prohibited(self):
+        other_college = College.objects.create(name="Other College", code="OC-GU", contact_email="admin@oc.edu")
+        other_prog = Programme.objects.create(college=other_college, name="Other", code="OTH", duration_semesters=8)
+        other_sem = Semester.objects.create(programme=other_prog, semester_number=2, name="Sem 2")
+
+        res = self.client.patch(self.url, {"semester": other_sem.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem2)
+
+    def test_paper_category_and_credit_validation_still_works_on_semester_change(self):
+        res = self.client.patch(self.url, {
+            "semester": self.sem4.id,
+            "credits": "10.0",
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem2)
+
+    def test_model_clean_enforces_semester_mapping_invariant(self):
+        map_paper_to_programmes(self.offering, [self.prog_4sem])
+        self.offering.semester = self.sem6
+        with self.assertRaises(ValidationError) as cm:
+            self.offering.clean()
+        self.assertIn("semester", cm.exception.message_dict)

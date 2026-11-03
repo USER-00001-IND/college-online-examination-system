@@ -23,6 +23,9 @@ from apps.academics.models import (
     SubjectCategory,
 )
 from apps.academics.services import (
+    create_institutional_config,
+    update_institutional_config,
+    update_paper_offering,
     validate_paper_offering_relationships,
     validate_paper_programme_mapping,
 )
@@ -329,6 +332,20 @@ class PaperOfferingSerializer(serializers.ModelSerializer):
                     )
                 })
 
+        # Programme duration coverage invariant: existing programme mappings must cover proposed semester number
+        if self.instance and self.instance.pk and sem:
+            sem_num = sem.semester_number
+            for mapping in self.instance.programme_mappings.select_related("programme"):
+                if mapping.programme.duration_semesters < sem_num:
+                    raise serializers.ValidationError({
+                        "semester": (
+                            f"Cannot move paper offering to semester {sem_num}: mapped programme "
+                            f"'{mapping.programme.code}' duration ({mapping.programme.duration_semesters} sem) "
+                            f"does not cover proposed semester ({sem_num}). "
+                            "Remove or update incompatible programme mappings first."
+                        )
+                    })
+
         try:
             validate_paper_offering_relationships(
                 academic_session=session,
@@ -346,6 +363,17 @@ class PaperOfferingSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(exc.messages if hasattr(exc, "messages") else [str(exc)])
 
         return attrs
+
+    def update(self, instance, validated_data):
+        try:
+            return update_paper_offering(
+                paper_offering_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
 
 class PaperProgrammeMappingSerializer(serializers.ModelSerializer):
@@ -402,7 +430,7 @@ class PaperProgrammeMappingSerializer(serializers.ModelSerializer):
             pks = sorted({instance.paper_offering_id, target_paper_offering.pk})
             locked_offerings = {
                 po.pk: po
-                for po in PaperOffering.objects.select_for_update().filter(pk__in=pks)
+                for po in PaperOffering.objects.select_for_update().filter(pk__in=pks).order_by("pk")
             }
             mapping = super().update(instance, validated_data)
             paper = locked_offerings[target_paper_offering.pk]
@@ -515,15 +543,31 @@ class InstitutionalConfigSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         request = self.context.get("request")
-        if request and request.user.is_authenticated:
-            validated_data["updated_by"] = request.user
-        return super().create(validated_data)
+        user = getattr(request, "user", None)
+        try:
+            return create_institutional_config(
+                college_id=validated_data["college"].pk,
+                validated_data=validated_data,
+                user=user,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
     def update(self, instance, validated_data):
         request = self.context.get("request")
-        if request and request.user.is_authenticated:
-            validated_data["updated_by"] = request.user
-        return super().update(instance, validated_data)
+        user = getattr(request, "user", None)
+        try:
+            return update_institutional_config(
+                config_id=instance.pk,
+                validated_data=validated_data,
+                user=user,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
 
 class MapProgrammesPayloadSerializer(serializers.Serializer):

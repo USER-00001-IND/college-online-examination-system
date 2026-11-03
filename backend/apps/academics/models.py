@@ -415,6 +415,19 @@ class PaperOffering(models.Model):
                     "Remove all programme mappings first."
                 )
 
+        # Programme duration coverage invariant: existing programme mappings must cover proposed semester number
+        if self.pk and self.semester_id:
+            sem_num = self.semester.semester_number
+            for mapping in self.programme_mappings.select_related("programme"):
+                if mapping.programme.duration_semesters < sem_num:
+                    errors["semester"] = (
+                        f"Cannot move paper offering to semester {sem_num}: mapped programme "
+                        f"'{mapping.programme.code}' duration ({mapping.programme.duration_semesters} sem) "
+                        f"does not cover proposed semester ({sem_num}). "
+                        "Remove or update incompatible programme mappings first."
+                    )
+                    break
+
         if errors:
             raise ValidationError(errors)
 
