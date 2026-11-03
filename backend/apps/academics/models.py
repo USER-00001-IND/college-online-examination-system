@@ -452,6 +452,14 @@ class PaperProgrammeMapping(models.Model):
                 raise ValidationError({
                     "programme": "Programme and PaperOffering must belong to the same college institution."
                 })
+            sem_num = self.paper_offering.semester.semester_number
+            if self.programme.duration_semesters < sem_num:
+                raise ValidationError({
+                    "programme": (
+                        f"Programme '{self.programme.code}' duration ({self.programme.duration_semesters} sem) "
+                        f"does not cover offering semester ({sem_num})."
+                    )
+                })
 
     def __str__(self) -> str:
         return f"{self.paper_offering.paper_code} -> {self.programme.code}"

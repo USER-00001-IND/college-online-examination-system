@@ -40,8 +40,9 @@ class IsInstitutionalConfigPermission(BasePermission):
     """
     Access control for Institutional Configuration (Table 21).
     - Read: Institutional Administrators and Superadministrators only. Students and Faculty denied.
-    - Write: Institutional Administrators and Superadministrators only.
-    - Sensitive Configs: Superadministrators only.
+    - Write (Nonsensitive): Institutional Administrators and Superadministrators.
+    - Write / Create / Mutate (Sensitive): Superadministrators only.
+    - Sensitivity Downgrade / Upgrade: Superadministrators only.
     """
     message = "Administrator access required for institutional configuration."
 
@@ -55,7 +56,22 @@ class IsInstitutionalConfigPermission(BasePermission):
             return False
 
         admin_perm = IsAdminUserRole()
-        return admin_perm.has_permission(request, view)
+        if not admin_perm.has_permission(request, view):
+            return False
+
+        # When creating a new configuration with is_sensitive=True, require Superadmin privileges
+        if request.method == "POST":
+            raw_sensitive = request.data.get("is_sensitive", False)
+            is_req_sensitive = (
+                raw_sensitive is True or str(raw_sensitive).strip().lower() in ("true", "1")
+            )
+            if is_req_sensitive:
+                superadmin_perm = IsCollegeSuperAdmin()
+                if not superadmin_perm.has_permission(request, view):
+                    self.message = "Superadministrator privileges required to create sensitive institutional configuration."
+                    return False
+
+        return True
 
     def has_object_permission(self, request, view, obj) -> bool:
         user = getattr(request, "user", None)
@@ -66,9 +82,25 @@ class IsInstitutionalConfigPermission(BasePermission):
         if not admin_perm.has_permission(request, view):
             return False
 
-        # If object is sensitive and client attempts mutation, require Superadmin privileges
-        if getattr(obj, "is_sensitive", False) and request.method not in SAFE_METHODS:
+        # If reading (SAFE_METHODS), ordinary admins can view the object (serializer masks sensitive values)
+        if request.method in SAFE_METHODS:
+            return True
+
+        # For mutations (PUT, PATCH, DELETE):
+        # 1. If existing object is sensitive, require Superadmin.
+        # 2. If attempting to change nonsensitive to sensitive, require Superadmin.
+        # 3. If attempting to downgrade sensitive to nonsensitive, require Superadmin.
+        existing_sensitive = getattr(obj, "is_sensitive", False)
+        raw_sensitive = request.data.get("is_sensitive") if hasattr(request, "data") else None
+        is_changing_to_sensitive = (
+            raw_sensitive is not None
+            and (raw_sensitive is True or str(raw_sensitive).strip().lower() in ("true", "1"))
+        )
+
+        if existing_sensitive or is_changing_to_sensitive:
             superadmin_perm = IsCollegeSuperAdmin()
-            return superadmin_perm.has_permission(request, view)
+            if not superadmin_perm.has_permission(request, view):
+                self.message = "Superadministrator privileges required to modify sensitive institutional configuration."
+                return False
 
         return True

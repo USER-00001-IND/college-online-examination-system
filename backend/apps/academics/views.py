@@ -3,10 +3,12 @@ Academic Management Views and ViewSets.
 Provides RESTful CRUD operations and administrative actions for Domain B FYUGP entities.
 """
 
+import logging
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import models, transaction
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
 
 from apps.academics.models import (
@@ -30,6 +32,7 @@ from apps.academics.serializers import (
     CollegeSerializer,
     DepartmentSerializer,
     InstitutionalConfigSerializer,
+    MapProgrammesPayloadSerializer,
     PaperOfferingSerializer,
     PaperProgrammeMappingSerializer,
     ProgrammeSerializer,
@@ -41,6 +44,8 @@ from apps.academics.services import (
     map_paper_to_programmes,
     set_current_academic_session,
 )
+
+logger = logging.getLogger("college.academics")
 
 
 class BaseAcademicViewSet(viewsets.ModelViewSet):
@@ -82,7 +87,19 @@ class AcademicSessionViewSet(BaseAcademicViewSet):
     @action(detail=True, methods=["post"], url_path="set-current")
     def set_current(self, request, pk=None):
         session = self.get_object()
-        updated_session = set_current_academic_session(session.college, session)
+        try:
+            updated_session = set_current_academic_session(session.college, session)
+        except (DjangoValidationError, DRFValidationError) as exc:
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Failed to update current academic session.",
+                        "details": exc.message_dict if hasattr(exc, "message_dict") else str(exc),
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         serializer = self.get_serializer(updated_session)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -146,21 +163,26 @@ class PaperOfferingViewSet(BaseAcademicViewSet):
     def map_programmes(self, request, pk=None):
         """
         Maps a common paper offering to multiple eligible degree programmes.
-        Body format: { "programme_ids": [1, 2, 3], "replace": true/false }
+        Payload format: { "programme_ids": [1, 2, 3], "replace": true/false }
+        Strictly validates genuine JSON boolean for 'replace' and non-empty distinct list of IDs.
         """
         offering = self.get_object()
-        programme_ids = request.data.get("programme_ids")
 
-        if not isinstance(programme_ids, list) or not programme_ids:
+        payload_serializer = MapProgrammesPayloadSerializer(data=request.data)
+        if not payload_serializer.is_valid():
             return Response(
                 {
                     "error": {
                         "code": "VALIDATION_ERROR",
-                        "message": "programme_ids must be a non-empty list of programme IDs.",
+                        "message": "Invalid mapping payload.",
+                        "details": payload_serializer.errors,
                     }
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        programme_ids = payload_serializer.validated_data["programme_ids"]
+        replace = payload_serializer.validated_data.get("replace", False)
 
         programmes = list(Programme.objects.filter(pk__in=programme_ids))
         if len(programmes) != len(programme_ids):
@@ -174,19 +196,30 @@ class PaperOfferingViewSet(BaseAcademicViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        replace = bool(request.data.get("replace", False))
-
         try:
             mappings = map_paper_to_programmes(offering, programmes, replace=replace)
-        except Exception as exc:
+        except (DjangoValidationError, DRFValidationError) as exc:
             return Response(
                 {
                     "error": {
                         "code": "VALIDATION_ERROR",
-                        "message": str(exc),
+                        "message": "Academic validation error.",
+                        "details": exc.message_dict if hasattr(exc, "message_dict") else str(exc),
                     }
                 },
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            # Sanitized logging under Chunk 03/04 policy: raw internal exception is never exposed to client
+            logger.exception("Unexpected error during paper-programme mapping")
+            return Response(
+                {
+                    "error": {
+                        "code": "INTERNAL_SERVER_ERROR",
+                        "message": "An error occurred while processing the mapping request.",
+                    }
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         serializer = PaperProgrammeMappingSerializer(mappings, many=True)

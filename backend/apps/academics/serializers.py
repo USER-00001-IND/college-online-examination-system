@@ -1,11 +1,11 @@
 """
 Academic Management Serializers.
-Provides serialization, validation, and relational integrity checking for Domain B FYUGP entities.
+Provides serialization, complete-state validation, and relational integrity checking for Domain B FYUGP entities.
 """
 
 from decimal import Decimal
 import json
-from rest_framework import serializers
+from rest_framework import exceptions, serializers
 
 from apps.academics.models import (
     AcademicSession,
@@ -19,6 +19,10 @@ from apps.academics.models import (
     Semester,
     Subject,
     SubjectCategory,
+)
+from apps.academics.services import (
+    validate_paper_offering_relationships,
+    validate_paper_programme_mapping,
 )
 from apps.accounts.models import RoleChoices
 
@@ -54,13 +58,34 @@ class AcademicSessionSerializer(serializers.ModelSerializer):
             "is_current",
             "created_at",
         ]
-        read_only_fields = ["id", "created_at"]
+        read_only_fields = ["id", "is_current", "created_at"]
 
     def validate(self, attrs):
-        start_date = attrs.get("start_date") or getattr(self.instance, "start_date", None)
-        end_date = attrs.get("end_date") or getattr(self.instance, "end_date", None)
+        # Reject attempts to modify is_current via ordinary CRUD
+        request = self.context.get("request")
+        if "is_current" in attrs or (request and "is_current" in getattr(request, "data", {})):
+            raise serializers.ValidationError({
+                "is_current": (
+                    "is_current cannot be modified via ordinary CRUD endpoints. "
+                    "Use the dedicated POST /api/v1/academics/sessions/{id}/set-current/ action."
+                )
+            })
+
+        start_date = (
+            attrs["start_date"]
+            if "start_date" in attrs
+            else getattr(self.instance, "start_date", None)
+        )
+        end_date = (
+            attrs["end_date"]
+            if "end_date" in attrs
+            else getattr(self.instance, "end_date", None)
+        )
+
         if start_date and end_date and start_date >= end_date:
-            raise serializers.ValidationError({"end_date": "Academic session start_date must precede end_date."})
+            raise serializers.ValidationError({
+                "end_date": "Academic session start_date must precede end_date."
+            })
         return attrs
 
 
@@ -120,17 +145,29 @@ class SemesterSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
     def validate(self, attrs):
-        prog = attrs.get("programme") or getattr(self.instance, "programme", None)
-        sem_num = attrs.get("semester_number") or getattr(self.instance, "semester_number", None)
+        prog = (
+            attrs["programme"]
+            if "programme" in attrs
+            else getattr(self.instance, "programme", None)
+        )
+        sem_num = (
+            attrs["semester_number"]
+            if "semester_number" in attrs
+            else getattr(self.instance, "semester_number", None)
+        )
 
+        errors = {}
         if sem_num is not None and sem_num < 1:
-            raise serializers.ValidationError({"semester_number": "Semester number must be at least 1."})
+            errors["semester_number"] = "Semester number must be at least 1."
 
-        if prog and sem_num:
+        if prog and sem_num is not None:
             if sem_num > prog.duration_semesters:
-                raise serializers.ValidationError({
-                    "semester_number": f"Semester number ({sem_num}) exceeds programme duration ({prog.duration_semesters})."
-                })
+                errors["semester_number"] = (
+                    f"Semester number ({sem_num}) exceeds programme duration ({prog.duration_semesters})."
+                )
+
+        if errors:
+            raise serializers.ValidationError(errors)
         return attrs
 
 
@@ -153,13 +190,25 @@ class SubjectCategorySerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
     def validate(self, attrs):
-        min_c = attrs.get("min_credits") or getattr(self.instance, "min_credits", Decimal("2.0"))
-        max_c = attrs.get("max_credits") or getattr(self.instance, "max_credits", Decimal("4.0"))
+        min_c = (
+            attrs["min_credits"]
+            if "min_credits" in attrs
+            else getattr(self.instance, "min_credits", Decimal("2.0"))
+        )
+        max_c = (
+            attrs["max_credits"]
+            if "max_credits" in attrs
+            else getattr(self.instance, "max_credits", Decimal("4.0"))
+        )
 
+        errors = {}
         if min_c < Decimal("0.0"):
-            raise serializers.ValidationError({"min_credits": "Minimum credits cannot be negative."})
+            errors["min_credits"] = "Minimum credits cannot be negative."
         if max_c < min_c:
-            raise serializers.ValidationError({"max_credits": "Maximum credits cannot be less than minimum credits."})
+            errors["max_credits"] = "Maximum credits cannot be less than minimum credits."
+
+        if errors:
+            raise serializers.ValidationError(errors)
         return attrs
 
 
@@ -212,48 +261,76 @@ class PaperOfferingSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
     def validate(self, attrs):
-        session = attrs.get("academic_session") or getattr(self.instance, "academic_session", None)
-        sem = attrs.get("semester") or getattr(self.instance, "semester", None)
-        sub = attrs.get("subject") or getattr(self.instance, "subject", None)
-        cat = attrs.get("subject_category") or getattr(self.instance, "subject_category", None)
-        creds = attrs.get("credits") or getattr(self.instance, "credits", Decimal("4.0"))
-        int_marks = attrs.get("max_marks_internal") or getattr(self.instance, "max_marks_internal", Decimal("20.00"))
-        ext_marks = attrs.get("max_marks_external") or getattr(self.instance, "max_marks_external", Decimal("80.00"))
-        pass_marks = attrs.get("pass_marks_external") or getattr(self.instance, "pass_marks_external", Decimal("28.00"))
+        # Explicit field-presence checks to ensure complete-state validation and avoid truthiness zero bypass
+        session = (
+            attrs["academic_session"]
+            if "academic_session" in attrs
+            else getattr(self.instance, "academic_session", None)
+        )
+        sem = (
+            attrs["semester"]
+            if "semester" in attrs
+            else getattr(self.instance, "semester", None)
+        )
+        sub = (
+            attrs["subject"]
+            if "subject" in attrs
+            else getattr(self.instance, "subject", None)
+        )
+        cat = (
+            attrs["subject_category"]
+            if "subject_category" in attrs
+            else getattr(self.instance, "subject_category", None)
+        )
+        creds = (
+            attrs["credits"]
+            if "credits" in attrs
+            else getattr(self.instance, "credits", Decimal("4.0"))
+        )
+        int_marks = (
+            attrs["max_marks_internal"]
+            if "max_marks_internal" in attrs
+            else getattr(self.instance, "max_marks_internal", Decimal("20.00"))
+        )
+        ext_marks = (
+            attrs["max_marks_external"]
+            if "max_marks_external" in attrs
+            else getattr(self.instance, "max_marks_external", Decimal("80.00"))
+        )
+        pass_marks = (
+            attrs["pass_marks_external"]
+            if "pass_marks_external" in attrs
+            else getattr(self.instance, "pass_marks_external", Decimal("28.00"))
+        )
 
         errors = {}
-
-        # Numeric bounds
-        if creds < Decimal("0.0"):
-            errors["credits"] = "Credits cannot be negative."
-        elif cat:
-            if creds < cat.min_credits or creds > cat.max_credits:
-                errors["credits"] = (
-                    f"Credits ({creds}) must fall within category '{cat.code}' "
-                    f"range [{cat.min_credits}, {cat.max_credits}]."
-                )
-
-        if int_marks < Decimal("0.0"):
-            errors["max_marks_internal"] = "Internal marks cannot be negative."
-        if ext_marks < Decimal("0.0"):
-            errors["max_marks_external"] = "External marks cannot be negative."
-        if pass_marks < Decimal("0.0"):
-            errors["pass_marks_external"] = "Pass marks cannot be negative."
-        elif ext_marks >= Decimal("0.0") and pass_marks > ext_marks:
-            errors["pass_marks_external"] = "Pass marks cannot exceed maximum external marks."
-
-        # Cross-college validation
-        if session and sem and sub and cat:
-            college_id = session.college_id
-            if sem.programme.college_id != college_id:
-                errors["semester"] = "Semester programme does not belong to the same college as the academic session."
-            if sub.department.college_id != college_id:
-                errors["subject"] = "Subject department does not belong to the same college as the academic session."
-            if cat.college_id != college_id:
-                errors["subject_category"] = "Subject category does not belong to the same college as the academic session."
+        if not session:
+            errors["academic_session"] = "Academic session is required."
+        if not sem:
+            errors["semester"] = "Semester is required."
+        if not sub:
+            errors["subject"] = "Subject is required."
+        if not cat:
+            errors["subject_category"] = "Subject category is required."
 
         if errors:
             raise serializers.ValidationError(errors)
+
+        try:
+            validate_paper_offering_relationships(
+                academic_session=session,
+                semester=sem,
+                subject=sub,
+                subject_category=cat,
+                credits=creds,
+                max_marks_internal=int_marks,
+                max_marks_external=ext_marks,
+                pass_marks_external=pass_marks,
+            )
+        except Exception as exc:
+            if hasattr(exc, "message_dict"):
+                raise serializers.ValidationError(exc.message_dict)
+            raise serializers.ValidationError(str(exc))
 
         return attrs
 
@@ -274,15 +351,44 @@ class PaperProgrammeMappingSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
     def validate(self, attrs):
-        paper = attrs.get("paper_offering") or getattr(self.instance, "paper_offering", None)
-        prog = attrs.get("programme") or getattr(self.instance, "programme", None)
+        paper = (
+            attrs["paper_offering"]
+            if "paper_offering" in attrs
+            else getattr(self.instance, "paper_offering", None)
+        )
+        prog = (
+            attrs["programme"]
+            if "programme" in attrs
+            else getattr(self.instance, "programme", None)
+        )
 
-        if paper and prog:
-            if paper.academic_session.college_id != prog.college_id:
-                raise serializers.ValidationError({
-                    "programme": "Programme and PaperOffering must belong to the same college institution."
-                })
+        if not paper or not prog:
+            raise serializers.ValidationError("Both paper_offering and programme are required.")
+
+        try:
+            validate_paper_programme_mapping(paper, prog)
+        except Exception as exc:
+            if hasattr(exc, "message_dict"):
+                raise serializers.ValidationError(exc.message_dict)
+            raise serializers.ValidationError(str(exc))
+
         return attrs
+
+    def create(self, validated_data):
+        mapping = super().create(validated_data)
+        paper = mapping.paper_offering
+        if not paper.is_common_paper:
+            paper.is_common_paper = True
+            paper.save(update_fields=["is_common_paper"])
+        return mapping
+
+    def update(self, instance, validated_data):
+        mapping = super().update(instance, validated_data)
+        paper = mapping.paper_offering
+        if not paper.is_common_paper:
+            paper.is_common_paper = True
+            paper.save(update_fields=["is_common_paper"])
+        return mapping
 
 
 class InstitutionalConfigSerializer(serializers.ModelSerializer):
@@ -316,15 +422,58 @@ class InstitutionalConfigSerializer(serializers.ModelSerializer):
             is_superadmin = (
                 user
                 and user.is_authenticated
-                and (user.role == RoleChoices.SUPERADMIN or user.is_superuser or user.has_role("COLLEGE_SUPERADMIN"))
+                and (
+                    user.role == RoleChoices.SUPERADMIN
+                    or user.is_superuser
+                    or (hasattr(user, "has_role") and user.has_role("COLLEGE_SUPERADMIN"))
+                )
+                and user.role != RoleChoices.STUDENT
+                and user.role != RoleChoices.FACULTY
             )
             if not is_superadmin:
                 data["config_value"] = "********"
         return data
 
     def validate(self, attrs):
-        val = attrs.get("config_value")
-        d_type = attrs.get("data_type") or getattr(self.instance, "data_type", ConfigDataType.STRING)
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
+        # Check sensitivity authorization:
+        # If existing object is sensitive OR requested sensitivity is True, require Superadmin privileges
+        existing_sensitive = getattr(self.instance, "is_sensitive", False) if self.instance else False
+        new_sensitive = (
+            attrs["is_sensitive"]
+            if "is_sensitive" in attrs
+            else existing_sensitive
+        )
+
+        if existing_sensitive or new_sensitive:
+            is_superadmin = (
+                user
+                and user.is_authenticated
+                and (
+                    user.role == RoleChoices.SUPERADMIN
+                    or user.is_superuser
+                    or (hasattr(user, "has_role") and user.has_role("COLLEGE_SUPERADMIN"))
+                )
+                and user.role != RoleChoices.STUDENT
+                and user.role != RoleChoices.FACULTY
+            )
+            if not is_superadmin:
+                raise exceptions.PermissionDenied(
+                    "Superadministrator privileges required for sensitive institutional configuration."
+                )
+
+        val = (
+            attrs["config_value"]
+            if "config_value" in attrs
+            else getattr(self.instance, "config_value", None)
+        )
+        d_type = (
+            attrs["data_type"]
+            if "data_type" in attrs
+            else getattr(self.instance, "data_type", ConfigDataType.STRING)
+        )
 
         if val is not None:
             if d_type == ConfigDataType.INTEGER:
@@ -354,3 +503,36 @@ class InstitutionalConfigSerializer(serializers.ModelSerializer):
         if request and request.user.is_authenticated:
             validated_data["updated_by"] = request.user
         return super().update(instance, validated_data)
+
+
+class MapProgrammesPayloadSerializer(serializers.Serializer):
+    """
+    Dedicated explicit serializer for POST /paper-offerings/{id}/map-programmes/ action.
+    Enforces strict boolean type validation on 'replace' and non-empty distinct integer list on 'programme_ids'.
+    """
+    programme_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        allow_empty=False,
+    )
+    replace = serializers.BooleanField(
+        required=False,
+        default=False,
+    )
+
+    def validate_programme_ids(self, value):
+        if not value:
+            raise serializers.ValidationError("programme_ids list cannot be empty.")
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("Duplicate programme IDs are not permitted in programme_ids.")
+        return value
+
+    def validate_replace(self, value):
+        raw_replace = self.initial_data.get("replace")
+        if raw_replace is not None:
+            # Genuine JSON boolean check: type(True) is bool, type(False) is bool.
+            # Reject strings like "false", "true", or numbers 0, 1.
+            if type(raw_replace) is not bool:
+                raise serializers.ValidationError(
+                    "replace must be a genuine JSON boolean (true or false), not a string or number."
+                )
+        return value

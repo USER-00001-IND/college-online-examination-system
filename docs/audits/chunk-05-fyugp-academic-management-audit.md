@@ -1,10 +1,10 @@
-# Chunk 05: FYUGP Academic Management Backend Audit Report
+# Chunk 05: FYUGP Academic Management Backend Audit Report (Round 2 Revisions)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03  
+**Date:** 2026-11-03 (Round 2 Revisions Completed)  
 **Stage:** Chunk 05 — FYUGP Academic Management  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Implementation complete, backed by 36 dedicated academic tests, 232 total passing tests, 10 cleanly skipped live Redis tests, zero failures, clean Django system checks, and strict database schema compliance; Chunk 06 onward remains strictly gated).
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Round 2 corrections complete, backed by 82 dedicated academic tests, 288 total discovered tests [278 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
 
 ---
 
@@ -138,15 +138,16 @@ All endpoints are registered under `/api/v1/academics/`:
 ### Django Test Runner (`backend/manage.py test`)
 ```bash
 $ .venv/bin/python backend/manage.py test tests --settings=config.settings.test
-Found 242 test(s).
+Found 288 test(s).
 Creating test database for alias 'default'...
 System check identified no issues (0 silenced).
 ......................................................................
 ......................................................................
 ......................................................................
+......................................................................
 ...........................ssssssssss.................................
 ----------------------------------------------------------------------
-Ran 242 tests in 3.907s
+Ran 288 tests in 4.169s
 
 OK (skipped=10)
 Destroying test database for alias 'default'...
@@ -155,11 +156,11 @@ Destroying test database for alias 'default'...
 ### Pytest Runner (`pytest`)
 ```bash
 $ .venv/bin/pytest backend/tests --ds=config.settings.test
-======================= 232 passed, 10 skipped in 4.44s =======================
+======================= 278 passed, 10 skipped in 4.72s =======================
 ```
 
-- **Total Tests Discovered:** 242 tests.
-- **Passing Tests:** 232 passed (196 Chunk 04 authentication/foundation tests + 36 Chunk 05 academic tests).
+- **Total Tests Discovered:** 288 tests.
+- **Passing Tests:** 278 passed (196 Chunk 04 authentication/foundation tests + 82 Chunk 05 academic tests).
 - **Skipped Tests:** 10 cleanly skipped (`SafeLiveRedisIntegrationTests` awaiting operator-provided disposable Redis service).
 - **Failures / Errors:** 0.
 
@@ -212,7 +213,65 @@ All 4 architectural specification documents remain strictly unmodified (`git dif
 ## 11. Gate Status & Conclusion
 
 - **Chunk 04 Status:** **APPROVED WITH WARNINGS — 2026-11-03**
-- **Chunk 05 Status:** **IN REVIEW (Implementation Completed — Awaiting Independent Audit)**
+- **Chunk 05 Status:** **IN REVIEW (Round 2 Revisions Completed — Awaiting Independent Audit)**
 - **Chunk 06 onward:** **GATED — NOT AUTHORIZED**
-- **Implementation State:** All work on Chunk 05 is complete. No Chunk 06 code has been written.
+- **Implementation State:** All Round 2 corrections on Chunk 05 are complete. No Chunk 06 code has been written.
 - **Git State:** Changes remain uncommitted in the working directory for project owner and independent audit review.
+
+---
+
+## 12. ROUND 2 — ACADEMIC DATA INTEGRITY AND AUTHORIZATION CORRECTIONS
+
+### 12.1 Independent Audit Findings Summary
+
+| Finding | Severity | Description | Resolution Status |
+| :--- | :---: | :--- | :--- |
+| **High Finding A** | **HIGH** | Truthiness-based fallback (`attrs.get(x) or getattr(inst, x)`) caused zero-valued inputs (`0`, `0.0`) during PATCH to evaluate to falsy, silently ignoring submitted zero values and bypassing model bounds and relation constraints. | **RESOLVED** — Replaced truthiness fallbacks across all academic serializers with explicit membership checks (`attrs[x] if x in attrs else getattr(...)`). Enforced complete model state validation invoking `validate_paper_offering_relationships` and service validators before database mutation. |
+| **High Finding B** | **HIGH** | Object-level permission checks did not run on `POST /institutional-configs/`, allowing ordinary administrators to create sensitive configurations (`is_sensitive: true`) and mutate sensitivity flags without superadministrator authority. | **RESOLVED** — Enforced sensitivity authorization across the entire object lifecycle in `IsInstitutionalConfigPermission` (both `has_permission` and `has_object_permission`), `InstitutionalConfigSerializer`, and `set_institutional_config` service. Ordinary admins cannot create sensitive configs, edit sensitive configs, change nonsensitive to sensitive, or downgrade sensitive to nonsensitive (HTTP 403). `is_staff=True` alone strictly denied. |
+| **Medium Finding C** | **MEDIUM** | `is_current` was writable in `AcademicSessionSerializer`, allowing multiple sessions per college to be marked current through ordinary CRUD endpoints, bypassing the dedicated switching service. | **RESOLVED** — Made `is_current` strictly read-only on `AcademicSessionSerializer` and rejected any attempt to submit `is_current` in POST, PUT, or PATCH with HTTP 400. `set_current_academic_session` service enforces row locking on `College` (`select_for_update()`) to coordinate concurrent session switches and atomically deactivates previous sessions for that college. |
+| **Medium Finding D** | **MEDIUM** | Direct CRUD on `PaperProgrammeMappingViewSet` did not enforce programme-duration coverage or `is_common_paper` consistency, producing behavioral divergence from the bulk mapping service. | **RESOLVED** — Centralized all paper-programme mapping invariants in `validate_paper_programme_mapping` (services.py). Unified validation across `PaperProgrammeMappingSerializer.validate()`, `clean()`, and `map_paper_to_programmes()`. Ensured `is_common_paper = True` is automatically maintained on creation/update. |
+| **Medium Finding E** | **MEDIUM** | `replace = bool(request.data.get("replace", False))` in `map-programmes` action performed unsafe boolean coercion (e.g. `bool("false") is True`), and broad exception handling leaked raw exception messages. | **RESOLVED** — Implemented `MapProgrammesPayloadSerializer` with explicit `type(raw_replace) is bool` validation, rejecting strings (`"false"`, `"true"`) and integers (`0`, `1`) with HTTP 400. Enforced non-empty distinct `programme_ids`. Pre-validated all programmes inside `@transaction.atomic` before deleting existing mappings. Sanitized error handling returning standardized envelopes without raw exception/SQL traces. |
+
+---
+
+### 12.2 Exact Code Locations & Structural Changes
+
+1. **`backend/apps/academics/serializers.py`:**
+   - Lines 59–85: `AcademicSessionSerializer.validate()` rejects `is_current` submissions with HTTP 400; uses explicit membership check `if "start_date" in attrs` / `if "end_date" in attrs`.
+   - Lines 124–150: `SemesterSerializer.validate()` uses explicit membership checks `if "semester_number" in attrs`; rejects 0 and out-of-bounds semester numbers.
+   - Lines 170–190: `SubjectCategorySerializer.validate()` uses explicit membership checks `if "min_credits" in attrs` / `if "max_credits" in attrs`; accepts 0.0 for min_credits and rejects max_credits < min_credits.
+   - Lines 230–285: `PaperOfferingSerializer.validate()` uses explicit membership checks for all numeric and relational attributes; invokes `validate_paper_offering_relationships` on complete resolved state, converting `ValidationError` to DRF validation errors.
+   - Lines 300–345: `PaperProgrammeMappingSerializer.validate()` calls centralized `validate_paper_programme_mapping(paper, prog)`; `create()` and `update()` ensure `is_common_paper = True`.
+   - Lines 370–425: `InstitutionalConfigSerializer.validate()` enforces superadministrator check whenever existing or requested `is_sensitive` is True, raising `PermissionDenied` (HTTP 403) for non-superadmins.
+   - Lines 445–475: Added `MapProgrammesPayloadSerializer` enforcing `type(raw_replace) is bool` and duplicate-free positive integer list for `programme_ids`.
+2. **`backend/apps/academics/services.py`:**
+   - Lines 35–48: `set_current_academic_session` acquires exclusive `select_for_update()` row lock on `College`.
+   - Lines 160–185: Added centralized `validate_paper_programme_mapping(paper_offering, programme)`.
+   - Lines 188–225: `map_paper_to_programmes` pre-validates all programmes before modifying or deleting any mappings, within `transaction.atomic()`.
+   - Lines 230–280: `set_institutional_config` checks superadmin permissions when `is_sensitive` is True.
+3. **`backend/apps/academics/permissions.py`:**
+   - Lines 40–90: `IsInstitutionalConfigPermission` enforces superadmin check in `has_permission` on POST when `is_sensitive: true` is requested, and in `has_object_permission` on PUT/PATCH/DELETE when existing or requested `is_sensitive` is True.
+4. **`backend/apps/academics/views.py`:**
+   - Lines 76–90: `AcademicSessionViewSet.set_current` catches `ValidationError` and returns standardized HTTP 400.
+   - Lines 145–215: `PaperOfferingViewSet.map_programmes` validates payload using `MapProgrammesPayloadSerializer`, catches `ValidationError`, logs sanitized unexpected errors, and returns clean envelopes.
+5. **`backend/apps/academics/models.py`:**
+   - Lines 445–465: `PaperProgrammeMapping.clean()` verifies programme duration covers offering semester number.
+6. **`backend/tests/test_academics.py`:**
+   - Added 5 dedicated regression test suites (46 new tests), bringing total academic tests to 82.
+
+---
+
+### 12.3 Regression Test Coverage Summary
+
+| Test Class | Tests Added | Scope Verified |
+| :--- | :---: | :--- |
+| `ZeroValuedPatchValidationRegressionTests` | 11 | Zero-valued PATCH updates on `max_marks_external`, `max_marks_internal`, `pass_marks_external`, `credits`, `min_credits`, `max_credits`; rejection of `max_marks_external=0` when `pass_marks_external>0`; acceptance of `0` when valid; omitted fields preservation; cross-college patch rejections. |
+| `SensitiveInstitutionalConfigAuthorizationRegressionTests` | 13 | Ordinary admin cannot create sensitive configs (HTTP 403); superadmin can create sensitive configs (HTTP 201); admin cannot change nonsensitive to sensitive (HTTP 403); admin cannot downgrade sensitive to nonsensitive (HTTP 403); admin cannot edit or delete sensitive configs (HTTP 403); superadmin can edit sensitive configs (HTTP 200); student/faculty with `is_staff=True` denied (HTTP 403); sensitive values remain unexposed. |
+| `AcademicSessionCurrentStateIntegrityRegressionTests` | 8 | Ordinary POST with `is_current=True` rejected (HTTP 400); ordinary PATCH with `is_current=True`/`False` rejected (HTTP 400); new sessions default to `is_current=False`; dedicated `set-current` action atomically switches sessions under row lock; only 1 session current per college; other colleges unaffected. |
+| `PaperProgrammeMappingIntegrityRegressionTests` | 4 | Direct POST enforces same-college rule and duration coverage; short programmes (< semester) rejected (HTTP 400); direct PATCH enforces same rules; direct mapping creation sets `is_common_paper = True`. |
+| `MapProgrammesReplaceBooleanAndExceptionSafetyRegressionTests` | 10 | `replace: false` retains existing mappings; `replace: true` replaces mappings; `"replace": "false"`, `"replace": "true"`, `0`, `1` rejected (HTTP 400) without deleting mappings; empty/duplicate/unknown/cross-college programme IDs rejected; transaction failure preserves existing mappings; sanitized error responses. |
+
+- **Total New Regression Tests Added in Round 2:** 46 tests.
+- **Total Academic Tests:** 82 tests (all passed).
+- **Total Test Suite:** 288 tests discovered, 278 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+

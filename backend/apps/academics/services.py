@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Iterable, List, Optional
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from rest_framework.exceptions import PermissionDenied
 
 from apps.academics.models import (
     AcademicSession,
@@ -21,6 +22,7 @@ from apps.academics.models import (
     Subject,
     SubjectCategory,
 )
+from apps.accounts.models import RoleChoices
 
 
 def validate_academic_session_dates(start_date, end_date) -> None:
@@ -36,11 +38,16 @@ def set_current_academic_session(college: College, session: AcademicSession) -> 
     """
     Atomically designates a session as current for a college, clearing current status
     from any other sessions in that college.
+    Acquires an exclusive row lock on the College record to serialize concurrent switches.
     """
-    if session.college_id != college.id:
+    # Exclusively lock the College record to coordinate concurrent session activation under MySQL InnoDB
+    locked_college = College.objects.select_for_update().get(pk=college.pk)
+
+    if session.college_id != locked_college.pk:
         raise ValidationError({"session": "Session does not belong to the specified college."})
 
-    AcademicSession.objects.filter(college=college, is_current=True).exclude(pk=session.pk).update(is_current=False)
+    # Clear current flag on any other sessions of this college
+    AcademicSession.objects.filter(college=locked_college, is_current=True).exclude(pk=session.pk).update(is_current=False)
     session.is_current = True
     session.save(update_fields=["is_current"])
     return session
@@ -151,6 +158,31 @@ def create_paper_offering(
     return offering
 
 
+def validate_paper_programme_mapping(paper_offering: PaperOffering, programme: Programme) -> None:
+    """
+    Centralized validation of paper-programme mapping invariants:
+    1. Cross-college isolation: Programme and PaperOffering must belong to the same College.
+    2. Duration coverage: Programme duration must be >= semester number of the PaperOffering.
+    """
+    college_id = paper_offering.academic_session.college_id
+    if programme.college_id != college_id:
+        raise ValidationError({
+            "programme": (
+                f"Programme '{programme.code}' (College ID {programme.college_id}) belongs to a "
+                f"different college than PaperOffering '{paper_offering.paper_code}' (College ID {college_id})."
+            )
+        })
+
+    sem_num = paper_offering.semester.semester_number
+    if programme.duration_semesters < sem_num:
+        raise ValidationError({
+            "programme": (
+                f"Programme '{programme.code}' duration ({programme.duration_semesters} sem) does not "
+                f"cover offering semester ({sem_num})."
+            )
+        })
+
+
 @transaction.atomic
 def map_paper_to_programmes(
     paper_offering: PaperOffering,
@@ -161,30 +193,23 @@ def map_paper_to_programmes(
     """
     Maps a common paper offering to multiple eligible degree programmes.
     Ensures:
-    1. Cross-college isolation: All programmes must belong to paper_offering's college.
-    2. Duration validation: Programme duration must be >= semester number of the offering.
-    3. is_common_paper flag is maintained.
+    1. All programmes pre-validated BEFORE modifying any database records.
+    2. Cross-college isolation and duration coverage verified via validate_paper_programme_mapping.
+    3. Transaction atomicity: failed replacement preserves existing mappings.
+    4. is_common_paper flag is maintained.
     """
-    college_id = paper_offering.academic_session.college_id
-    mappings = []
+    prog_list = list(programmes)
+
+    # Pre-validate all programmes before performing any deletions or mutations
+    for prog in prog_list:
+        validate_paper_programme_mapping(paper_offering, prog)
 
     if replace:
         PaperProgrammeMapping.objects.filter(paper_offering=paper_offering).delete()
 
-    for prog in programmes:
-        if prog.college_id != college_id:
-            raise ValidationError({
-                "programmes": f"Programme '{prog.code}' belongs to a different college institution."
-            })
-        if prog.duration_semesters < paper_offering.semester.semester_number:
-            raise ValidationError({
-                "programmes": (
-                    f"Programme '{prog.code}' duration ({prog.duration_semesters} sem) does not "
-                    f"cover offering semester ({paper_offering.semester.semester_number})."
-                )
-            })
-
-        mapping, created = PaperProgrammeMapping.objects.get_or_create(
+    mappings = []
+    for prog in prog_list:
+        mapping, _ = PaperProgrammeMapping.objects.get_or_create(
             paper_offering=paper_offering,
             programme=prog,
         )
@@ -208,22 +233,34 @@ def set_institutional_config(
     is_sensitive: bool = False,
     description: Optional[str] = None,
     user=None,
+    enforce_authorization: bool = True,
 ) -> InstitutionalConfig:
     """
-    Creates or updates an institutional configuration key with type validation.
+    Creates or updates an institutional configuration key with type validation and RBAC checks.
     """
-    config, _ = InstitutionalConfig.objects.get_or_create(
-        college=college,
-        config_key=config_key.strip(),
-        defaults={
-            "config_value": config_value,
-            "data_type": data_type,
-            "is_sensitive": is_sensitive,
-            "description": description,
-            "updated_by": user if (user and user.is_authenticated) else None,
-        },
-    )
-    if not _:
+    key_clean = config_key.strip()
+    existing = InstitutionalConfig.objects.filter(college=college, config_key=key_clean).first()
+    existing_sensitive = existing.is_sensitive if existing else False
+
+    if enforce_authorization and user is not None:
+        if is_sensitive or existing_sensitive:
+            is_superadmin = (
+                user.is_authenticated
+                and (
+                    user.role == RoleChoices.SUPERADMIN
+                    or user.is_superuser
+                    or (hasattr(user, "has_role") and user.has_role("COLLEGE_SUPERADMIN"))
+                )
+                and user.role != RoleChoices.STUDENT
+                and user.role != RoleChoices.FACULTY
+            )
+            if not is_superadmin:
+                raise PermissionDenied(
+                    "Superadministrator privileges required for sensitive institutional configuration."
+                )
+
+    if existing:
+        config = existing
         config.config_value = config_value
         config.data_type = data_type
         config.is_sensitive = is_sensitive
@@ -231,6 +268,16 @@ def set_institutional_config(
             config.description = description
         if user and user.is_authenticated:
             config.updated_by = user
+    else:
+        config = InstitutionalConfig(
+            college=college,
+            config_key=key_clean,
+            config_value=config_value,
+            data_type=data_type,
+            is_sensitive=is_sensitive,
+            description=description,
+            updated_by=user if (user and user.is_authenticated) else None,
+        )
 
     config.full_clean()
     config.save()
