@@ -1,11 +1,11 @@
-# Chunk 04: Authentication and Roles Audit Report (Round 5 Throttle Counter Integrity & Safe Redis Testing)
+# Chunk 04: Authentication and Roles Audit Report (Round 6 Redis Test Isolation & Response Contract)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 5 Revision)  
+**Date:** 2026-11-03 (Round 6 Revision)  
 **Stage:** Chunk 04 — Authentication and Roles  
-**Last Audited Commit:** `12b79dfa42d8852d6d8d14878a0c6352bf45328c`  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 3 Round 5 findings [2 HIGH, 1 LOW] have been resolved, verified, and backed by 159 passing automated tests and 1 cleanly skipped live-redis integration test; Chunk 05 onward remains strictly gated).
+**Last Audited Commit:** `d77b1948e258e953a6ce8cf4cf2df59e2f6ac28e`  
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 3 Round 6 findings [2 HIGH, 1 MEDIUM] have been resolved, verified, and backed by 192 passing automated tests and 10 cleanly skipped live-redis integration tests; Chunk 05 onward remains strictly gated).
 
 ---
 
@@ -845,31 +845,216 @@ The four protected architectural documents remain completely unmodified and veri
 
 ---
 
-## 14. Verification and Test Results Summary
+## 15. ROUND 6 — REDIS TEST ISOLATION AND RESPONSE CONTRACT CORRECTIONS
 
+### 15.1 Audit Findings & Context
+During the independent Chunk 04 Round 5 audit (commit `d77b1948e258e953a6ce8cf4cf2df59e2f6ac28e`), three findings were identified:
+1. **Finding A (HIGH): Redis Test Keys Are Not Isolated:** `SafeLiveRedisIntegrationTests` generated a unique namespace string (`self.test_namespace`), but never applied it to the throttle keys before executing the Lua script. The rate limiter continued writing standard unnamespaced keys (`auth_throttle:ip:...`, `auth_throttle:target:...`), and compound target keys were untracked. Teardown checked `k.startswith(self.test_namespace)`, so test keys were never deleted.
+2. **Finding B (HIGH): Unsafe Redis Test Endpoint Selection & Suppressed Cleanup Errors:** The test safety gate checked if `TEST_REDIS_URL` matched `REDIS_URL` only when `ENVIRONMENT_NAME == 'production'`, which is ineffective because automated test suites run under `ENVIRONMENT_NAME == 'test'`. Furthermore, `tearDown()` caught all exceptions and silently suppressed them (`except Exception: pass`), concealing sentinel-integrity assertion failures and deletion errors.
+3. **Finding C (MEDIUM): Contradictory Redis Lua Responses Accepted:** `AuthenticationThrottle.acquire_admission()` checked the admission flag and reason code independently, permitting contradictory responses such as `[1, 0, b'IP_LIMIT']` (admitted with denial reason) or `[0, 300, b'ADMITTED']` (denied with admission reason) to authorize requests or corrupt state.
+
+---
+
+### 15.2 Root Causes & Exact Code Corrections
+
+| Finding ID | Severity | Root Cause | Code Corrections Applied |
+| :--- | :--- | :--- | :--- |
+| **Finding A** | **HIGH** | `AuthenticationThrottle` had no mechanism to accept or apply an isolated key namespace, writing default keys directly. | Added `key_prefix: Optional[str] = None` and `key_builder: Optional[Callable[[str, str], str]] = None` parameters to `AuthenticationThrottle.__init__`. Implemented `build_effective_key()` and `get_effective_keys()` ensuring both IP and compound target keys incorporate the test namespace before Lua evaluation. In `SafeLiveRedisIntegrationTests`, all effective keys are tracked in `self.tracked_keys` and deleted during teardown. |
+| **Finding B** | **HIGH** | Endpoint safety check relied on `ENVIRONMENT_NAME == 'production'`; teardown swallowed assertion failures. | Implemented `canonicalize_redis_endpoint()` and `validate_test_redis_safety()`, checking `TEST_REDIS_URL` against all application Redis/cache endpoints regardless of `ENVIRONMENT_NAME`. Required 3-factor gate (`RUN_REDIS_INTEGRATION_TESTS=1`, nonempty `TEST_REDIS_URL`, `TEST_REDIS_DISPOSABLE=YES`). Refactored `tearDown()` to verify sentinel integrity without exception suppression and collect cleanup failures with visible `self.fail()`. |
+| **Finding C** | **MEDIUM** | Admission flag and reason were decoded independently without coherent contract validation. | Implemented `validate_and_decode_redis_response()` strictly enforcing the coherent 3-tuple contract: Admitted `[1, 0, 'ADMITTED']`, IP limit `[0, 1 <= TTL <= max_ttl, 'IP_LIMIT']`, Target limit `[0, 1 <= TTL <= max_ttl, 'TARGET_LIMIT']`. Any contradictory, malformed, or out-of-bounds response raises `ThrottleBackendError`, failing closed to HTTP 503 with zero password checks. |
+
+---
+
+### 15.3 Key Namespace Design & Lifecycle (Finding A)
+
+1. **Namespace Generation:** In `SafeLiveRedisIntegrationTests.setUp()`, a per-run random UUID generates an isolated namespace:
+   ```python
+   self.test_run_id = uuid.uuid4().hex[:12]
+   self.test_namespace = f"test_throttle:{self.test_run_id}:"
+   ```
+2. **Namespace Injection:** The test instantiates `AuthenticationThrottle(key_prefix=self.test_namespace, ...)`. No global settings or environment variables are introduced for key prefixing, preserving production integrity.
+3. **Effective Key Construction:**
+   - IP key: `test_throttle:<run_id>:auth_throttle:ip:<sha256_ip>`
+   - Target key: `test_throttle:<run_id>:auth_throttle:target:<sha256_compound>`
+4. **Key Tracking:** Tests obtain exact effective keys via `throttle.get_effective_keys(ip, identifier)` and record them into `self.tracked_keys`.
+5. **Atomic Execution:** `redis_client.eval(REDIS_CHECK_AND_RESERVE_LUA, 2, effective_ip_key, effective_target_key, ...)` executes against only the namespaced keys.
+6. **Validated Cleanup:** In `tearDown()`, every key in `self.tracked_keys` is validated:
+   ```python
+   for k in list(self.tracked_keys):
+       if self.test_namespace in k:
+           self.r.delete(k)
+       else:
+           cleanup_errors.append(f"Refusing to delete key '{k}' outside namespace")
+   ```
+   Unrelated application keys are never touched.
+
+---
+
+### 15.4 Redis Test Endpoint Safety Checks (Finding B)
+
+1. **Three-Factor Configuration Gate:**
+   - `RUN_REDIS_INTEGRATION_TESTS=1` (explicit test execution opt-in)
+   - `TEST_REDIS_URL` (nonempty, valid connection URL)
+   - `TEST_REDIS_DISPOSABLE=YES` (operator acknowledgment that target Redis is isolated and disposable)
+   - If any factor is absent, tests skip cleanly before making any connection.
+2. **Endpoint Canonicalization (`canonicalize_redis_endpoint`):**
+   - Normalizes loopback representations (`localhost`, `127.0.0.1`, `::1` $\to$ `127.0.0.1`).
+   - Resolves default port `6379` and default DB `0`.
+   - Parses Unix domain sockets (`unix:///path/to/sock?db=0`).
+   - Normalizes URLs: `(scheme, canonical_host, port, db)`.
+3. **Collision Detection (`validate_test_redis_safety`):**
+   - Collects all application Redis URLs from `REDIS_URL`, `CACHE_URL`, `settings.REDIS_URL`, and `settings.CACHES['default']['LOCATION']`.
+   - Compares the canonical `(host, port, db)` of the proposed `TEST_REDIS_URL` against every application endpoint.
+   - Rejects collisions immediately, even when running under `config.settings.test`.
+4. **Credential Sanitization (`sanitize_redis_url`):**
+   - Masks usernames and passwords (`redis://***:***@host:port/db`) in error messages, skip messages, and logs.
+5. **Sentinel-Integrity Verification:**
+   - Writes `sentinel:system_data:<uuid>` with payload `b"CRITICAL_SHARED_DATABASE_DATA_PRESERVED"` before test execution.
+   - In `tearDown()`, asserts that the sentinel value was neither deleted nor modified.
+   - Sentinel integrity failures raise visible `AssertionError` and are never swallowed.
+6. **Cleanup Failure Reporting:**
+   - Deletion errors are collected and reported via `self.fail()`.
+
+---
+
+### 15.5 Coherent Redis Lua Response Contract (Finding C)
+
+The Redis Lua response contract in `apps.accounts.throttling.validate_and_decode_redis_response` enforces strict coherence:
+
+| Admission Flag | TTL | Reason Code | Contract Decision |
+| :--- | :--- | :--- | :--- |
+| `1` | `0` | `'ADMITTED'` | **Accepted** (Admitted) |
+| `0` | $1 \le \text{TTL} \le \text{max\_ttl}$ | `'IP_LIMIT'` | **Accepted** (Denied on IP limit) |
+| `0` | $1 \le \text{TTL} \le \text{max\_ttl}$ | `'TARGET_LIMIT'` | **Accepted** (Denied on Target limit) |
+| `1` | `0` | `'IP_LIMIT'` / `'TARGET_LIMIT'` | **REJECTED** (Contradictory: Admitted with denial reason) |
+| `0` | $> 0$ | `'ADMITTED'` | **REJECTED** (Contradictory: Denied with admission reason) |
+| `1` | $> 0$ | `'ADMITTED'` | **REJECTED** (Contradictory: Admitted with nonzero TTL) |
+| `0` | $\le 0$ | `'IP_LIMIT'` / `'TARGET_LIMIT'` | **REJECTED** (Contradictory: Denied with non-positive TTL) |
+| `0` | $> \text{max\_ttl}$ | Any | **REJECTED** (TTL exceeds maximum allowable bound) |
+| Non-boolean/0/1 | Any | Any | **REJECTED** (Invalid admission flag) |
+| Length $\ne 3$ | Any | Any | **REJECTED** (Invalid response structure) |
+| Non-UTF-8 bytes | Any | Any | **REJECTED** (Undecodable bulk string) |
+| Unrecognized | Any | Any | **REJECTED** (Unknown reason code) |
+
+When any contract violation occurs:
+- A structured critical log is emitted: `college.accounts.throttling: Authentication throttle backend failure [category=...]`.
+- `ThrottleBackendError` is raised.
+- `LoginView` catches the error, fails closed, and returns HTTP 503 `SERVICE_UNAVAILABLE`.
+- Password verification (`check_password`) and session creation are bypassed.
+
+---
+
+### 15.6 New Regression Tests Added in Round 6
+
+1. **`RedisResponseContractTests` (20 tests in `backend/tests/test_throttling.py`):**
+   - Valid admitted response succeeds.
+   - Valid IP limit response is denied with retry-after.
+   - Valid target limit response is denied with retry-after.
+   - Bytes and string reason codes both supported and decoded.
+   - Admission with `IP_LIMIT` rejected.
+   - Admission with `TARGET_LIMIT` rejected.
+   - Denial with `ADMITTED` rejected.
+   - Admission with nonzero TTL rejected.
+   - Denial with zero TTL rejected.
+   - Denial with negative TTL rejected.
+   - Oversized TTL rejected.
+   - Non-integer / boolean / string admission flags rejected.
+   - Response length $\ne 3$ rejected.
+   - Non-sequence response types rejected.
+   - Undecodable bytes rejected.
+   - Unknown reason codes rejected.
+   - Boolean TTL values rejected.
+   - Contradictory responses return HTTP 503 in `LoginView`.
+   - Password checking and session creation skipped on contract violation.
+2. **`RedisKeyIsolationTests` (9 tests in `backend/tests/test_throttling.py`):**
+   - Keys have unique injected test namespace.
+   - IP and compound target keys are both namespaced.
+   - Generated keys match keys passed to Redis `eval`.
+   - Cleanup removes every test-generated key.
+   - Unrelated sentinel keys remain unchanged.
+   - Two separate test runs with different namespaces cannot collide.
+   - Concurrent requests sharing the same test namespace share counters.
+   - Normal production key naming is unchanged.
+   - Injected custom `key_builder` is delegated to construct effective keys.
+3. **`RedisEndpointSafetyTests` (13 tests in `backend/tests/test_throttling.py`):**
+   - Missing opt-in (`RUN_REDIS_INTEGRATION_TESTS != '1'`) skips.
+   - Missing test URL skips.
+   - Missing disposable acknowledgment (`TEST_REDIS_DISPOSABLE != 'YES'`) skips.
+   - Same test and application endpoint rejected regardless of `ENVIRONMENT_NAME`.
+   - Textually different but equivalent URLs (localhost vs 127.0.0.1 default DB) rejected.
+   - Unsupported URL schemes rejected.
+   - Malformed/ambiguous URLs rejected.
+   - Credential-bearing URLs sanitized in logs and messages.
+   - No Redis connection attempted before safety checks pass.
+   - Sentinel modification causes visible test failure with `AssertionError`.
+   - Cleanup failure reported with visible failure.
+   - Unrelated keys without test namespace are preserved (refused deletion).
+   - Tracked keys matching test namespace are cleanly deleted.
+4. **`RedisIntegrationSafetyGuardTests` (4 tests in `backend/tests/test_throttling.py`):**
+   - Opt-in enforcement, test URL requirement, disposable acknowledgment check.
+   - AST and string inspection confirming zero occurrences of `flushdb` or `flushall`.
+5. **`SafeLiveRedisIntegrationTests` (10 live cases in `backend/tests/test_throttling.py`):**
+   - Case 1: 30 concurrent requests with IP limit 15.
+   - Case 2: 20 concurrent requests with target limit 5.
+   - Case 3: Multiple limiter instances sharing Redis.
+   - Case 4: Last-slot concurrency race between 10 threads.
+   - Case 5: Fixed-window TTL expiration.
+   - Case 6: Correct bytes response decoding.
+   - Case 7: Backend outage handling fails closed.
+   - Case 8: Isolated key creation and tracked cleanup.
+   - Case 9: Sentinel preservation throughout burst.
+   - Case 10: Zero-reset counter policy under live Redis.
+
+---
+
+### 15.7 Live Redis Integration Execution Status
+
+```
+REAL REDIS INTEGRATION: NOT EXECUTED — Explicit opt-in RUN_REDIS_INTEGRATION_TESTS=1 required to execute live Redis integration tests.
+```
+
+In strict adherence to verification standards, live Redis integration tests were cleanly skipped during local test execution because the automated test environment operates on an in-memory test cache without a dedicated disposable Redis instance. All 10 live test cases reported as cleanly skipped (`OK (skipped=10)`).
+
+---
+
+### 15.8 Remaining Risks and Limitations
+
+1. **Live Redis Verification Gate:** While all 10 live Redis concurrency cases are fully coded with non-destructive UUID namespacing and sentinel preservation, their live execution requires a running disposable Redis instance with `RUN_REDIS_INTEGRATION_TESTS=1`, `TEST_REDIS_URL`, and `TEST_REDIS_DISPOSABLE=YES`.
+2. **Reverse Proxy Trust Boundary:** Enforcement of trusted client IP and HTTPS headers remains dependent on production Nginx deployment configuration (documented in `backend/README.md`).
+3. **Chunk 05 Gating:** All academic management, question management, live examination, and frontend modules remain gated until independent GitHub review and explicit owner approval.
+
+---
+
+## 16. Verification and Test Results Summary
+
+### Django Test Runner (`backend/manage.py test`)
 ```bash
 $ .venv/bin/python backend/manage.py test tests --settings=config.settings.test
-Found 160 test(s).
+Found 202 test(s).
 Creating test database for alias 'default'...
 System check identified no issues (0 silenced).
-...............................................................................................................................................................s
+...............................................................................
+...............................................................................
+......................................ssssssssss..
 ----------------------------------------------------------------------
-Ran 160 tests in 3.975s
+Ran 202 tests in 4.432s
 
-OK (skipped=1)
+OK (skipped=10)
 Destroying test database for alias 'default'...
 ```
 
+### Pytest Runner (`pytest`)
 ```bash
 $ .venv/bin/pytest backend/tests --ds=config.settings.test
-======================== 159 passed, 1 skipped in 4.99s ========================
+======================= 192 passed, 10 skipped in 5.39s =======================
 ```
 
 - **Django Development Check:** `System check identified no issues (0 silenced).`
 - **Django Migration Dry-Run:** `No changes detected.`
 - **Django Production Deploy Check:** `System check identified no issues (0 silenced).`
-- **Protected Files Integrity:** All 4 protected documents remain strictly unmodified.
+- **Protected Files Integrity:** All 4 protected documents remain strictly unmodified (`git diff --exit-code`: 0).
 - **Stage Gating:** Chunk 04 is in `IN REVIEW` status. Chunk 05 onward remains strictly gated.
+
 
 
 

@@ -16,6 +16,9 @@ from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.test import Client, RequestFactory, TestCase, override_settings
 from django.urls import reverse
+import ast
+import math
+import uuid
 from rest_framework import status
 from rest_framework.test import APIRequestFactory
 
@@ -23,9 +26,14 @@ from apps.accounts.models import RoleChoices, User
 from apps.accounts.throttling import (
     AuthenticationThrottle,
     ThrottleBackendError,
+    AdmissionResult,
     _hash_throttle_key,
     _local_throttle_lock,
     _make_effective_cache_key,
+    canonicalize_redis_endpoint,
+    sanitize_redis_url,
+    validate_test_redis_safety,
+    validate_and_decode_redis_response,
     REDIS_CHECK_AND_RESERVE_LUA,
 )
 from apps.accounts.views import LoginView
@@ -507,8 +515,11 @@ class MockRedisClient:
                 return -2
             if key not in self._expires:
                 return -1
-            rem = int(self._expires[key] - time.time())
-            return max(0, rem)
+            rem = self._expires[key] - time.time()
+            if rem <= 0:
+                self._purge_expired(key)
+                return -2
+            return max(1, int(math.ceil(rem)))
 
     def set(self, key, value, ex=None):
         with self._lock:
@@ -548,13 +559,13 @@ class MockRedisClient:
 
             if ip_count >= ip_limit:
                 ttl_val = self.ttl(ip_key)
-                if ttl_val < 0:
+                if ttl_val <= 0:
                     ttl_val = ip_window
                 return [0, ttl_val, b'IP_LIMIT']
 
             if target_count >= target_limit:
                 ttl_val = self.ttl(target_key)
-                if ttl_val < 0:
+                if ttl_val <= 0:
                     ttl_val = target_window
                 return [0, ttl_val, b'TARGET_LIMIT']
 
@@ -995,20 +1006,22 @@ class NoResetAdmissionIntegrityRegressionTests(TestCase):
         self.assertEqual(res_blocked.reason, 'TARGET_LIMIT')
 
 
-class RedisResponseDecodingTests(TestCase):
+class RedisResponseContractTests(TestCase):
     """
-    Verifies Low Finding C:
-    Strict decoding and validation of Redis responses.
-    Ensures bulk bytes strings (b'ADMITTED', b'IP_LIMIT', b'TARGET_LIMIT') are decoded
-    to Python strings, unexpected reason codes are rejected, and malformed responses fail closed.
+    Verifies Finding C (Medium): Strict Redis Lua Response Contract.
+    The response is validated as one coherent contract:
+    - Admitted [1, 0, 'ADMITTED']
+    - Denied IP [0, 1 <= TTL <= max_ttl, 'IP_LIMIT']
+    - Denied Target [0, 1 <= TTL <= max_ttl, 'TARGET_LIMIT']
+    Contradictory, malformed, or out-of-bounds responses fail closed with ThrottleBackendError.
     """
 
     def setUp(self):
-        self.throttle = AuthenticationThrottle()
+        self.throttle = AuthenticationThrottle(ip_limit=15, ip_window=300, target_limit=5, target_window=300)
         self.rf = APIRequestFactory()
 
-    def test_bytes_admitted_decoded_to_str(self):
-        """Verify b'ADMITTED' is decoded to string 'ADMITTED'."""
+    def test_valid_admitted_response_succeeds(self):
+        """Verify valid admitted response [1, 0, b'ADMITTED'] succeeds."""
         mock_client = MagicMock()
         mock_client.eval.return_value = [1, 0, b'ADMITTED']
 
@@ -1017,34 +1030,31 @@ class RedisResponseDecodingTests(TestCase):
             self.assertTrue(res.admitted)
             self.assertEqual(res.retry_after, 0)
             self.assertEqual(res.reason, 'ADMITTED')
-            self.assertIsInstance(res.reason, str)
 
-    def test_bytes_ip_limit_decoded_to_str(self):
-        """Verify b'IP_LIMIT' is decoded to string 'IP_LIMIT'."""
+    def test_valid_ip_limit_response_denied(self):
+        """Verify valid IP limit response [0, 120, b'IP_LIMIT'] is denied with retry-after."""
         mock_client = MagicMock()
-        mock_client.eval.return_value = [0, 180, b'IP_LIMIT']
+        mock_client.eval.return_value = [0, 120, b'IP_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            res = self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertFalse(res.admitted)
+            self.assertEqual(res.retry_after, 120)
+            self.assertEqual(res.reason, 'IP_LIMIT')
+
+    def test_valid_target_limit_response_denied(self):
+        """Verify valid target limit response [0, 180, b'TARGET_LIMIT'] is denied with retry-after."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 180, b'TARGET_LIMIT']
 
         with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
             res = self.throttle.acquire_admission('10.0.0.1', 'user')
             self.assertFalse(res.admitted)
             self.assertEqual(res.retry_after, 180)
-            self.assertEqual(res.reason, 'IP_LIMIT')
-            self.assertIsInstance(res.reason, str)
-
-    def test_bytes_target_limit_decoded_to_str(self):
-        """Verify b'TARGET_LIMIT' is decoded to string 'TARGET_LIMIT'."""
-        mock_client = MagicMock()
-        mock_client.eval.return_value = [0, 240, b'TARGET_LIMIT']
-
-        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
-            res = self.throttle.acquire_admission('10.0.0.1', 'user')
-            self.assertFalse(res.admitted)
-            self.assertEqual(res.retry_after, 240)
             self.assertEqual(res.reason, 'TARGET_LIMIT')
-            self.assertIsInstance(res.reason, str)
 
-    def test_string_responses_supported(self):
-        """Verify plain string responses continue to work seamlessly."""
+    def test_bytes_and_string_reasons_both_supported(self):
+        """Verify both bytes and decoded strings are properly accepted and normalized."""
         mock_client = MagicMock()
         mock_client.eval.return_value = [1, 0, 'ADMITTED']
 
@@ -1053,60 +1063,158 @@ class RedisResponseDecodingTests(TestCase):
             self.assertTrue(res.admitted)
             self.assertEqual(res.reason, 'ADMITTED')
 
-    def test_unexpected_reason_code_rejected(self):
-        """Verify unexpected reason codes raise ThrottleBackendError."""
+    def test_admission_with_ip_limit_reason_rejected(self):
+        """Verify contradictory response: admitted with IP_LIMIT denial reason raises ThrottleBackendError."""
         mock_client = MagicMock()
-        mock_client.eval.return_value = [1, 0, b'UNKNOWN_REASON_CODE']
+        mock_client.eval.return_value = [1, 0, b'IP_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("Contradictory throttle response", str(ctx.exception))
+
+    def test_admission_with_target_limit_reason_rejected(self):
+        """Verify contradictory response: admitted with TARGET_LIMIT denial reason raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 0, b'TARGET_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("Contradictory throttle response", str(ctx.exception))
+
+    def test_denial_with_admitted_reason_rejected(self):
+        """Verify contradictory response: denied with ADMITTED reason raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 60, b'ADMITTED']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("Contradictory throttle response", str(ctx.exception))
+
+    def test_admission_with_nonzero_ttl_rejected(self):
+        """Verify contradictory response: admitted with nonzero TTL raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [1, 15, b'ADMITTED']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("nonzero TTL", str(ctx.exception))
+
+    def test_denial_with_zero_ttl_rejected(self):
+        """Verify contradictory response: denied with zero TTL raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 0, b'IP_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("non-positive TTL", str(ctx.exception))
+
+    def test_denial_with_negative_ttl_rejected(self):
+        """Verify contradictory response: denied with negative TTL raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, -5, b'TARGET_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("non-positive TTL", str(ctx.exception))
+
+    def test_oversized_ttl_rejected(self):
+        """Verify unexpectedly large TTL exceeding max_ttl bound raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 999999, b'IP_LIMIT']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("exceeds maximum allowable bound", str(ctx.exception))
+
+    def test_invalid_admission_flag_rejected(self):
+        """Verify invalid admission flag (non-0/1 integer) raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [2, 0, b'ADMITTED']
+
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("Invalid throttle admission flag", str(ctx.exception))
+
+    def test_string_admission_flag_rejected(self):
+        """Verify non-integer admission flag (string 'true') raises ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = ['true', 0, b'ADMITTED']
 
         with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
             with self.assertRaises(ThrottleBackendError):
                 self.throttle.acquire_admission('10.0.0.1', 'user')
 
     def test_invalid_response_length_rejected(self):
-        """Verify truncated response tuples raise ThrottleBackendError."""
+        """Verify response sequences of invalid length (<3 or >3) raise ThrottleBackendError."""
         mock_client = MagicMock()
-        mock_client.eval.return_value = [1, 0]  # Missing reason
+        with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
+            # Length 2
+            mock_client.eval.return_value = [1, 0]
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("length", str(ctx.exception))
+
+            # Length 4
+            mock_client.eval.return_value = [1, 0, b'ADMITTED', 'EXTRA_PAYLOAD']
+            with self.assertRaises(ThrottleBackendError) as ctx:
+                self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("length", str(ctx.exception))
+
+    def test_invalid_response_type_rejected(self):
+        """Verify non-sequence responses raise ThrottleBackendError."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = "NOT_A_LIST"
 
         with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
             with self.assertRaises(ThrottleBackendError):
                 self.throttle.acquire_admission('10.0.0.1', 'user')
 
-    def test_malformed_admission_flag_rejected(self):
-        """Verify non-boolean admission flag raises ThrottleBackendError."""
+    def test_invalid_bytes_rejected(self):
+        """Verify invalid UTF-8 byte sequences raise ThrottleBackendError."""
         mock_client = MagicMock()
-        mock_client.eval.return_value = ['YES_ADMITTED', 0, b'ADMITTED']
+        mock_client.eval.return_value = [1, 0, b'\xff\xfe\xfd']
 
         with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
             with self.assertRaises(ThrottleBackendError):
                 self.throttle.acquire_admission('10.0.0.1', 'user')
 
-    def test_malformed_ttl_rejected(self):
-        """Verify non-integer TTL raises ThrottleBackendError."""
+    def test_invalid_reason_code_rejected(self):
+        """Verify unknown reason code raises ThrottleBackendError."""
         mock_client = MagicMock()
-        mock_client.eval.return_value = [0, 'not_an_int', b'IP_LIMIT']
+        mock_client.eval.return_value = [0, 60, b'UNRECOGNIZED_POLICY']
 
         with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
-            with self.assertRaises(ThrottleBackendError):
+            with self.assertRaises(ThrottleBackendError) as ctx:
                 self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("Unknown throttle reason code", str(ctx.exception))
 
-    def test_malformed_reason_type_rejected(self):
-        """Verify non-string non-bytes reason type raises ThrottleBackendError."""
+    def test_boolean_ttl_rejected(self):
+        """Verify boolean value for TTL is rejected and raises ThrottleBackendError."""
         mock_client = MagicMock()
-        mock_client.eval.return_value = [1, 0, 12345]  # int reason
+        mock_client.eval.return_value = [0, True, b'IP_LIMIT']
 
         with patch.object(self.throttle, '_get_raw_redis_client', return_value=mock_client):
-            with self.assertRaises(ThrottleBackendError):
+            with self.assertRaises(ThrottleBackendError) as ctx:
                 self.throttle.acquire_admission('10.0.0.1', 'user')
+            self.assertIn("boolean not permitted", str(ctx.exception))
 
-    def test_malformed_response_fails_closed_in_login_view(self):
-        """Verify malformed Redis response triggers HTTP 503 and zero password check in LoginView."""
+    def test_login_view_returns_http_503_on_contract_violation(self):
+        """Verify contradictory Redis response causes LoginView to return HTTP 503."""
         mock_client = MagicMock()
-        mock_client.eval.return_value = [1, 0, b'INVALID_CODE']
+        mock_client.eval.return_value = [1, 0, b'IP_LIMIT']  # Contradictory!
 
         view = LoginView.as_view()
         request = self.rf.post(
             '/api/v1/auth/login/',
-            data={'identifier': 'some_user', 'password': 'Password123!'},
+            data={'identifier': 'student1', 'password': 'Password123!'},
             format='json',
             REMOTE_ADDR='192.168.1.1',
         )
@@ -1116,12 +1224,32 @@ class RedisResponseDecodingTests(TestCase):
                 response = view(request)
                 self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
                 self.assertEqual(response.data['error']['code'], 'SERVICE_UNAVAILABLE')
+                # Password check must NOT be executed!
+                mock_check_password.assert_not_called()
+
+    def test_password_check_and_session_creation_skipped_on_contract_violation(self):
+        """Verify that when a contract violation occurs, credential checks and session creation are bypassed."""
+        mock_client = MagicMock()
+        mock_client.eval.return_value = [0, 300, b'ADMITTED']  # Contradictory!
+
+        view = LoginView.as_view()
+        request = self.rf.post(
+            '/api/v1/auth/login/',
+            data={'identifier': 'student1', 'password': 'Password123!'},
+            format='json',
+            REMOTE_ADDR='192.168.1.1',
+        )
+
+        with patch.object(AuthenticationThrottle, '_get_raw_redis_client', return_value=mock_client):
+            with patch.object(User, 'check_password') as mock_check_password:
+                response = view(request)
+                self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
                 mock_check_password.assert_not_called()
 
 
 class SafeRedisExceptionLoggingTests(TestCase):
     """
-    Verifies Finding 3: Sanitized Redis exception logging.
+    Verifies sanitized Redis exception logging.
     Guarantees raw exception text, passwords, connection URLs, and tokens
     are NEVER logged in production diagnostic logs.
     """
@@ -1188,29 +1316,370 @@ class SafeRedisExceptionLoggingTests(TestCase):
                 self.assertNotIn(sensitive_text, str(err))
 
 
+class RedisKeyIsolationTests(TestCase):
+    """
+    Verifies Finding A (High): Real Per-Run Redis Test Key Isolation.
+    Ensures that test-injected namespaces are applied to EVERY Redis key (both IP and compound target)
+    before Lua script execution, effective keys are tracked, cleanup removes test keys only,
+    sentinel keys remain untouched, separate test runs do not collide, and production keys are unchanged.
+    """
+
+    def test_keys_have_unique_test_namespace(self):
+        """Verify that effective keys include the injected unique test namespace."""
+        prefix = "test_throttle:run_abc123:"
+        throttle = AuthenticationThrottle(key_prefix=prefix)
+        eff_ip, eff_target = throttle.get_effective_keys('192.168.1.10', 'student_a')
+
+        self.assertTrue(eff_ip.startswith(prefix), f"IP key '{eff_ip}' must start with '{prefix}'")
+        self.assertTrue(eff_target.startswith(prefix), f"Target key '{eff_target}' must start with '{prefix}'")
+
+    def test_ip_and_compound_keys_are_both_namespaced(self):
+        """Verify both IP-level and compound IP+identifier dimensions are namespaced."""
+        prefix = f"test_throttle:{uuid.uuid4().hex[:8]}:"
+        throttle = AuthenticationThrottle(key_prefix=prefix)
+        eff_ip, eff_target = throttle.get_effective_keys('10.0.0.50', 'faculty_member')
+
+        self.assertIn("auth_throttle:ip:", eff_ip)
+        self.assertIn("auth_throttle:target:", eff_target)
+        self.assertTrue(eff_ip.startswith(prefix))
+        self.assertTrue(eff_target.startswith(prefix))
+
+    def test_generated_keys_are_tracked(self):
+        """Verify that get_effective_keys provides exact keys passed to Redis eval."""
+        prefix = "test_throttle:track_run:"
+        throttle = AuthenticationThrottle(key_prefix=prefix)
+        eff_ip, eff_target = throttle.get_effective_keys('172.16.5.5', 'test_user')
+
+        mock_client_eval = MagicMock()
+        mock_client_eval.eval.return_value = [1, 0, b'ADMITTED']
+
+        with patch.object(throttle, '_get_raw_redis_client', return_value=mock_client_eval):
+            throttle.acquire_admission('172.16.5.5', 'test_user')
+
+            # Verify KEYS[1] and KEYS[2] match get_effective_keys exactly
+            called_args = mock_client_eval.eval.call_args[0]
+            numkeys = called_args[1]
+            self.assertEqual(numkeys, 2)
+            passed_ip_key = called_args[2]
+            passed_target_key = called_args[3]
+            self.assertEqual(passed_ip_key, eff_ip)
+            self.assertEqual(passed_target_key, eff_target)
+
+    def test_cleanup_removes_every_test_generated_key(self):
+        """Verify cleanup removes every test-generated key without touching other keys."""
+        mock_redis = MockRedisClient()
+        prefix = "test_throttle:cleanup_test:"
+        throttle = AuthenticationThrottle(key_prefix=prefix)
+
+        with patch.object(throttle, '_get_raw_redis_client', return_value=mock_redis):
+            eff_ip, eff_target = throttle.get_effective_keys('10.0.0.1', 'target_user')
+            throttle.acquire_admission('10.0.0.1', 'target_user')
+
+            # Both keys exist in Redis simulator
+            self.assertIsNotNone(mock_redis.get(eff_ip))
+            self.assertIsNotNone(mock_redis.get(eff_target))
+
+            # Simulate tracked cleanup
+            tracked = {eff_ip, eff_target}
+            for k in tracked:
+                if k.startswith(prefix):
+                    mock_redis.delete(k)
+
+            # Both keys are now deleted
+            self.assertIsNone(mock_redis.get(eff_ip))
+            self.assertIsNone(mock_redis.get(eff_target))
+
+    def test_unrelated_sentinel_keys_remain_unchanged(self):
+        """Verify unrelated sentinel keys outside the test namespace are untouched."""
+        mock_redis = MockRedisClient()
+        sentinel_key = "sentinel:shared_data:001"
+        sentinel_value = b"CRITICAL_DATA_SAFE"
+        mock_redis.set(sentinel_key, 1)
+
+        prefix = "test_throttle:sentinel_test:"
+        throttle = AuthenticationThrottle(key_prefix=prefix)
+
+        with patch.object(throttle, '_get_raw_redis_client', return_value=mock_redis):
+            throttle.acquire_admission('10.0.0.1', 'user')
+
+            # Sentinel key is still intact
+            self.assertEqual(mock_redis.get(sentinel_key), '1')
+
+    def test_two_separate_test_runs_cannot_interfere(self):
+        """Verify two independent test runs with different namespaces cannot collide or interfere."""
+        mock_redis = MockRedisClient()
+
+        run_1_prefix = "test_throttle:run_alpha:"
+        throttle_1 = AuthenticationThrottle(target_limit=2, key_prefix=run_1_prefix)
+
+        run_2_prefix = "test_throttle:run_beta:"
+        throttle_2 = AuthenticationThrottle(target_limit=2, key_prefix=run_2_prefix)
+
+        with patch.object(throttle_1, '_get_raw_redis_client', return_value=mock_redis):
+            with patch.object(throttle_2, '_get_raw_redis_client', return_value=mock_redis):
+                # Run 1 exhausts its limit
+                self.assertTrue(throttle_1.acquire_admission('10.0.0.1', 'shared_student').admitted)
+                self.assertTrue(throttle_1.acquire_admission('10.0.0.1', 'shared_student').admitted)
+                self.assertFalse(throttle_1.acquire_admission('10.0.0.1', 'shared_student').admitted)
+
+                # Run 2 for the exact same IP and student is completely independent and admitted!
+                self.assertTrue(throttle_2.acquire_admission('10.0.0.1', 'shared_student').admitted)
+                self.assertTrue(throttle_2.acquire_admission('10.0.0.1', 'shared_student').admitted)
+
+    def test_concurrent_requests_in_same_test_share_expected_counters(self):
+        """Verify concurrent requests sharing the same test namespace share the counters."""
+        mock_redis = MockRedisClient()
+        shared_prefix = "test_throttle:same_test_run:"
+
+        throttle_a = AuthenticationThrottle(target_limit=3, key_prefix=shared_prefix)
+        throttle_b = AuthenticationThrottle(target_limit=3, key_prefix=shared_prefix)
+
+        with patch.object(throttle_a, '_get_raw_redis_client', return_value=mock_redis):
+            with patch.object(throttle_b, '_get_raw_redis_client', return_value=mock_redis):
+                self.assertTrue(throttle_a.acquire_admission('10.0.0.2', 'concurrent_user').admitted)
+                self.assertTrue(throttle_b.acquire_admission('10.0.0.2', 'concurrent_user').admitted)
+                self.assertTrue(throttle_a.acquire_admission('10.0.0.2', 'concurrent_user').admitted)
+                # 4th request across both instances is denied
+                self.assertFalse(throttle_b.acquire_admission('10.0.0.2', 'concurrent_user').admitted)
+
+    def test_normal_production_key_naming_is_unchanged(self):
+        """Verify normal production throttle instances (no key_prefix, no key_builder) use standard key naming."""
+        prod_throttle = AuthenticationThrottle()
+        eff_ip, eff_target = prod_throttle.get_effective_keys('127.0.0.1', 'production_user')
+
+        self.assertFalse(eff_ip.startswith("test_throttle:"))
+        self.assertFalse(eff_target.startswith("test_throttle:"))
+        self.assertIn("auth_throttle:ip:", eff_ip)
+        self.assertIn("auth_throttle:target:", eff_target)
+
+    def test_test_only_injected_key_builder(self):
+        """Verify custom injected key_builder callable is delegated to construct effective keys."""
+        def custom_builder(dimension, value):
+            return f"injected_namespace:{dimension}:{value}"
+
+        throttle = AuthenticationThrottle(key_builder=custom_builder)
+        eff_ip, eff_target = throttle.get_effective_keys('1.2.3.4', 'injected_user')
+
+        self.assertEqual(eff_ip, "injected_namespace:ip:1.2.3.4")
+        self.assertEqual(eff_target, "injected_namespace:target:1.2.3.4:injected_user")
+
+
+class RedisEndpointSafetyTests(TestCase):
+    """
+    Verifies Finding B (High): Enforce Redis Test Endpoint Safety.
+    Validates explicit test-only configuration (opt-in, test URL, disposable acknowledgment),
+    endpoint canonicalization, collision detection against application Redis endpoints,
+    credential sanitization, and visible failure on sentinel corruption or cleanup errors.
+    """
+
+    def test_missing_opt_in_skipped(self):
+        """Verify that live integration tests skip when RUN_REDIS_INTEGRATION_TESTS != '1'."""
+        orig_skip = getattr(SafeLiveRedisIntegrationTests, 'skip_reason', None)
+        try:
+            with patch.dict(os.environ, {
+                'RUN_REDIS_INTEGRATION_TESTS': '0',
+                'TEST_REDIS_URL': 'redis://127.0.0.1:6379/15',
+                'TEST_REDIS_DISPOSABLE': 'YES',
+            }):
+                SafeLiveRedisIntegrationTests.setUpClass()
+                self.assertIsNotNone(SafeLiveRedisIntegrationTests.skip_reason)
+                self.assertIn("RUN_REDIS_INTEGRATION_TESTS=1", SafeLiveRedisIntegrationTests.skip_reason)
+        finally:
+            SafeLiveRedisIntegrationTests.skip_reason = orig_skip
+
+    def test_missing_test_url_skipped(self):
+        """Verify that live integration tests skip when TEST_REDIS_URL is empty."""
+        orig_skip = getattr(SafeLiveRedisIntegrationTests, 'skip_reason', None)
+        try:
+            with patch.dict(os.environ, {
+                'RUN_REDIS_INTEGRATION_TESTS': '1',
+                'TEST_REDIS_URL': '',
+                'TEST_REDIS_DISPOSABLE': 'YES',
+            }):
+                SafeLiveRedisIntegrationTests.setUpClass()
+                self.assertIsNotNone(SafeLiveRedisIntegrationTests.skip_reason)
+                self.assertIn("Dedicated TEST_REDIS_URL", SafeLiveRedisIntegrationTests.skip_reason)
+        finally:
+            SafeLiveRedisIntegrationTests.skip_reason = orig_skip
+
+    def test_missing_disposable_acknowledgment_skipped(self):
+        """Verify that live integration tests skip when TEST_REDIS_DISPOSABLE != 'YES'."""
+        orig_skip = getattr(SafeLiveRedisIntegrationTests, 'skip_reason', None)
+        try:
+            with patch.dict(os.environ, {
+                'RUN_REDIS_INTEGRATION_TESTS': '1',
+                'TEST_REDIS_URL': 'redis://127.0.0.1:6379/15',
+                'TEST_REDIS_DISPOSABLE': 'NO',
+            }):
+                SafeLiveRedisIntegrationTests.setUpClass()
+                self.assertIsNotNone(SafeLiveRedisIntegrationTests.skip_reason)
+                self.assertIn("TEST_REDIS_DISPOSABLE=YES", SafeLiveRedisIntegrationTests.skip_reason)
+        finally:
+            SafeLiveRedisIntegrationTests.skip_reason = orig_skip
+
+    def test_same_test_and_app_endpoint_rejected(self):
+        """Verify that identical test and application endpoints are rejected regardless of ENVIRONMENT_NAME."""
+        test_url = "redis://127.0.0.1:6379/1"
+        app_endpoints = [('redis', '127.0.0.1', 6379, 1)]
+        is_safe, error = validate_test_redis_safety(test_url, app_endpoints=app_endpoints)
+        self.assertFalse(is_safe)
+        self.assertIn("conflicts with application Redis endpoint", error)
+
+    def test_equivalent_urls_different_text_rejected(self):
+        """Verify that textually different but equivalent URLs (e.g. localhost vs 127.0.0.1 default DB) are rejected."""
+        test_url = "redis://localhost:6379/"  # resolves to 127.0.0.1:6379 db 0
+        app_endpoints = [('redis', '127.0.0.1', 6379, 0)]  # resolves to 127.0.0.1:6379 db 0
+        is_safe, error = validate_test_redis_safety(test_url, app_endpoints=app_endpoints)
+        self.assertFalse(is_safe)
+        self.assertIn("conflicts with application Redis endpoint", error)
+
+    def test_invalid_url_scheme_rejected(self):
+        """Verify that unsupported URL schemes (e.g. http://) are rejected."""
+        test_url = "http://127.0.0.1:6379/15"
+        is_safe, error = validate_test_redis_safety(test_url, app_endpoints=[])
+        self.assertFalse(is_safe)
+        self.assertIn("Unsupported Redis URL scheme", error)
+
+    def test_invalid_or_ambiguous_configuration_rejected(self):
+        """Verify that malformed URLs (e.g. negative db index or invalid port) are rejected."""
+        test_url = "redis://127.0.0.1:6379/-1"
+        is_safe, error = validate_test_redis_safety(test_url, app_endpoints=[])
+        self.assertFalse(is_safe)
+        self.assertIn("Invalid TEST_REDIS_URL", error)
+
+    def test_credential_bearing_urls_sanitized(self):
+        """Verify that credentials in URLs are masked in error messages and logs."""
+        raw_url = "redis://admin:super_secret_password_123@redis.corp.internal:6379/5"
+        sanitized = sanitize_redis_url(raw_url)
+        self.assertNotIn("super_secret_password_123", sanitized)
+        self.assertIn("***:***", sanitized)
+        self.assertIn("redis.corp.internal:6379/5", sanitized)
+
+    def test_no_redis_connection_before_safety_checks_pass(self):
+        """Verify that no Redis connection is attempted if endpoint safety validation fails."""
+        orig_skip = getattr(SafeLiveRedisIntegrationTests, 'skip_reason', None)
+        try:
+            with patch.dict(os.environ, {
+                'RUN_REDIS_INTEGRATION_TESTS': '1',
+                'TEST_REDIS_URL': 'redis://127.0.0.1:6379/1',  # Conflicts with app endpoint!
+                'TEST_REDIS_DISPOSABLE': 'YES',
+            }):
+                with patch('apps.accounts.throttling.get_configured_application_redis_endpoints', return_value=[('redis', '127.0.0.1', 6379, 1)]):
+                    with patch('redis.from_url') as mock_redis_connect:
+                        SafeLiveRedisIntegrationTests.setUpClass()
+                        self.assertIsNotNone(SafeLiveRedisIntegrationTests.skip_reason)
+                        self.assertIn("Safety check failed", SafeLiveRedisIntegrationTests.skip_reason)
+                        # Connection must NEVER have been attempted!
+                        mock_redis_connect.assert_not_called()
+        finally:
+            SafeLiveRedisIntegrationTests.skip_reason = orig_skip
+
+    def test_sentinel_modification_causes_visible_failure(self):
+        """Verify that if the sentinel key is modified or corrupted, tearDown fails visibly."""
+        test_instance = SafeLiveRedisIntegrationTests()
+        test_instance._force_teardown = True
+        test_instance.r = MagicMock()
+        test_instance.skip_reason = None
+        test_instance.sentinel_key = "sentinel:test_key"
+        test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.test_namespace = "test_throttle:err_test:"
+        test_instance.tracked_keys = set()
+
+        # Simulate corrupted sentinel value
+        test_instance.r.get.return_value = b"CORRUPTED_SENTINEL_VAL"
+
+        with self.assertRaises(AssertionError) as ctx:
+            test_instance.tearDown()
+        self.assertIn("Sentinel key corruption detected", str(ctx.exception))
+
+    def test_cleanup_failure_reported(self):
+        """Verify that if key cleanup fails, tearDown reports the failure visibly."""
+        test_instance = SafeLiveRedisIntegrationTests()
+        test_instance._force_teardown = True
+        test_instance.r = MagicMock()
+        test_instance.skip_reason = None
+        test_instance.sentinel_key = "sentinel:test_key"
+        test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.r.get.return_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.test_namespace = "test_throttle:cleanup_err:"
+        test_instance.tracked_keys = {"test_throttle:cleanup_err:key_1"}
+
+        # Simulate deletion failure
+        test_instance.r.delete.side_effect = Exception("Redis network reset")
+
+        with self.assertRaises(AssertionError) as ctx:
+            test_instance.tearDown()
+        self.assertIn("Test cleanup failed", str(ctx.exception))
+
+    def test_unrelated_keys_preserved(self):
+        """Verify that tearDown refuses to delete tracked keys that do not match the test namespace."""
+        test_instance = SafeLiveRedisIntegrationTests()
+        test_instance._force_teardown = True
+        test_instance.r = MagicMock()
+        test_instance.skip_reason = None
+        test_instance.sentinel_key = "sentinel:test_key"
+        test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.r.get.return_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.test_namespace = "test_throttle:isolated_run:"
+        # Key does NOT contain the namespace
+        test_instance.tracked_keys = {"unrelated_application_key:ip:123"}
+
+        with self.assertRaises(AssertionError) as ctx:
+            test_instance.tearDown()
+        self.assertIn("does not match test namespace", str(ctx.exception))
+        # Ensure the unrelated key was NOT deleted
+        test_instance.r.delete.assert_called_once_with("sentinel:test_key")
+
+    def test_all_test_created_keys_cleaned_up(self):
+        """Verify that tearDown successfully cleans up all keys matching the test namespace."""
+        test_instance = SafeLiveRedisIntegrationTests()
+        test_instance._force_teardown = True
+        test_instance.r = MagicMock()
+        test_instance.skip_reason = None
+        test_instance.sentinel_key = "sentinel:test_key"
+        test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.r.get.return_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.test_namespace = "test_throttle:success_run:"
+        test_instance.tracked_keys = {
+            "test_throttle:success_run:ip:abc",
+            "test_throttle:success_run:target:def",
+        }
+
+        test_instance.tearDown()
+        # Deleted both tracked keys and the sentinel key
+        self.assertEqual(test_instance.r.delete.call_count, 3)
+
+
 class RedisIntegrationSafetyGuardTests(TestCase):
     """
     Verifies that live Redis integration test code strictly adheres to non-destructive isolation requirements:
     - Opt-in enforcement.
     - Dedicated test URL requirement.
-    - Prohibition of FLUSHDB and FLUSHALL in test code.
+    - Explicit disposable acknowledgment requirement.
+    - Strict prohibition of database-wide wipe commands (FLUSHDB / FLUSHALL) via AST and source inspection.
     """
 
     def test_skipped_without_explicit_opt_in(self):
         """Verify integration tests are cleanly skipped when RUN_REDIS_INTEGRATION_TESTS is not '1'."""
-        with patch.dict(os.environ, {'RUN_REDIS_INTEGRATION_TESTS': '0', 'TEST_REDIS_URL': 'redis://127.0.0.1:6379/15'}, clear=False):
+        with patch.dict(os.environ, {'RUN_REDIS_INTEGRATION_TESTS': '0', 'TEST_REDIS_URL': 'redis://127.0.0.1:6379/15', 'TEST_REDIS_DISPOSABLE': 'YES'}):
             self.assertNotEqual(os.environ.get('RUN_REDIS_INTEGRATION_TESTS'), '1')
 
     def test_skipped_without_test_redis_url(self):
         """Verify integration tests are cleanly skipped when TEST_REDIS_URL is omitted."""
-        with patch.dict(os.environ, {'RUN_REDIS_INTEGRATION_TESTS': '1', 'TEST_REDIS_URL': ''}, clear=False):
+        with patch.dict(os.environ, {'RUN_REDIS_INTEGRATION_TESTS': '1', 'TEST_REDIS_URL': '', 'TEST_REDIS_DISPOSABLE': 'YES'}):
             test_url = os.environ.get('TEST_REDIS_URL', '').strip()
             self.assertEqual(test_url, '')
+
+    def test_skipped_without_disposable_acknowledgment(self):
+        """Verify integration tests are cleanly skipped when TEST_REDIS_DISPOSABLE is not 'YES'."""
+        with patch.dict(os.environ, {'RUN_REDIS_INTEGRATION_TESTS': '1', 'TEST_REDIS_URL': 'redis://127.0.0.1:6379/15', 'TEST_REDIS_DISPOSABLE': 'NO'}):
+            ack = os.environ.get('TEST_REDIS_DISPOSABLE', '').strip().upper()
+            self.assertNotEqual(ack, 'YES')
 
     def test_test_source_never_contains_flushdb_or_flushall(self):
         """
         Verify that test_throttling.py contains ZERO occurrences of database-wide wipe commands
-        in executable test code.
+        in executable test code via string and AST analysis.
         """
         import inspect
         import tests.test_throttling as test_module
@@ -1224,16 +1693,24 @@ class RedisIntegrationSafetyGuardTests(TestCase):
         for cmd in target_cmds:
             self.assertNotIn(cmd, inspected_source)
 
+        import ast
+        tree = ast.parse(inspected_source)
+        forbidden_attrs = {'flush' + 'db', 'flush' + 'all'}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.assertNotIn(node.func.attr, forbidden_attrs)
+
 
 class SafeLiveRedisIntegrationTests(TestCase):
     """
     Live Redis Integration Tests with strict non-destructive isolation safeguards:
     - Requires explicit opt-in via RUN_REDIS_INTEGRATION_TESTS=1.
     - Requires dedicated disposable TEST_REDIS_URL.
-    - Refuses execution against production Redis endpoints.
-    - Uses unique test namespace per run (test_throttle:<uuid>:).
+    - Requires explicit acknowledgment TEST_REDIS_DISPOSABLE=YES.
+    - Validates endpoint safety and rejects application Redis collisions.
+    - Uses unique per-run namespace (test_throttle:<uuid>:) applied to EVERY Redis key.
     - NEVER executes FLUSHDB, FLUSHALL, or database-wide wipe commands.
-    - Cleans up only explicitly tracked keys created by this test run.
+    - Tracks and cleans up ONLY keys created by this exact test run.
     - Verifies unrelated sentinel keys remain untouched throughout.
     """
 
@@ -1242,6 +1719,7 @@ class SafeLiveRedisIntegrationTests(TestCase):
         super().setUpClass()
         opt_in = os.environ.get('RUN_REDIS_INTEGRATION_TESTS', '').strip()
         test_url = os.environ.get('TEST_REDIS_URL', '').strip()
+        disposable_ack = os.environ.get('TEST_REDIS_DISPOSABLE', '').strip().upper()
 
         if opt_in != '1':
             cls.skip_reason = (
@@ -1257,12 +1735,16 @@ class SafeLiveRedisIntegrationTests(TestCase):
             )
             return
 
-        prod_redis_url = getattr(settings, 'REDIS_URL', None) or os.environ.get('REDIS_URL', '')
-        if prod_redis_url and test_url.strip() == prod_redis_url.strip() and getattr(settings, 'ENVIRONMENT_NAME', '') == 'production':
+        if disposable_ack != 'YES':
             cls.skip_reason = (
-                "REAL REDIS INTEGRATION: NOT EXECUTED — TEST_REDIS_URL cannot match production "
-                "REDIS_URL in a production environment."
+                "REAL REDIS INTEGRATION: NOT EXECUTED — Explicit confirmation "
+                "TEST_REDIS_DISPOSABLE=YES required to confirm target Redis instance is disposable."
             )
+            return
+
+        is_safe, error_msg = validate_test_redis_safety(test_url)
+        if not is_safe:
+            cls.skip_reason = f"REAL REDIS INTEGRATION: NOT EXECUTED — Safety check failed: {error_msg}"
             return
 
         try:
@@ -1272,14 +1754,14 @@ class SafeLiveRedisIntegrationTests(TestCase):
             cls.skip_reason = None
         except Exception as exc:
             cls.skip_reason = (
-                f"REAL REDIS INTEGRATION: NOT EXECUTED — Unable to connect to TEST_REDIS_URL: {exc.__class__.__name__}"
+                f"REAL REDIS INTEGRATION: NOT EXECUTED — Unable to connect to TEST_REDIS_URL "
+                f"({sanitize_redis_url(test_url)}): {exc.__class__.__name__}"
             )
 
     def setUp(self):
         if getattr(self.__class__, 'skip_reason', None):
             self.skipTest(self.__class__.skip_reason)
 
-        import uuid
         self.test_run_id = uuid.uuid4().hex[:12]
         self.test_namespace = f"test_throttle:{self.test_run_id}:"
         self.tracked_keys = set()
@@ -1290,30 +1772,62 @@ class SafeLiveRedisIntegrationTests(TestCase):
         self.r.set(self.sentinel_key, self.sentinel_value)
 
     def tearDown(self):
-        if hasattr(self, 'r') and getattr(self.__class__, 'skip_reason', None) is None:
-            try:
-                # 1. Assert the unrelated sentinel key was NEVER deleted or modified
-                current_sentinel = self.r.get(self.sentinel_key)
-                self.assertEqual(current_sentinel, self.sentinel_value, "Sentinel key was modified or deleted!")
-                self.r.delete(self.sentinel_key)
+        is_mock_test = hasattr(self, '_force_teardown') or ('skip_reason' in self.__dict__ and self.skip_reason is None)
+        if not is_mock_test:
+            if not hasattr(self, 'r') or getattr(self.__class__, 'skip_reason', None) is not None:
+                return
 
-                # 2. Non-destructively clean up ONLY test-created keys within this run's namespace
-                for k in list(self.tracked_keys):
-                    if k.startswith(self.test_namespace):
+        sentinel_failure = None
+        try:
+            # 1. Assert the unrelated sentinel key was NEVER deleted or modified
+            current_sentinel = self.r.get(self.sentinel_key)
+            if current_sentinel != self.sentinel_value:
+                sentinel_failure = (
+                    f"Sentinel key corruption detected! Expected {self.sentinel_value!r}, got {current_sentinel!r}."
+                )
+        except Exception as exc:
+            sentinel_failure = f"Failed to verify sentinel key integrity: {exc}"
+
+        cleanup_errors = []
+        try:
+            # 2. Non-destructively clean up ONLY test-created keys within this run's namespace
+            for k in list(self.tracked_keys):
+                if self.test_namespace in k:
+                    try:
                         self.r.delete(k)
-            except Exception:
-                pass
+                    except Exception as exc:
+                        cleanup_errors.append(f"Failed to delete test key {k}: {exc}")
+                else:
+                    cleanup_errors.append(
+                        f"Refusing to delete key '{k}' because it does not match test namespace '{self.test_namespace}'"
+                    )
+        finally:
+            # 3. Best-effort delete of sentinel key
+            try:
+                self.r.delete(self.sentinel_key)
+            except Exception as exc:
+                cleanup_errors.append(f"Failed to delete sentinel key {self.sentinel_key}: {exc}")
 
-    def test_live_redis_concurrency_same_ip_burst(self):
-        """Test A against live Redis: 30 concurrent requests with IP limit 15."""
-        throttle = AuthenticationThrottle(ip_limit=15, ip_window=60, target_limit=50, target_window=60)
+        # 4. Fail visibly if sentinel was corrupted
+        if sentinel_failure:
+            self.fail(f"CRITICAL: {sentinel_failure}")
+
+        # 5. Report cleanup failures rather than silently suppressing them
+        if cleanup_errors:
+            self.fail(f"Test cleanup failed: {'; '.join(cleanup_errors)}")
+
+    def test_case_1_concurrent_ip_burst_limit_15(self):
+        """Case 1 against live Redis: Thirty concurrent requests with IP limit 15."""
+        throttle = AuthenticationThrottle(
+            ip_limit=15, ip_window=60, target_limit=50, target_window=60, key_prefix=self.test_namespace
+        )
         with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
             results = []
 
             def submit(i):
-                raw_k = _hash_throttle_key('ip', '172.16.0.1')
-                eff_k = _make_effective_cache_key(raw_k)
-                self.tracked_keys.add(eff_k)
+                eff_ip, eff_target = throttle.get_effective_keys('172.16.0.1', f'live_user_{i}')
+                self.tracked_keys.add(eff_ip)
+                self.tracked_keys.add(eff_target)
                 return throttle.acquire_admission('172.16.0.1', f'live_user_{i}')
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -1325,5 +1839,177 @@ class SafeLiveRedisIntegrationTests(TestCase):
             denied = [r for r in results if r[0] is False]
             self.assertEqual(len(admitted), 15)
             self.assertEqual(len(denied), 15)
+            for r in denied:
+                self.assertEqual(r[2], 'IP_LIMIT')
+
+    def test_case_2_concurrent_target_burst_limit_5(self):
+        """Case 2 against live Redis: Twenty concurrent requests with compound target limit 5."""
+        throttle = AuthenticationThrottle(
+            ip_limit=50, ip_window=60, target_limit=5, target_window=60, key_prefix=self.test_namespace
+        )
+        with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
+            results = []
+
+            def submit(i):
+                # Unique IP per attempt, same target identifier
+                ip = f'172.16.1.{i}'
+                eff_ip, eff_target = throttle.get_effective_keys(ip, 'common_target')
+                self.tracked_keys.add(eff_ip)
+                self.tracked_keys.add(eff_target)
+                return throttle.acquire_admission(ip, 'common_target')
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(submit, i) for i in range(20)]
+                for f in concurrent.futures.as_completed(futures):
+                    results.append(f.result())
+
+            admitted = [r for r in results if r[0] is True]
+            denied = [r for r in results if r[0] is False]
+            self.assertEqual(len(admitted), 5)
+            self.assertEqual(len(denied), 15)
+            for r in denied:
+                self.assertEqual(r[2], 'TARGET_LIMIT')
+
+    def test_case_3_multiple_independent_limiter_instances_sharing_redis(self):
+        """Case 3 against live Redis: Multiple independent limiter instances sharing Redis."""
+        limiter_1 = AuthenticationThrottle(target_limit=5, target_window=60, key_prefix=self.test_namespace)
+        limiter_2 = AuthenticationThrottle(target_limit=5, target_window=60, key_prefix=self.test_namespace)
+
+        with patch.object(limiter_1, '_get_raw_redis_client', return_value=self.r):
+            with patch.object(limiter_2, '_get_raw_redis_client', return_value=self.r):
+                eff_ip, eff_target = limiter_1.get_effective_keys('172.16.2.1', 'shared_account')
+                self.tracked_keys.add(eff_ip)
+                self.tracked_keys.add(eff_target)
+
+                # Limiter 1 admits 3
+                for _ in range(3):
+                    self.assertTrue(limiter_1.acquire_admission('172.16.2.1', 'shared_account').admitted)
+
+                # Limiter 2 admits 2
+                for _ in range(2):
+                    self.assertTrue(limiter_2.acquire_admission('172.16.2.1', 'shared_account').admitted)
+
+                # 6th attempt across both is blocked
+                res = limiter_1.acquire_admission('172.16.2.1', 'shared_account')
+                self.assertFalse(res.admitted)
+                self.assertEqual(res.reason, 'TARGET_LIMIT')
+
+    def test_case_4_last_slot_concurrency_race(self):
+        """Case 4 against live Redis: Last-slot concurrency race between 10 simultaneous threads."""
+        throttle = AuthenticationThrottle(target_limit=5, target_window=60, key_prefix=self.test_namespace)
+        with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
+            eff_ip, eff_target = throttle.get_effective_keys('172.16.3.1', 'race_account')
+            self.tracked_keys.add(eff_ip)
+            self.tracked_keys.add(eff_target)
+
+            # Pre-reserve 4 slots
+            for _ in range(4):
+                self.assertTrue(throttle.acquire_admission('172.16.3.1', 'race_account').admitted)
+
+            # 1 slot remains: launch 10 threads
+            results = []
+
+            def race(i):
+                return throttle.acquire_admission('172.16.3.1', 'race_account')
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(race, i) for i in range(10)]
+                for f in concurrent.futures.as_completed(futures):
+                    results.append(f.result())
+
+            admitted = [r for r in results if r[0] is True]
+            denied = [r for r in results if r[0] is False]
+            self.assertEqual(len(admitted), 1)
+            self.assertEqual(len(denied), 9)
+
+    def test_case_5_fixed_window_ttl_expiration(self):
+        """Case 5 against live Redis: Fixed-window TTL expiration."""
+        throttle = AuthenticationThrottle(target_limit=2, target_window=1, key_prefix=self.test_namespace)
+        with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
+            eff_ip, eff_target = throttle.get_effective_keys('172.16.4.1', 'expiring_account')
+            self.tracked_keys.add(eff_ip)
+            self.tracked_keys.add(eff_target)
+
+            self.assertTrue(throttle.acquire_admission('172.16.4.1', 'expiring_account').admitted)
+            self.assertTrue(throttle.acquire_admission('172.16.4.1', 'expiring_account').admitted)
+            self.assertFalse(throttle.acquire_admission('172.16.4.1', 'expiring_account').admitted)
+
+            # Sleep 1.1s for window expiration
+            time.sleep(1.1)
+
+            res = throttle.acquire_admission('172.16.4.1', 'expiring_account')
+            self.assertTrue(res.admitted)
+            self.assertEqual(res.reason, 'ADMITTED')
+
+    def test_case_6_correct_bytes_response_decoding(self):
+        """Case 6 against live Redis: Correct bytes response decoding."""
+        throttle = AuthenticationThrottle(key_prefix=self.test_namespace)
+        with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
+            eff_ip, eff_target = throttle.get_effective_keys('172.16.5.1', 'decode_user')
+            self.tracked_keys.add(eff_ip)
+            self.tracked_keys.add(eff_target)
+
+            res = throttle.acquire_admission('172.16.5.1', 'decode_user')
+            self.assertTrue(res.admitted)
+            self.assertEqual(res.reason, 'ADMITTED')
+            self.assertIsInstance(res.reason, str)
+            self.assertEqual(res.retry_after, 0)
+
+    def test_case_7_backend_outage_handling(self):
+        """Case 7 against live Redis: Backend outage handling fails closed."""
+        import redis
+        outage_client = redis.Redis(host='127.0.0.1', port=63799, socket_connect_timeout=0.1, socket_timeout=0.1)
+        throttle = AuthenticationThrottle(key_prefix=self.test_namespace)
+        with patch.object(throttle, '_get_raw_redis_client', return_value=outage_client):
+            with self.assertRaises(ThrottleBackendError):
+                throttle.acquire_admission('172.16.6.1', 'outage_user')
+
+    def test_case_8_isolated_key_creation_and_cleanup(self):
+        """Case 8 against live Redis: Isolated key creation and tracked cleanup."""
+        throttle = AuthenticationThrottle(key_prefix=self.test_namespace)
+        with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
+            eff_ip, eff_target = throttle.get_effective_keys('172.16.7.1', 'isolation_user')
+            self.tracked_keys.add(eff_ip)
+            self.tracked_keys.add(eff_target)
+
+            throttle.acquire_admission('172.16.7.1', 'isolation_user')
+
+            # Verify keys exist and contain the namespace
+            self.assertTrue(self.r.exists(eff_ip))
+            self.assertTrue(self.r.exists(eff_target))
+            self.assertTrue(eff_ip.startswith(self.test_namespace))
+            self.assertTrue(eff_target.startswith(self.test_namespace))
+
+    def test_case_9_sentinel_preservation(self):
+        """Case 9 against live Redis: Unrelated sentinel preservation throughout burst."""
+        throttle = AuthenticationThrottle(key_prefix=self.test_namespace)
+        with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
+            eff_ip, eff_target = throttle.get_effective_keys('172.16.8.1', 'sentinel_user')
+            self.tracked_keys.add(eff_ip)
+            self.tracked_keys.add(eff_target)
+
+            for _ in range(5):
+                throttle.acquire_admission('172.16.8.1', 'sentinel_user')
+
+            # Sentinel key is strictly preserved
+            self.assertEqual(self.r.get(self.sentinel_key), self.sentinel_value)
+
+    def test_case_10_no_successful_login_counter_resets(self):
+        """Case 10 against live Redis: Zero-reset counter policy under live Redis."""
+        throttle = AuthenticationThrottle(target_limit=5, target_window=60, key_prefix=self.test_namespace)
+        with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
+            eff_ip, eff_target = throttle.get_effective_keys('172.16.9.1', 'no_reset_user')
+            self.tracked_keys.add(eff_ip)
+            self.tracked_keys.add(eff_target)
+
+            # 5 admitted attempts
+            for _ in range(5):
+                self.assertTrue(throttle.acquire_admission('172.16.9.1', 'no_reset_user').admitted)
+
+            # 6th attempt must be blocked (proves no reset occurred)
+            res = throttle.acquire_admission('172.16.9.1', 'no_reset_user')
+            self.assertFalse(res.admitted)
+            self.assertEqual(res.reason, 'TARGET_LIMIT')
+
 
 
