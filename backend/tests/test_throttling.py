@@ -1463,6 +1463,62 @@ class RedisKeyIsolationTests(TestCase):
         self.assertEqual(eff_ip, "injected_namespace:ip:1.2.3.4")
         self.assertEqual(eff_target, "injected_namespace:target:1.2.3.4:injected_user")
 
+    def test_regression_changing_ip_creates_separate_compound_counters_vs_shared_ip(self):
+        """
+        Regression test demonstrating the Round 6 target limit concurrency defect:
+        1. When changing the IP per request (f'172.16.1.{i}'), each request generates
+           a distinct compound key (ip:normalized_id), creating separate counters.
+           With ip_limit=50, none of the 20 requests hit the target limit 5.
+        2. When using a shared IP ('172.16.1.10') and shared identifier ('common_target'),
+           all requests target the SAME compound key, strictly enforcing the 5-attempt limit:
+           exactly 5 admitted, 15 rejected with TARGET_LIMIT, and target counter == 5.
+        """
+        mock_redis = MockRedisClient()
+        prefix = f"test_throttle:{uuid.uuid4().hex[:8]}:"
+
+        throttle = AuthenticationThrottle(
+            ip_limit=50,
+            ip_window=60,
+            target_limit=5,
+            target_window=60,
+            key_prefix=prefix,
+        )
+
+        with patch.object(throttle, '_get_raw_redis_client', return_value=mock_redis):
+            # Phase 1: Defect demonstration — rotating IP creates 20 distinct compound keys
+            results_diff_ips = []
+            for i in range(20):
+                res = throttle.acquire_admission(f'10.99.1.{i}', 'common_student')
+                results_diff_ips.append(res)
+
+            # All 20 are admitted because each had its own compound counter (count=1 for each)
+            self.assertEqual(len([r for r in results_diff_ips if r.admitted]), 20)
+            self.assertEqual(len([r for r in results_diff_ips if not r.admitted]), 0)
+
+            # Phase 2: Correct behavior — shared IP and shared identifier enforces compound limit
+            shared_ip = '10.99.2.1'
+            shared_identifier = 'common_student'
+            eff_ip, eff_target = throttle.get_effective_keys(shared_ip, shared_identifier)
+
+            results_shared_ip = []
+            for i in range(20):
+                res = throttle.acquire_admission(shared_ip, shared_identifier)
+                results_shared_ip.append(res)
+
+            admitted = [r for r in results_shared_ip if r.admitted]
+            denied = [r for r in results_shared_ip if not r.admitted]
+
+            self.assertEqual(len(admitted), 5)
+            self.assertEqual(len(denied), 15)
+            for r in denied:
+                self.assertEqual(r.reason, 'TARGET_LIMIT')
+                self.assertGreater(r.retry_after, 0)
+                self.assertLessEqual(r.retry_after, 60)
+
+            # Verify exact counter values in Redis
+            self.assertEqual(int(mock_redis.get(eff_target)), 5)
+            self.assertEqual(int(mock_redis.get(eff_ip)), 5)
+
 
 class RedisEndpointSafetyTests(TestCase):
     """
@@ -1611,8 +1667,61 @@ class RedisEndpointSafetyTests(TestCase):
             test_instance.tearDown()
         self.assertIn("Test cleanup failed", str(ctx.exception))
 
-    def test_unrelated_keys_preserved(self):
-        """Verify that tearDown refuses to delete tracked keys that do not match the test namespace."""
+    def test_correctly_namespaced_key_is_deleted(self):
+        """Verify that tearDown deletes tracked keys beginning with the test namespace."""
+        test_instance = SafeLiveRedisIntegrationTests()
+        test_instance._force_teardown = True
+        test_instance.r = MagicMock()
+        test_instance.skip_reason = None
+        test_instance.sentinel_key = "sentinel:test_key"
+        test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.r.get.return_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.test_namespace = "test_throttle:valid_run:"
+        test_instance.tracked_keys = {"test_throttle:valid_run:key_1"}
+
+        test_instance.tearDown()
+        test_instance.r.delete.assert_any_call("test_throttle:valid_run:key_1")
+        test_instance.r.delete.assert_any_call("sentinel:test_key")
+
+    def test_key_with_namespace_in_middle_is_not_deleted(self):
+        """Verify that tearDown refuses to delete keys where test namespace is in the middle, not prefix."""
+        test_instance = SafeLiveRedisIntegrationTests()
+        test_instance._force_teardown = True
+        test_instance.r = MagicMock()
+        test_instance.skip_reason = None
+        test_instance.sentinel_key = "sentinel:test_key"
+        test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.r.get.return_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.test_namespace = "test_throttle:my_run:"
+        # Namespace appears in the middle (substring), not as prefix
+        test_instance.tracked_keys = {"unrelated:test_throttle:my_run:key_1"}
+
+        with self.assertRaises(AssertionError) as ctx:
+            test_instance.tearDown()
+        self.assertIn("outside the current test namespace", str(ctx.exception))
+        # Ensure the key with namespace in middle was NOT deleted
+        test_instance.r.delete.assert_called_once_with("sentinel:test_key")
+
+    def test_key_from_another_test_run_is_not_deleted(self):
+        """Verify that tearDown refuses to delete keys belonging to a different test run."""
+        test_instance = SafeLiveRedisIntegrationTests()
+        test_instance._force_teardown = True
+        test_instance.r = MagicMock()
+        test_instance.skip_reason = None
+        test_instance.sentinel_key = "sentinel:test_key"
+        test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.r.get.return_value = b"INITIAL_SENTINEL_VAL"
+        test_instance.test_namespace = "test_throttle:run_alpha:"
+        # Belongs to run_beta
+        test_instance.tracked_keys = {"test_throttle:run_beta:key_1"}
+
+        with self.assertRaises(AssertionError) as ctx:
+            test_instance.tearDown()
+        self.assertIn("outside the current test namespace", str(ctx.exception))
+        test_instance.r.delete.assert_called_once_with("sentinel:test_key")
+
+    def test_unrelated_application_key_is_not_deleted(self):
+        """Verify that tearDown refuses to delete untracked/unrelated application keys."""
         test_instance = SafeLiveRedisIntegrationTests()
         test_instance._force_teardown = True
         test_instance.r = MagicMock()
@@ -1621,17 +1730,17 @@ class RedisEndpointSafetyTests(TestCase):
         test_instance.sentinel_value = b"INITIAL_SENTINEL_VAL"
         test_instance.r.get.return_value = b"INITIAL_SENTINEL_VAL"
         test_instance.test_namespace = "test_throttle:isolated_run:"
-        # Key does NOT contain the namespace
-        test_instance.tracked_keys = {"unrelated_application_key:ip:123"}
+        # Normal application key without test namespace
+        test_instance.tracked_keys = {"auth_throttle:ip:123"}
 
         with self.assertRaises(AssertionError) as ctx:
             test_instance.tearDown()
-        self.assertIn("does not match test namespace", str(ctx.exception))
+        self.assertIn("outside the current test namespace", str(ctx.exception))
         # Ensure the unrelated key was NOT deleted
         test_instance.r.delete.assert_called_once_with("sentinel:test_key")
 
-    def test_all_test_created_keys_cleaned_up(self):
-        """Verify that tearDown successfully cleans up all keys matching the test namespace."""
+    def test_all_exact_tracked_current_run_keys_cleaned_up(self):
+        """Verify that tearDown successfully cleans up all exact tracked keys matching test namespace."""
         test_instance = SafeLiveRedisIntegrationTests()
         test_instance._force_teardown = True
         test_instance.r = MagicMock()
@@ -1792,14 +1901,14 @@ class SafeLiveRedisIntegrationTests(TestCase):
         try:
             # 2. Non-destructively clean up ONLY test-created keys within this run's namespace
             for k in list(self.tracked_keys):
-                if self.test_namespace in k:
+                if k.startswith(self.test_namespace):
                     try:
                         self.r.delete(k)
                     except Exception as exc:
                         cleanup_errors.append(f"Failed to delete test key {k}: {exc}")
                 else:
                     cleanup_errors.append(
-                        f"Refusing to delete key '{k}' because it does not match test namespace '{self.test_namespace}'"
+                        f"Refusing to delete key '{k}' outside the current test namespace '{self.test_namespace}'"
                     )
         finally:
             # 3. Best-effort delete of sentinel key
@@ -1843,20 +1952,31 @@ class SafeLiveRedisIntegrationTests(TestCase):
                 self.assertEqual(r[2], 'IP_LIMIT')
 
     def test_case_2_concurrent_target_burst_limit_5(self):
-        """Case 2 against live Redis: Twenty concurrent requests with compound target limit 5."""
+        """Case 2 against live Redis: Twenty concurrent requests with compound target limit 5 using shared IP and identifier."""
+        shared_ip = '172.16.1.10'
+        shared_identifier = 'common_target'
+
         throttle = AuthenticationThrottle(
-            ip_limit=50, ip_window=60, target_limit=5, target_window=60, key_prefix=self.test_namespace
+            ip_limit=50,
+            ip_window=60,
+            target_limit=5,
+            target_window=60,
+            key_prefix=self.test_namespace,
         )
+
+        eff_ip, eff_target = throttle.get_effective_keys(shared_ip, shared_identifier)
+        self.tracked_keys.add(eff_ip)
+        self.tracked_keys.add(eff_target)
+
+        # Assert effective keys begin with unique test namespace
+        self.assertTrue(eff_ip.startswith(self.test_namespace))
+        self.assertTrue(eff_target.startswith(self.test_namespace))
+
         with patch.object(throttle, '_get_raw_redis_client', return_value=self.r):
             results = []
 
             def submit(i):
-                # Unique IP per attempt, same target identifier
-                ip = f'172.16.1.{i}'
-                eff_ip, eff_target = throttle.get_effective_keys(ip, 'common_target')
-                self.tracked_keys.add(eff_ip)
-                self.tracked_keys.add(eff_target)
-                return throttle.acquire_admission(ip, 'common_target')
+                return throttle.acquire_admission(shared_ip, shared_identifier)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [executor.submit(submit, i) for i in range(20)]
@@ -1865,10 +1985,35 @@ class SafeLiveRedisIntegrationTests(TestCase):
 
             admitted = [r for r in results if r[0] is True]
             denied = [r for r in results if r[0] is False]
+
+            # Exactly 5 admitted, exactly 15 rejected
             self.assertEqual(len(admitted), 5)
             self.assertEqual(len(denied), 15)
+
+            # Every rejected request must have reason TARGET_LIMIT and valid positive bounded retry_after
             for r in denied:
                 self.assertEqual(r[2], 'TARGET_LIMIT')
+                self.assertGreater(r[1], 0)
+                self.assertLessEqual(r[1], 60)
+
+            # Assert target Redis counter and IP Redis counter are exactly 5
+            target_val = self.r.get(eff_target)
+            ip_val = self.r.get(eff_ip)
+            target_count = int(target_val.decode('utf-8') if isinstance(target_val, bytes) else target_val)
+            ip_count = int(ip_val.decode('utf-8') if isinstance(ip_val, bytes) else ip_val)
+            self.assertEqual(target_count, 5)
+            self.assertEqual(ip_count, 5)
+
+            # Assert remaining TTLs in Redis are positive and within configured window
+            target_ttl = self.r.ttl(eff_target)
+            ip_ttl = self.r.ttl(eff_ip)
+            self.assertGreater(target_ttl, 0)
+            self.assertLessEqual(target_ttl, 60)
+            self.assertGreater(ip_ttl, 0)
+            self.assertLessEqual(ip_ttl, 60)
+
+            # Sentinel key remains unchanged
+            self.assertEqual(self.r.get(self.sentinel_key), self.sentinel_value)
 
     def test_case_3_multiple_independent_limiter_instances_sharing_redis(self):
         """Case 3 against live Redis: Multiple independent limiter instances sharing Redis."""
