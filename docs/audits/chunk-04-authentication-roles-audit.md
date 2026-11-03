@@ -1,10 +1,11 @@
-# Chunk 04: Authentication and Roles Audit Report
+# Chunk 04: Authentication and Roles Audit Report (Round 2 Security Corrections)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03  
+**Date:** 2026-11-03 (Round 2 Revision)  
 **Stage:** Chunk 04 — Authentication and Roles  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Identity models, custom User model, migrations, session authentication APIs, RBAC permission classes, password security baseline, and comprehensive test suite are complete; Chunk 05 onward remains strictly gated).
+**Last Audited Commit:** `ee4cf67669095b1e74090debc882fe689c396050`  
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 4 Round 2 security findings [2 HIGH, 2 MEDIUM] have been resolved, verified, and backed by 113 passing automated tests; Chunk 05 onward remains strictly gated).
 
 ---
 
@@ -210,10 +211,232 @@ backend/tests/test_security.py .......                                   [100%]
 
 ---
 
-## 6. Audit Verdict & Recommendation
+## 7. ROUND 2 — INDEPENDENT SECURITY AUDIT CORRECTIONS
 
-**Audit Verdict:** **READY FOR INDEPENDENT REVIEW — RECOMMENDED FOR AUDIT PASS.**
+During the independent security audit of Chunk 04 (audited commit `ee4cf67669095b1e74090debc882fe689c396050`), four security findings were identified (2 HIGH, 2 MEDIUM). All four findings, along with identified regression vectors, have been completely resolved and verified.
 
-All Chunk 04 deliverables have been completely implemented, verified, and documented in strict adherence to the project specification and database architecture.
+---
 
-**Gating Notice:** Chunk 05 (FYUGP Academic Management) and all subsequent chunks remain strictly gated pending explicit independent audit sign-off and project owner approval.
+### 7.1 Finding A (HIGH): Login CSRF Vulnerability
+
+#### 1. Severity & Classification
+- **Severity:** HIGH
+- **Vulnerability Category:** Cross-Site Request Forgery (CSRF) / Session Fixation Ingress
+- **Affected Endpoints:** `POST /api/v1/auth/login/`
+
+#### 2. Root Cause
+`LoginView` is an unauthenticated entry point (`authentication_classes = []`, `permission_classes = [AllowAny]`). In Django REST Framework, `APIView.as_view()` unconditionally wraps view callables in `@csrf_exempt`. Because `LoginView` had no authentication classes, DRF's `SessionAuthentication.enforce_csrf()` was never executed. Although `@ensure_csrf_cookie` was attached to `LoginView`, that decorator only ensures the `csrftoken` cookie is returned in the response—it does NOT validate incoming request tokens. Consequently, incoming login requests were completely exempt from CSRF token verification.
+
+#### 3. Exact Affected Code
+- `backend/apps/accounts/views.py`: `LoginView` lines 71–84.
+- `backend/apps/accounts/urls.py`: Missing explicit CSRF bootstrap route.
+- `backend/config/settings/base.py`: Unconfigured `CSRF_FAILURE_VIEW`.
+
+#### 4. Implementation Correction
+1. **DRF APIView Un-Exemption (`views.py:LoginView.as_view`):**
+   Overrode `as_view()` on `LoginView` to explicitly set `view.csrf_exempt = False`. This restores standard Django `CsrfViewMiddleware` execution for incoming POST requests.
+2. **View-Level Defense-in-Depth (`views.py:LoginView.initial` & `enforce_csrf`):**
+   Added an explicit call to `self.enforce_csrf(request)` inside `LoginView.initial()` using DRF's `CSRFCheck(dummy_get_response)`. This guarantees CSRF verification even if requests are processed through test harnesses or direct callable invocations that bypass outer WSGI middleware.
+3. **Safe CSRF Bootstrap Flow (`views.py:CsrfBootstrapView` & `urls.py`):**
+   Added an explicitly designated safe endpoint `GET /api/v1/auth/csrf/` decorated with `@ensure_csrf_cookie` returning `{"message": "CSRF cookie set.", "csrf_token": get_token(request)}`. Single-page applications and clients invoke this endpoint to securely obtain an initial CSRF token prior to authentication mutations.
+4. **Standardized CSRF Failure Handler (`apps.core.views.csrf_failure_view` & `base.py:CSRF_FAILURE_VIEW`):**
+   Implemented `csrf_failure_view` returning a standardized JSON error envelope with HTTP 403 Forbidden (`PERMISSION_DENIED: "CSRF validation failed. Token missing or invalid."`), completely suppressing internal tracebacks and server paths.
+
+#### 5. Associated Tests
+- `tests.test_auth.AuthenticationAPITests.test_csrf_bootstrap_and_login_enforcement`:
+  Uses Django's `Client(enforce_csrf_checks=True)` to prove:
+  - `GET /api/v1/auth/csrf/` delivers `csrftoken` cookie and token.
+  - `POST /api/v1/auth/login/` without CSRF token is rejected with HTTP 403 `PERMISSION_DENIED`.
+  - `POST /api/v1/auth/login/` with an invalid token is rejected with HTTP 403 `PERMISSION_DENIED`.
+  - `POST /api/v1/auth/login/` with a valid CSRF token succeeds with HTTP 200, creates session, and rotates session key.
+  - Authenticated session access functions properly.
+  - `POST /api/v1/auth/logout/` without CSRF token is rejected with HTTP 403.
+  - `POST /api/v1/auth/logout/` with valid CSRF token succeeds with HTTP 200 and invalidates the session.
+
+---
+
+### 7.2 Finding B (HIGH): Role Authorization Bypass via `is_staff=True`
+
+#### 1. Severity & Classification
+- **Severity:** HIGH
+- **Vulnerability Category:** Broken Object Level Authorization / Privilege Escalation
+- **Affected Components:** `backend/apps/accounts/permissions.py`
+
+#### 2. Root Cause
+`IsAdminUserRole` and `IsFacultyUserRole` previously contained fallback logic:
+```python
+if user.is_superuser or user.is_staff:
+    return True
+```
+Django's `is_staff` flag designates administrative site access and is not equivalent to institutional administrator or faculty authority. If an active user with primary role `STUDENT` or `FACULTY` had `is_staff=True`, they were granted unrestricted access to privileged administrative and examination endpoints.
+
+#### 3. Exact Affected Code
+- `backend/apps/accounts/permissions.py`: Lines 22–24 in `IsAdminUserRole`, Lines 43–45 in `IsFacultyUserRole`, and related checks in `IsCollegeSuperAdmin`.
+
+#### 4. Implementation Correction
+1. **Separation of Django Staff Flags from Institutional RBAC:**
+   `is_staff=True` alone NEVER grants institutional administrator or faculty privileges.
+2. **Hard Compartmentalization for Student Accounts:**
+   Explicitly checks `if user.role == RoleChoices.STUDENT: return False` as the initial gate in `IsAdminUserRole`, `IsFacultyUserRole`, and `IsCollegeSuperAdmin`. Students cannot escalate privileges through staff flags or misconfigured role links.
+3. **Faculty / Admin Boundary:**
+   `FACULTY` accounts with `is_staff=True` are strictly barred from `IsAdminUserRole`.
+4. **Legitimate Superadmin Authority Preserved:**
+   `user.role == RoleChoices.SUPERADMIN` (or `user.is_superuser` when combined with administrative primary roles) retains institutional governance authority.
+5. **Approved Granular Roles Only:**
+   Granular privileges via `UserRole` are restricted to approved role codes:
+   - Administrative: `COLLEGE_SUPERADMIN`, `EXAM_OFFICER`
+   - Faculty/Examiner: `FACULTY`, `HEAD_EXAMINER`, `EXAMINER`
+   - Unrelated granular roles (e.g. `INVIGILATOR`, `LAB_ASSISTANT`) are strictly rejected from granting excessive privileges.
+
+#### 5. Updated Permission Evaluation Matrix
+| Primary Role | `is_staff` | Granular Role | Admin Endpoint | Faculty Endpoint | Student Endpoint |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `STUDENT` | `False` | None | **DENIED (403)** | **DENIED (403)** | **PERMITTED (200)** |
+| `STUDENT` | `True` | None | **DENIED (403)** | **DENIED (403)** | **PERMITTED (200)** |
+| `STUDENT` | `True` | `EXAM_OFFICER` | **DENIED (403)** | **DENIED (403)** | **PERMITTED (200)** |
+| `FACULTY` | `False` | None | **DENIED (403)** | **PERMITTED (200)** | **DENIED (403)** |
+| `FACULTY` | `True` | None | **DENIED (403)** | **PERMITTED (200)** | **DENIED (403)** |
+| `FACULTY` | `False` | `EXAM_OFFICER` | **PERMITTED (200)** | **PERMITTED (200)** | **DENIED (403)** |
+| `FACULTY` | `False` | `INVIGILATOR` | **DENIED (403)** | **PERMITTED (200)** | **DENIED (403)** |
+| `ADMIN` | `False` | None | **PERMITTED (200)** | **PERMITTED (200)** | **DENIED (403)** |
+| `ADMIN` | `True` | None | **PERMITTED (200)** | **PERMITTED (200)** | **DENIED (403)** |
+| `SUPERADMIN` | `True` | `COLLEGE_SUPERADMIN` | **PERMITTED (200)** | **PERMITTED (200)** | **DENIED (403)** |
+
+#### 6. Associated Tests
+- `tests.test_permissions.RoleBasedAccessControlTests`:
+  - `test_is_staff_flag_alone_does_not_grant_admin_or_faculty_access`
+  - `test_unrelated_granular_role_does_not_grant_privileged_access`
+  - `test_student_cannot_be_escalated_via_granular_role`
+  - `test_inactive_and_anonymous_users_strictly_denied`
+
+---
+
+### 7.3 Finding C (MEDIUM): Login Rate Limiting & Brute-Force Throttling
+
+#### 1. Severity & Classification
+- **Severity:** MEDIUM
+- **Vulnerability Category:** Lack of Authentication Rate Limiting / Automated Password Guessing
+- **Affected Endpoints:** `POST /api/v1/auth/login/`
+
+#### 2. Root Cause
+The public authentication endpoint did not enforce application-level rate limiting, allowing unrestricted automated password guessing and credential-stuffing attacks.
+
+#### 3. Exact Affected Code
+- `backend/apps/accounts/views.py`: `LoginView.post` lines 82–120.
+- `backend/config/settings/base.py`: Missing throttling configuration parameters and cache definitions.
+- `backend/config/settings/production.py`: Missing cache backend validation gate.
+
+#### 4. Implementation Correction
+1. **Dedicated Throttling Engine (`apps.accounts.throttling.AuthenticationThrottle`):**
+   Implemented a server-side rate limiter using Django's atomic cache primitives (`cache.add()`, `cache.incr()`, `cache.get()`, `cache.delete()`).
+2. **Dual-Dimension Protection:**
+   - **IP-Level Throttle:** Maximum 15 attempts per 5-minute sliding window (`AUTH_THROTTLE_IP_LIMIT = 15`, `AUTH_THROTTLE_IP_WINDOW = 300`). Prevents distributed credential stuffing across multiple accounts from a single host.
+   - **Target Compound Throttle (IP + Normalized Identifier):** Maximum 5 attempts per 5-minute sliding window (`AUTH_THROTTLE_TARGET_LIMIT = 5`, `AUTH_THROTTLE_TARGET_WINDOW = 300`). Prevents targeted brute-forcing against individual accounts while preventing attackers from causing widespread account lockout of legitimate users from other IPs.
+3. **Execution Before Password Verification:**
+   The throttle check runs immediately upon request receipt, before expensive database lookups and PBKDF2 hash calculations, protecting server CPU resources.
+4. **Standardized HTTP 429 Response:**
+   Exceeded limits return HTTP 429 Too Many Requests with standardized envelope `RATE_LIMIT_EXCEEDED` and a compliant `Retry-After: <seconds>` HTTP response header.
+5. **Identifier Normalization & Credential Safety:**
+   Identifiers are normalized (stripped of control characters and lowercased). Cache keys store SHA-256 digests (`auth_throttle:ip:<sha256>`, `auth_throttle:target:<sha256>`). Raw identifiers, passwords, and tokens are NEVER stored in cache keys.
+6. **Account Enumeration Resistance:**
+   Existing and non-existing accounts follow the identical throttling curve and return the identical 429 response structure.
+7. **Reset on Success:**
+   Successful logins reset the compound target counter, preventing false-positive lockouts for legitimate users who mistype their password once or twice.
+8. **Production Cache Gate (`production.py`):**
+   Enforces that `DummyCache` is strictly forbidden in production, raising `ImproperlyConfigured`. Multi-worker production deployment requires configuring a distributed shared cache (`REDIS_URL` or `DatabaseCache`).
+
+#### 5. Associated Tests
+- `tests.test_throttling.AuthenticationThrottlingTests`:
+  - `test_requests_below_threshold_permitted`
+  - `test_exceeding_target_threshold_returns_429`
+  - `test_case_and_whitespace_variations_do_not_bypass_throttling`
+  - `test_throttling_does_not_reveal_account_existence`
+  - `test_single_user_attack_does_not_block_different_user`
+  - `test_successful_login_resets_target_attempts`
+  - `test_spoofed_ip_header_does_not_bypass_ip_throttle`
+  - `test_production_cache_gate_rejects_dummy_cache`
+
+---
+
+### 7.4 Finding D (MEDIUM): Authentication Audit Metadata Validation & Integrity
+
+#### 1. Severity & Classification
+- **Severity:** MEDIUM
+- **Vulnerability Category:** Untrusted Ingress Metadata / Log & Database Injection / Audit Bypasses
+- **Affected Components:** `backend/apps/accounts/views.py:_get_client_ip`, `_log_auth_event`
+
+#### 2. Root Cause
+- `_get_client_ip()` previously trusted `X-Forwarded-For` based on `TRUST_PROXY_SSL_HEADER`. Deciding whether to trust HTTPS scheme termination from a reverse proxy is completely separate from determining whether forwarded client IP headers are authentic.
+- The helper performed zero syntactic validation on IP strings, merely truncating raw strings to 45 characters. Injected script tags, CRLF characters, or SQL fragments could enter audit logs.
+- Login identifiers and User-Agent strings were unvalidated, allowing CRLF injection (`\r\n`) and multiline log poisoning.
+- `_log_auth_event()` caught and suppressed all exceptions during `AuthEvent.objects.create()`, allowing login sessions to be established without a durable audit record.
+
+#### 3. Exact Affected Code
+- `backend/apps/accounts/views.py`: `_get_client_ip`, `_get_user_agent`, `_log_auth_event`.
+- `backend/config/settings/base.py`: Missing `TRUST_PROXY_CLIENT_IP`.
+- `backend/config/settings/production.py`: Missing `TRUST_PROXY_CLIENT_IP` validation.
+
+#### 4. Implementation Correction
+1. **Dedicated Audit Services Module (`apps.accounts.audit`):**
+   Centralized metadata validation in `backend/apps/accounts/audit.py`.
+2. **Independent IP Trust Boundary (`TRUST_PROXY_CLIENT_IP`):**
+   Created `TRUST_PROXY_CLIENT_IP = env.bool('TRUST_PROXY_CLIENT_IP', default=False)` in `base.py` and validated in `production.py`. Completely decoupled from `TRUST_PROXY_SSL_HEADER`.
+3. **Strict IP Address Validation via Python `ipaddress`:**
+   `get_validated_client_ip()` parses candidate IP strings through `ipaddress.ip_address()`. Any non-IP, spoofed, or malformed value is rejected and falls back safely to validated `REMOTE_ADDR` (or default `'127.0.0.1'`). Supports IPv4 and IPv6.
+4. **Metadata Sanitization & Control-Character Stripping:**
+   `sanitize_identifier()` and `sanitize_user_agent()` strip all ASCII control characters (`[\x00-\x1f\x7f]`), eliminating CRLF injection, null-byte poisoning, and multiline log forging. Enforces column length limits (254 chars for identifier, 255 chars for User-Agent).
+5. **Fail-Closed Audit Persistence Policy (`record_auth_event`):**
+   - For `LOGIN_SUCCESS`: Enforces `raise_on_failure=True`. If persisting the `AuthEvent` fails (e.g. database failure), an `AuditPersistenceError` is raised, session creation is aborted, and a standardized 500 error is returned. No user can obtain an active authenticated session without a durable audit record.
+   - For `LOGIN_FAILED`: Enforces `raise_on_failure=False`. Emits a critical alert in server logs without leaking database exceptions to clients or blocking error reporting.
+6. **Credential Redaction Guarantee:**
+   `AuthEvent` has no password or token fields. Password strings, secrets, and bearer tokens are never persisted in audit tables or server logs.
+
+#### 5. Associated Tests
+- `tests.test_audit.AuditMetadataValidationTests`:
+  - `test_direct_remote_addr_used_when_proxy_trust_disabled`
+  - `test_forwarded_ip_accepted_when_proxy_trust_enabled`
+  - `test_ipv6_address_validated_correctly`
+  - `test_invalid_ip_header_rejected_and_falls_back`
+  - `test_missing_client_metadata_defaults_safely`
+  - `test_crlf_and_control_characters_stripped_from_identifier`
+  - `test_oversized_identifier_truncated_safely`
+  - `test_crlf_and_control_characters_stripped_from_user_agent`
+  - `test_oversized_user_agent_truncated_safely`
+  - `test_login_success_fails_closed_when_audit_persistence_fails`
+  - `test_login_failed_logs_error_without_crashing_when_audit_persistence_fails`
+  - `test_audit_event_never_stores_credentials`
+
+---
+
+### 7.5 Additional Security Improvements
+- **Password Validator Enforcement in Custom Manager:**
+  Updated `backend/apps/accounts/managers.py:create_user()` to explicitly invoke `django.contrib.auth.password_validation.validate_password(password, user=user)`. Tested via `test_create_user_enforces_password_validation` in `test_models.py`.
+
+---
+
+## 8. Verification and Test Results Summary
+
+```bash
+$ .venv/bin/python backend/manage.py test tests --settings=config.settings.test
+Found 113 test(s).
+Creating test database for alias 'default'...
+System check identified no issues (0 silenced).
+.................................................................................................................
+----------------------------------------------------------------------
+Ran 113 tests in 0.394s
+
+OK
+Destroying test database for alias 'default'...
+```
+
+```bash
+$ .venv/bin/pytest backend/tests --ds=config.settings.test
+============================= 113 passed in 0.63s ==============================
+```
+
+- **Django Development Check:** `System check identified no issues (0 silenced).`
+- **Django Migration Dry-Run:** `No changes detected.`
+- **Django Production Deploy Check:** `System check identified no issues (0 silenced).`
+- **Protected Files Integrity:** [`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), and [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md) remain strictly unmodified.
+- **Next Stage Gating:** Chunk 05 onward remains strictly gated.
+

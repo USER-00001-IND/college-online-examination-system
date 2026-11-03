@@ -6,10 +6,29 @@ Includes minimal, credential-safe health check endpoint.
 from datetime import datetime, timezone
 
 from django.conf import settings
+from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+
+def csrf_failure_view(request, reason=""):
+    """
+    Standardized JSON error response for CSRF validation failures.
+    Complies with project API error envelope specifications and suppresses internal details.
+    """
+    return JsonResponse(
+        {
+            "error": {
+                "code": "PERMISSION_DENIED",
+                "message": "CSRF validation failed. Token missing or invalid.",
+                "details": {},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+        status=status.HTTP_403_FORBIDDEN,
+    )
 
 
 class HealthCheckView(APIView):

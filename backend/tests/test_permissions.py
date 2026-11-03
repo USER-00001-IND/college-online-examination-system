@@ -195,6 +195,111 @@ class RoleBasedAccessControlTests(TestCase):
         response = self.client.get(self.admin_url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    # --------------------------------------------------------------------------
+    # Finding B: Separation of is_staff from Institutional RBAC Authorization
+    # --------------------------------------------------------------------------
+
+    def test_is_staff_flag_alone_does_not_grant_admin_or_faculty_access(self):
+        """
+        Verify that is_staff=True does NOT escalate privileges.
+        - STUDENT with is_staff=True cannot access admin or faculty endpoints.
+        - FACULTY with is_staff=True cannot access admin endpoints.
+        """
+        staff_student = User.objects.create_user(
+            username='staff_student',
+            email='staff.student@gauhati.ac.in',
+            password=self.password,
+            role=RoleChoices.STUDENT,
+            is_active=True,
+            is_staff=True,
+        )
+
+        staff_faculty = User.objects.create_user(
+            username='staff_faculty',
+            email='staff.faculty@gauhati.ac.in',
+            password=self.password,
+            role=RoleChoices.FACULTY,
+            is_active=True,
+            is_staff=True,
+        )
+
+        admin_no_staff = User.objects.create_user(
+            username='admin_no_staff',
+            email='admin.nostaff@gauhati.ac.in',
+            password=self.password,
+            role=RoleChoices.ADMIN,
+            is_active=True,
+            is_staff=False,
+        )
+
+        # 1. STUDENT with is_staff=True: strictly denied admin and faculty endpoints
+        self.client.force_login(staff_student)
+        res = self.client.get(self.admin_url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        res = self.client.get(self.faculty_url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        # Permitted student endpoint
+        res = self.client.get(self.student_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        # 2. FACULTY with is_staff=True: permitted faculty, strictly denied admin
+        self.client.force_login(staff_faculty)
+        res = self.client.get(self.admin_url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        res = self.client.get(self.faculty_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        # 3. ADMIN without is_staff: approved admin access
+        self.client.force_login(admin_no_staff)
+        res = self.client.get(self.admin_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+    def test_unrelated_granular_role_does_not_grant_privileged_access(self):
+        """Verify unrelated granular roles (e.g. INVIGILATOR) do not grant admin access."""
+        invigilator_role = Role.objects.create(code='INVIGILATOR', name='Invigilator')
+        UserRole.objects.create(
+            user=self.faculty,
+            role=invigilator_role,
+            assigned_by=self.superadmin,
+        )
+
+        self.client.force_login(self.faculty)
+        response = self.client.get(self.admin_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_student_cannot_be_escalated_via_granular_role(self):
+        """Verify primary role STUDENT is hard-barred from administrative endpoints even if granular role exists."""
+        exam_officer_role = Role.objects.create(code='EXAM_OFFICER_STUDENT_TEST', name='Exam Officer')
+        UserRole.objects.create(
+            user=self.student,
+            role=exam_officer_role,
+            assigned_by=self.superadmin,
+        )
+
+        self.client.force_login(self.student)
+        response = self.client.get(self.admin_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_inactive_and_anonymous_users_strictly_denied(self):
+        """Verify inactive and unauthenticated users receive 401 on protected endpoints."""
+        inactive_admin = User.objects.create_user(
+            username='inactive_admin',
+            email='inactive.admin@gauhati.ac.in',
+            password=self.password,
+            role=RoleChoices.ADMIN,
+            is_active=False,
+        )
+
+        # Anonymous access -> 401
+        self.client.logout()
+        res = self.client.get(self.admin_url)
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # Inactive user access -> 401 (inactive accounts cannot authenticate sessions)
+        self.client.force_login(inactive_admin)
+        res = self.client.get(self.admin_url)
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
     def test_is_college_super_admin_permission(self):
         """Verify IsCollegeSuperAdmin permission class isolation."""
         permission = IsCollegeSuperAdmin()

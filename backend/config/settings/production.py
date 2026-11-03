@@ -116,6 +116,43 @@ if TRUST_PROXY_SSL_HEADER:
 else:
     SECURE_PROXY_SSL_HEADER = None
 
+# --------------------------------------------------------------------------
+# Reverse Proxy Client IP Trust Boundary (Finding D)
+# --------------------------------------------------------------------------
+# Distinct and independent from TRUST_PROXY_SSL_HEADER.
+# Enabling SSL header trust does NOT imply that X-Forwarded-For is authentic.
+# TRUST_PROXY_CLIENT_IP may only be enabled if Nginx is confirmed to unconditionally
+# overwrite X-Forwarded-For with the true remote client address ($remote_addr).
+raw_trust_client_ip = env('TRUST_PROXY_CLIENT_IP', default='False')
+if isinstance(raw_trust_client_ip, str) and raw_trust_client_ip.strip().lower() not in (
+    'true', 'false', '1', '0', 'yes', 'no', 't', 'f'
+):
+    raise ImproperlyConfigured(
+        f"CRITICAL SECURITY CONFIGURATION ERROR: Invalid TRUST_PROXY_CLIENT_IP value '{raw_trust_client_ip}'. "
+        "Must be an explicit boolean string ('True' or 'False')."
+    )
+TRUST_PROXY_CLIENT_IP = env.bool('TRUST_PROXY_CLIENT_IP', default=False)
+
+# --------------------------------------------------------------------------
+# Production Authentication Throttling & Cache Backend Gate (Finding C)
+# --------------------------------------------------------------------------
+# In production, authentication rate limiting requires an atomic, shared cache backend
+# to prevent race conditions across concurrent multi-worker processes.
+CACHE_URL = env('CACHE_URL', default=None)
+REDIS_URL = env('REDIS_URL', default=None)
+
+if REDIS_URL or CACHE_URL:
+    CACHES = {
+        'default': env.cache_url('REDIS_URL' if REDIS_URL else 'CACHE_URL')
+    }
+
+# Disallow DummyCache in production under all circumstances
+if CACHES['default']['BACKEND'] == 'django.core.cache.backends.dummy.DummyCache':
+    raise ImproperlyConfigured(
+        "CRITICAL SECURITY CONFIGURATION ERROR: DummyCache is strictly forbidden in production. "
+        "Authentication rate limiting requires an active cache backend."
+    )
+
 # HTTPS and Cookie Security
 SECURE_SSL_REDIRECT = env.bool('SECURE_SSL_REDIRECT', default=True)
 SESSION_COOKIE_SECURE = True

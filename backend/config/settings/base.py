@@ -86,6 +86,28 @@ ASGI_APPLICATION = 'config.asgi.application'
 # Enabled only in production when TRUST_PROXY_SSL_HEADER=True and Nginx isolation is verified
 SECURE_PROXY_SSL_HEADER = None
 
+# Reverse Proxy Client IP Trust Boundary (Independent of SSL Header Trust)
+# When False (default), client IP is strictly taken from validated REMOTE_ADDR
+# When True, X-Forwarded-For first hop is validated via Python ipaddress module
+TRUST_PROXY_CLIENT_IP = env.bool('TRUST_PROXY_CLIENT_IP', default=False)
+
+# Centralized CSRF Failure Handler
+CSRF_FAILURE_VIEW = 'apps.core.views.csrf_failure_view'
+
+# Cache Backend Configuration (Used for authentication rate limiting and session storage)
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'college-cache-default',
+    }
+}
+
+# Authentication Throttling & Brute-Force Rate Limiting Settings
+AUTH_THROTTLE_IP_LIMIT = env.int('AUTH_THROTTLE_IP_LIMIT', default=15)
+AUTH_THROTTLE_IP_WINDOW = env.int('AUTH_THROTTLE_IP_WINDOW', default=300)  # 5 minutes
+AUTH_THROTTLE_TARGET_LIMIT = env.int('AUTH_THROTTLE_TARGET_LIMIT', default=5)
+AUTH_THROTTLE_TARGET_WINDOW = env.int('AUTH_THROTTLE_TARGET_WINDOW', default=300)  # 5 minutes
+
 # Signed 64-bit integer primary keys (consistent with MySQL 8.x schema design)
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

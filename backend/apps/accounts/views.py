@@ -1,23 +1,30 @@
 """
 Authentication and Role-Based Access Views for College Online Examination System.
-Enforces session authentication, CSRF validation, enumeration resistance,
-and audit logging to accounts_auth_event.
+Enforces session authentication, CSRF validation, brute-force rate limiting,
+enumeration resistance, and secure audit logging to accounts_auth_event.
 """
 
 import logging
 from django.conf import settings
 from django.contrib.auth import login as django_login, logout as django_logout
 from django.db.models import Q
+from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import ensure_csrf_cookie
-from rest_framework import status
-from apps.accounts.authentication import ExamSessionAuthentication
+from rest_framework import exceptions, status
+from rest_framework.authentication import CSRFCheck
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import AuthEvent, AuthEventType, User
+from apps.accounts.audit import (
+    AuditPersistenceError,
+    get_validated_client_ip,
+    record_auth_event,
+)
+from apps.accounts.authentication import ExamSessionAuthentication
+from apps.accounts.models import AuthEventType, User
 from apps.accounts.permissions import (
     IsAdminUserRole,
     IsCollegeSuperAdmin,
@@ -25,61 +32,105 @@ from apps.accounts.permissions import (
     IsStudentUserRole,
 )
 from apps.accounts.serializers import LoginSerializer, UserSerializer
+from apps.accounts.throttling import AuthenticationThrottle
 
 logger = logging.getLogger('college.accounts')
 
 
-def _get_client_ip(request) -> str:
-    """Extracts client IP address respecting configured proxy trust boundaries."""
-    if getattr(settings, 'TRUST_PROXY_SSL_HEADER', False):
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            return x_forwarded_for.split(',')[0].strip()[:45]
-    remote_addr = request.META.get('REMOTE_ADDR', '127.0.0.1')
-    return (remote_addr or '127.0.0.1')[:45]
-
-
-def _get_user_agent(request) -> str:
-    """Extracts client user agent, truncated to column limit."""
-    ua = request.META.get('HTTP_USER_AGENT', '')
-    return ua[:255] if ua else ''
-
-
-def _log_auth_event(
-    user: User | None,
-    identifier: str,
-    event_type: str,
-    request,
-) -> None:
+@method_decorator(ensure_csrf_cookie, name='dispatch')
+class CsrfBootstrapView(APIView):
     """
-    Persists an authentication audit event to accounts_auth_event.
-    Never persists passwords, raw secrets, or sensitive tokens.
+    Explicit GET bootstrap endpoint to deliver an initial CSRF token and cookie.
+    Allows single-page applications and API clients to obtain a valid CSRF token
+    before submitting state-changing authentication requests.
     """
-    try:
-        AuthEvent.objects.create(
-            user=user,
-            identifier_entered=identifier[:254],
-            event_type=event_type,
-            ip_address=_get_client_ip(request),
-            user_agent=_get_user_agent(request),
-            created_at=timezone.now(),
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        csrf_token = get_token(request)
+        return Response(
+            {
+                "message": "CSRF cookie set.",
+                "csrf_token": csrf_token,
+            },
+            status=status.HTTP_200_OK,
         )
-    except Exception as exc:
-        logger.warning("Failed to record AuthEvent: %s", exc.__class__.__name__)
 
 
 @method_decorator(ensure_csrf_cookie, name='dispatch')
 class LoginView(APIView):
     """
     Session-based login endpoint.
-    Validates username or email, rotates session key, checks account status,
-    and logs authentication outcome to accounts_auth_event.
-    Returns identical generic error messages for non-existent users and wrong passwords.
+    Enforces explicit CSRF validation, dual-dimension brute-force throttling,
+    enumeration resistance (timing mitigation + identical error messages),
+    fail-closed audit logging, and session-key rotation.
     """
     authentication_classes = []
     permission_classes = [AllowAny]
 
+    @classmethod
+    def as_view(cls, **initkwargs):
+        """
+        Overrides DRF's default csrf_exempt=True wrapping on APIView.
+        Ensures Django's CsrfViewMiddleware actively validates incoming POST requests.
+        """
+        view = super().as_view(**initkwargs)
+        view.csrf_exempt = False
+        return view
+
+    def initial(self, request, *args, **kwargs):
+        """
+        Enforces DRF-level CSRFCheck defense-in-depth on the unauthenticated login POST.
+        """
+        super().initial(request, *args, **kwargs)
+        self.enforce_csrf(request)
+
+    def enforce_csrf(self, request):
+        """
+        Validates the incoming CSRF token using Django's CSRFCheck.
+        Rejects missing, mismatched, or invalid tokens with standardized 403 response.
+        """
+        def dummy_get_response(req):
+            return None
+
+        check = CSRFCheck(dummy_get_response)
+        check.process_request(request)
+        reason = check.process_view(request, None, (), {})
+        if reason:
+            raise exceptions.PermissionDenied(
+                "CSRF validation failed. Token missing or invalid."
+            )
+
     def post(self, request):
+        ip_address = get_validated_client_ip(request)
+        raw_identifier = request.data.get('identifier', '') if isinstance(request.data, dict) else ''
+
+        # ----------------------------------------------------------------------
+        # Finding C: Authentication Throttling Check (Before Password Verification)
+        # ----------------------------------------------------------------------
+        throttle = AuthenticationThrottle()
+        is_throttled, retry_after = throttle.is_throttled(ip_address, str(raw_identifier))
+        if is_throttled:
+            resp = Response(
+                {
+                    "error": {
+                        "code": "RATE_LIMIT_EXCEEDED",
+                        "message": f"Too many failed login attempts. Please wait {retry_after} seconds before trying again.",
+                        "details": {
+                            "retry_after_seconds": retry_after,
+                        },
+                        "timestamp": timezone.now().isoformat(),
+                    }
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+            resp["Retry-After"] = str(retry_after)
+            return resp
+
+        # ----------------------------------------------------------------------
+        # Input Validation
+        # ----------------------------------------------------------------------
         serializer = LoginSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(
@@ -104,7 +155,8 @@ class LoginView(APIView):
         # Mitigate username enumeration timing attacks
         if user is None:
             User().set_password(password)
-            _log_auth_event(None, identifier, AuthEventType.LOGIN_FAILED, request)
+            throttle.record_failed_attempt(ip_address, identifier)
+            record_auth_event(None, identifier, AuthEventType.LOGIN_FAILED, request, raise_on_failure=False)
             return Response(
                 {
                     "error": {
@@ -119,7 +171,8 @@ class LoginView(APIView):
 
         # Check password against stored hash
         if not user.check_password(password):
-            _log_auth_event(user, identifier, AuthEventType.LOGIN_FAILED, request)
+            throttle.record_failed_attempt(ip_address, identifier)
+            record_auth_event(user, identifier, AuthEventType.LOGIN_FAILED, request, raise_on_failure=False)
             return Response(
                 {
                     "error": {
@@ -134,7 +187,8 @@ class LoginView(APIView):
 
         # Check account activation status
         if not user.is_active:
-            _log_auth_event(user, identifier, AuthEventType.LOGIN_FAILED, request)
+            throttle.record_failed_attempt(ip_address, identifier)
+            record_auth_event(user, identifier, AuthEventType.LOGIN_FAILED, request, raise_on_failure=False)
             return Response(
                 {
                     "error": {
@@ -147,12 +201,32 @@ class LoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        # Authentication successful: establish session and cycle session key
+        # ----------------------------------------------------------------------
+        # Authentication Successful: Fail-Closed Audit Logging & Session Creation
+        # ----------------------------------------------------------------------
+        try:
+            record_auth_event(user, identifier, AuthEventType.LOGIN_SUCCESS, request, raise_on_failure=True)
+        except AuditPersistenceError:
+            logger.error("Login aborted: Unable to persist mandatory LOGIN_SUCCESS audit event.")
+            return Response(
+                {
+                    "error": {
+                        "code": "INTERNAL_SERVER_ERROR",
+                        "message": "Authentication service temporarily unavailable. Please retry.",
+                        "details": {},
+                        "timestamp": timezone.now().isoformat(),
+                    }
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # Clear compound rate-limiting throttle on successful authentication
+        throttle.reset_attempts(ip_address, identifier)
+
+        # Establish Django session and cycle session key to prevent session fixation
         django_login(request, user, backend='apps.accounts.backends.EmailOrUsernameModelBackend')
         user.last_login = timezone.now()
         user.save(update_fields=['last_login'])
-
-        _log_auth_event(user, identifier, AuthEventType.LOGIN_SUCCESS, request)
 
         return Response(
             {
@@ -173,7 +247,7 @@ class LogoutView(APIView):
 
     def post(self, request):
         user = request.user
-        _log_auth_event(user, user.username, AuthEventType.LOGOUT, request)
+        record_auth_event(user, user.username, AuthEventType.LOGOUT, request, raise_on_failure=False)
         django_logout(request)
 
         return Response(

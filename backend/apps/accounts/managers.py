@@ -55,6 +55,8 @@ class UserManager(BaseUserManager):
             **extra_fields
         )
         if password:
+            from django.contrib.auth.password_validation import validate_password
+            validate_password(password, user=user)
             user.set_password(password)
         else:
             user.set_unusable_password()

@@ -7,6 +7,7 @@ from django.urls import path
 
 from apps.accounts.views import (
     AdminTestView,
+    CsrfBootstrapView,
     CurrentUserView,
     FacultyTestView,
     LoginView,
@@ -17,6 +18,7 @@ from apps.accounts.views import (
 app_name = 'accounts'
 
 urlpatterns = [
+    path('csrf/', CsrfBootstrapView.as_view(), name='csrf-bootstrap'),
     path('login/', LoginView.as_view(), name='login'),
     path('logout/', LogoutView.as_view(), name='logout'),
     path('user/', CurrentUserView.as_view(), name='current-user'),

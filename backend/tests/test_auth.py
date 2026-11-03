@@ -17,6 +17,9 @@ class AuthenticationAPITests(TestCase):
     """Verifies login, logout, session management, CSRF enforcement, and audit logs."""
 
     def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+
         self.client = APIClient()
         self.password = 'SecurePassword@2026'
 
@@ -47,9 +50,14 @@ class AuthenticationAPITests(TestCase):
             is_active=True,
         )
 
+        self.csrf_bootstrap_url = reverse('accounts:csrf-bootstrap')
         self.login_url = reverse('accounts:login')
         self.logout_url = reverse('accounts:logout')
         self.user_url = reverse('accounts:current-user')
+
+    def tearDown(self):
+        from django.core.cache import cache
+        cache.clear()
 
     # --------------------------------------------------------------------------
     # Test 1: Successful Login with Username & Email
@@ -174,35 +182,77 @@ class AuthenticationAPITests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     # --------------------------------------------------------------------------
-    # Test 13: CSRF Enforcement on State-Changing Requests
+    # Test 13: CSRF Enforcement on Login, Mutations, and Bootstrap (Finding A)
     # --------------------------------------------------------------------------
 
-    def test_csrf_enforcement_on_mutations(self):
-        """Verify CSRF token is strictly enforced for authenticated state-changing requests."""
-        # 1. State-changing POST to logout without CSRF token must fail with 403 Forbidden
-        csrf_client = APIClient(enforce_csrf_checks=True)
-        csrf_client.force_login(self.student)
-        response = csrf_client.post(self.logout_url)
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-        self.assertIn('csrf', response.data['error']['message'].lower())
+    def test_csrf_bootstrap_and_login_enforcement(self):
+        """
+        Comprehensive test for Finding A CSRF enforcement:
+        1. Safe GET bootstrap delivers CSRF cookie and token.
+        2. Login POST without CSRF token is rejected with 403 Forbidden.
+        3. Login POST with invalid CSRF token is rejected with 403 Forbidden.
+        4. Login POST with valid CSRF token succeeds with 200 OK and establishes session.
+        5. Session authentication functions correctly for protected endpoints.
+        6. Logout POST without CSRF token is rejected with 403 Forbidden.
+        7. Logout POST with valid CSRF token succeeds and invalidates session.
+        """
+        client = Client(enforce_csrf_checks=True)
 
-        # 2. Login via standard test client and retrieve CSRF cookie
-        std_client = Client(enforce_csrf_checks=True)
-        login_resp = std_client.post(
+        # 1. CSRF Bootstrap flow via designated safe GET endpoint
+        bootstrap_resp = client.get(self.csrf_bootstrap_url)
+        self.assertEqual(bootstrap_resp.status_code, status.HTTP_200_OK)
+        self.assertIn('csrf_token', bootstrap_resp.json())
+        csrf_cookie = bootstrap_resp.cookies.get('csrftoken')
+        self.assertIsNotNone(csrf_cookie, "Bootstrap GET must set csrftoken cookie.")
+        valid_csrf_token = csrf_cookie.value
+
+        # 2. Login POST without CSRF token must be rejected with 403 Forbidden
+        reject_client = Client(enforce_csrf_checks=True)
+        resp_no_token = reject_client.post(
             self.login_url,
             {'identifier': 'active_student', 'password': self.password},
             content_type='application/json',
         )
-        self.assertEqual(login_resp.status_code, status.HTTP_200_OK)
-        csrf_token = login_resp.cookies.get('csrftoken')
-        self.assertIsNotNone(csrf_token, "Login response must set csrftoken cookie.")
+        self.assertEqual(resp_no_token.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(resp_no_token.json()['error']['code'], 'PERMISSION_DENIED')
 
-        # 3. POST to logout with valid CSRF token header must succeed
-        response = std_client.post(
-            self.logout_url,
-            HTTP_X_CSRFTOKEN=csrf_token.value,
+        # 3. Login POST with invalid CSRF token must be rejected with 403 Forbidden
+        resp_invalid_token = client.post(
+            self.login_url,
+            {'identifier': 'active_student', 'password': self.password},
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN='completely_invalid_csrf_token_value',
         )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp_invalid_token.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 4. Login POST with valid CSRF token must succeed
+        login_resp = client.post(
+            self.login_url,
+            {'identifier': 'active_student', 'password': self.password},
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=valid_csrf_token,
+        )
+        self.assertEqual(login_resp.status_code, status.HTTP_200_OK)
+        self.assertIn('sessionid', client.cookies, "Successful login must establish session cookie.")
+
+        # 5. Authenticated session access works
+        user_resp = client.get(self.user_url)
+        self.assertEqual(user_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(user_resp.json()['user']['username'], 'active_student')
+
+        # 6. Logout without CSRF token must be rejected with 403 Forbidden
+        logout_no_csrf = client.post(self.logout_url)
+        self.assertEqual(logout_no_csrf.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 7. Logout with valid CSRF token succeeds
+        # Refresh/read active CSRF token for the session
+        current_csrf = client.cookies.get('csrftoken').value
+        logout_success = client.post(self.logout_url, HTTP_X_CSRFTOKEN=current_csrf)
+        self.assertEqual(logout_success.status_code, status.HTTP_200_OK)
+
+        # 8. Subsequent requests fail because session was invalidated
+        subsequent_resp = client.get(self.user_url)
+        self.assertEqual(subsequent_resp.status_code, status.HTTP_401_UNAUTHORIZED)
 
     # --------------------------------------------------------------------------
     # Test 14: Password Hashing & Validation

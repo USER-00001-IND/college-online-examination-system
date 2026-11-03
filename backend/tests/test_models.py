@@ -83,6 +83,26 @@ class AccountsModelTests(TestCase):
                 role='HACKER',
             )
 
+    def test_create_user_enforces_password_validation(self):
+        """Verify UserManager.create_user enforces configured password validators."""
+        # Short password (< 8 chars)
+        with self.assertRaises(ValidationError):
+            User.objects.create_user(
+                username='weak_user_1',
+                email='weak1@gauhati.ac.in',
+                password='short',
+                role=RoleChoices.STUDENT,
+            )
+
+        # Entirely numeric password
+        with self.assertRaises(ValidationError):
+            User.objects.create_user(
+                username='weak_user_2',
+                email='weak2@gauhati.ac.in',
+                password='1234567890',
+                role=RoleChoices.STUDENT,
+            )
+
     def test_duplicate_username_constraint(self):
         """Verify username uniqueness constraint."""
         with self.assertRaises(IntegrityError):
