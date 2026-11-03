@@ -1,7 +1,7 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-03 (Chunk 04 Round 7 Final Redis Test Corrections)  
+**Last Updated:** 2026-11-03 (Chunk 04 Independent Audit — Pass with Warnings / Owner Approval Pending)  
 
 ---
 
@@ -9,8 +9,8 @@
 
 * **Current Active Chunk:** **CHUNK 04 — AUTHENTICATION AND ROLES**
 * **Project Phase:** Authentication & Role-Based Access Control Foundation
-* **Implementation Permission:** **COMPLETED FOR CHUNK 04 (Round 7 Final Redis Test Corrections)** (Identity models, custom User model, authentication migrations, session login/logout endpoints, CSRF enforcement, strict production-only Redis rate-limiting enforcement eliminating local fallback, 100% Redis key namespace parity via effective cache key transformation, complete removal of counter resets adopting an immutable fixed-window authentication admission limiter preventing concurrent failure erasure, per-run Redis test key namespace isolation via injected key builder/prefix, strict Redis test endpoint safety checks with 3-factor gate and collision detection, coherent Redis Lua response contract validation failing closed to HTTP 503 on contradictory responses, corrected shared-IP/identifier target-limit concurrency burst testing, strict namespace-prefix test cleanup, safe non-destructive test isolation prohibiting FLUSHDB/FLUSHALL, institutional RBAC permission classes, audit metadata validation, password security, and 196 passing automated authentication tests with 10 cleanly skipped live-redis integration tests; Chunk 05 onward, examination business logic, grading workers, and frontend remain gated)
-* **Next Permitted Action:** Independent audit and project owner review of Chunk 04; Chunk 05 remains gated
+* **Implementation Permission:** **COMPLETED FOR CHUNK 04 (Round 7 Final Redis Test Corrections — PASS WITH WARNINGS)** (Identity models, custom User model, authentication migrations, session login/logout endpoints, CSRF enforcement, strict production-only Redis rate-limiting enforcement eliminating local fallback, 100% Redis key namespace parity via effective cache key transformation, complete removal of counter resets adopting an immutable fixed-window authentication admission limiter preventing concurrent failure erasure, per-run Redis test key namespace isolation via injected key builder/prefix, strict Redis test endpoint safety checks with 3-factor gate and collision detection, coherent Redis Lua response contract validation failing closed to HTTP 503 on contradictory responses, corrected shared-IP/identifier target-limit concurrency burst testing, strict namespace-prefix test cleanup, safe non-destructive test isolation prohibiting FLUSHDB/FLUSHALL, institutional RBAC permission classes, audit metadata validation, password security, and 196 passing automated authentication tests with 10 cleanly skipped live-redis integration tests; Chunk 05 onward, examination business logic, grading workers, and frontend remain gated)
+* **Next Permitted Action:** Awaiting explicit project owner approval ("APPROVE CHUNK 04 — ACCEPT PASS WITH WARNINGS AND RETAIN OUTSTANDING INTEGRATION VERIFICATION REQUIREMENTS"); Chunk 05 remains gated
 
 ---
 
@@ -22,7 +22,7 @@
 | **01** | System Architecture | **COMPLETED** | [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **APPROVED** (2026-11-03) |
 | **02** | Database Architecture | **COMPLETED** | [`docs/audits/chunk-02-database-architecture-audit.md`](chunk-02-database-architecture-audit.md) | **APPROVED** (2026-11-03) |
 | **03** | Backend Foundation | **COMPLETED** | [`docs/audits/chunk-03-backend-foundation-audit.md`](chunk-03-backend-foundation-audit.md) | **APPROVED** (2026-11-03) |
-| **04** | Authentication and Roles | **IN REVIEW** | [`docs/audits/chunk-04-authentication-roles-audit.md`](chunk-04-authentication-roles-audit.md) | **IN REVIEW (Round 7 Completed — Pending Independent Audit)** |
+| **04** | Authentication and Roles | **IN REVIEW** | [`docs/audits/chunk-04-authentication-roles-audit.md`](chunk-04-authentication-roles-audit.md) | **PASS WITH WARNINGS / OWNER APPROVAL PENDING** (Commit: `78d1c0a5fae07713c3810e7230ef5860b91ccc28`) |
 | **05** | FYUGP Academic Management | NOT STARTED | — | GATED |
 | **06** | Student and Faculty Management | NOT STARTED | — | GATED |
 | **07** | Subject Registration | NOT STARTED | — | GATED |
@@ -96,3 +96,8 @@ The following warnings from the Chunk 02 Database Architecture Independent Audit
 5. **Redis Live Cluster & Reverse Proxy IP Ingress Validation (Carried Over from Chunk 04):**
    - In production deployment (Chunk 16), live multi-worker Redis cluster latency, failover, and connection pool behavior must be validated under load (`REDIS CONCURRENCY VERIFICATION: NOT EXECUTED` in current local dev/test environment).
    - Reverse proxy (Nginx) must be configured to unconditionally overwrite `X-Forwarded-For` with `$remote_addr` or set `REMOTE_ADDR` via Unix socket when `TRUST_PROXY_CLIENT_IP=True` is enabled in production.
+
+6. **Outstanding Verification Requirements (Carried Over from Chunk 04 Pass with Warnings):**
+   - **Live Redis Integration Testing (Target: Chunk 15 / Chunk 16):** Execute the 10 live Redis integration tests (`SafeLiveRedisIntegrationTests`) against a verified disposable instance (`RUN_REDIS_INTEGRATION_TESTS=1`, dedicated `TEST_REDIS_URL`, `TEST_REDIS_DISPOSABLE=YES`). In the current development/test suite, these 10 tests are cleanly skipped (`skipped=10`) and must not be misrepresented as executed.
+   - **Production MySQL Integration Verification (Target: Chunk 15 / Chunk 16):** Execute integration test suite and schema verification against a live production-grade MySQL 8.x InnoDB instance under concurrent load.
+   - **Production Reverse Proxy, Ingress Trust & TLS Verification (Target: Chunk 16):** Verify production Nginx configuration for TLS termination, unconditional overwrite of `X-Forwarded-Proto`, unconditional overwrite of `X-Request-ID`, and trusted proxy header configuration before enabling `TRUST_PROXY_SSL_HEADER=True` or `TRUST_PROXY_CLIENT_IP=True`.
