@@ -1,16 +1,16 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-03 (Chunk 03 Round 3 Request-ID Normalization)  
+**Last Updated:** 2026-11-03 (Chunk 04 Authentication and Roles Authorization)  
 
 ---
 
 ## 1. Overall Status
 
-* **Current Active Chunk:** **CHUNK 03 — BACKEND FOUNDATION**
-* **Project Phase:** Backend Foundation & Infrastructure Initialization
-* **Implementation Permission:** **GRANTED FOR CHUNK 03 ONLY** (Django/DRF foundation, modular app skeletons, environment settings hierarchy, health check endpoint, security baseline, structured error handling, JSON/structured logging, and smoke test suite; models, domain migrations, examination business logic, grading workers, and frontend remain gated)
-* **Next Permitted Action:** Implement Chunk 03 backend foundation, execute smoke verification tests, and generate Chunk 03 audit documentation for independent review
+* **Current Active Chunk:** **CHUNK 04 — AUTHENTICATION AND ROLES**
+* **Project Phase:** Authentication & Role-Based Access Control Foundation
+* **Implementation Permission:** **COMPLETED FOR CHUNK 04** (Identity models, custom User model, authentication migrations, session login/logout endpoints, current user profile view, role-based permission classes, password security, and automated authentication tests; Chunk 05 onward, examination business logic, grading workers, and frontend remain gated)
+* **Next Permitted Action:** Independent audit and project owner review of Chunk 04; Chunk 05 remains gated
 
 ---
 
@@ -21,8 +21,8 @@
 | **00** | Requirements Audit | **COMPLETED** | [`docs/audits/chunk-00-requirements-audit.md`](chunk-00-requirements-audit.md) | **APPROVED** (2026-11-02) |
 | **01** | System Architecture | **COMPLETED** | [`docs/audits/chunk-01-system-architecture-audit.md`](chunk-01-system-architecture-audit.md) | **APPROVED** (2026-11-03) |
 | **02** | Database Architecture | **COMPLETED** | [`docs/audits/chunk-02-database-architecture-audit.md`](chunk-02-database-architecture-audit.md) | **APPROVED** (2026-11-03) |
-| **03** | Backend Foundation | **IN PROGRESS** | [`docs/audits/chunk-03-backend-foundation-audit.md`](chunk-03-backend-foundation-audit.md) | **IN PROGRESS (Pending Independent Audit)** |
-| **04** | Authentication and Roles | NOT STARTED | — | GATED |
+| **03** | Backend Foundation | **COMPLETED** | [`docs/audits/chunk-03-backend-foundation-audit.md`](chunk-03-backend-foundation-audit.md) | **APPROVED** (2026-11-03) |
+| **04** | Authentication and Roles | **IN REVIEW** | [`docs/audits/chunk-04-authentication-roles-audit.md`](chunk-04-authentication-roles-audit.md) | **IN REVIEW (Pending Independent Audit)** |
 | **05** | FYUGP Academic Management | NOT STARTED | — | GATED |
 | **06** | Student and Faculty Management | NOT STARTED | — | GATED |
 | **07** | Subject Registration | NOT STARTED | — | GATED |
@@ -83,3 +83,7 @@ The following warnings from the Chunk 02 Database Architecture Independent Audit
    - Official letter grading scale and 10-point formula mapping must be populated in `academics_institutional_config`.
    - Hard production activation gate must prevent examination activation while `EXAM_PIN_DELIVERY_METHOD` or `EXAM_EVIDENCE_KEY_RETENTION_PERIOD` remains `UNCONFIGURED`.
    - Statutory retention schedules for private descriptive upload files (photos/PDFs) must be confirmed and configured before production deployment.
+
+4. **Reverse Proxy Ingress & Socket Isolation (Carried Over from Chunk 03):**
+   - In production deployment (Chunk 16), Nginx reverse proxy must be configured to unconditionally overwrite `proxy_set_header X-Forwarded-Proto $scheme;` and `proxy_set_header X-Request-ID $request_id;`.
+   - Direct network access to Gunicorn/Django must be mechanically blocked via Unix domain socket (`/run/gunicorn.sock` mode `0660`) or host firewall before `TRUST_PROXY_SSL_HEADER=True` is enabled.

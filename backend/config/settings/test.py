@@ -21,9 +21,10 @@ DATABASES = {
     }
 }
 
-# Accelerated password hasher for unit tests
+# Accelerated password hasher for unit tests (with PBKDF2 available for verification)
 PASSWORD_HASHERS = [
     'django.contrib.auth.hashers.MD5PasswordHasher',
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',
 ]
 
 # Clean test execution output
