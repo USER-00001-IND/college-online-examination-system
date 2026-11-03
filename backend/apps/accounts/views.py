@@ -32,7 +32,7 @@ from apps.accounts.permissions import (
     IsStudentUserRole,
 )
 from apps.accounts.serializers import LoginSerializer, UserSerializer
-from apps.accounts.throttling import AuthenticationThrottle
+from apps.accounts.throttling import AuthenticationThrottle, ThrottleBackendError
 
 logger = logging.getLogger('college.accounts')
 
@@ -104,14 +104,42 @@ class LoginView(APIView):
 
     def post(self, request):
         ip_address = get_validated_client_ip(request)
+        if not ip_address:
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Unable to verify trustworthy client IP address for authentication.",
+                        "details": {},
+                        "timestamp": timezone.now().isoformat(),
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         raw_identifier = request.data.get('identifier', '') if isinstance(request.data, dict) else ''
 
         # ----------------------------------------------------------------------
-        # Finding C: Authentication Throttling Check (Before Password Verification)
+        # Round 3: Atomic Pre-Auth Admission & Throttling (Fails Closed on Failure)
         # ----------------------------------------------------------------------
         throttle = AuthenticationThrottle()
-        is_throttled, retry_after = throttle.is_throttled(ip_address, str(raw_identifier))
-        if is_throttled:
+        try:
+            admitted, retry_after, reason = throttle.acquire_admission(ip_address, str(raw_identifier))
+        except ThrottleBackendError:
+            logger.critical("Authentication request rejected: Throttle infrastructure failure.")
+            return Response(
+                {
+                    "error": {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": "Authentication service temporarily unavailable. Rate-limiting infrastructure error.",
+                        "details": {},
+                        "timestamp": timezone.now().isoformat(),
+                    }
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        if not admitted:
             resp = Response(
                 {
                     "error": {
@@ -155,7 +183,6 @@ class LoginView(APIView):
         # Mitigate username enumeration timing attacks
         if user is None:
             User().set_password(password)
-            throttle.record_failed_attempt(ip_address, identifier)
             record_auth_event(None, identifier, AuthEventType.LOGIN_FAILED, request, raise_on_failure=False)
             return Response(
                 {
@@ -171,7 +198,6 @@ class LoginView(APIView):
 
         # Check password against stored hash
         if not user.check_password(password):
-            throttle.record_failed_attempt(ip_address, identifier)
             record_auth_event(user, identifier, AuthEventType.LOGIN_FAILED, request, raise_on_failure=False)
             return Response(
                 {
@@ -187,7 +213,6 @@ class LoginView(APIView):
 
         # Check account activation status
         if not user.is_active:
-            throttle.record_failed_attempt(ip_address, identifier)
             record_auth_event(user, identifier, AuthEventType.LOGIN_FAILED, request, raise_on_failure=False)
             return Response(
                 {
@@ -221,7 +246,7 @@ class LoginView(APIView):
             )
 
         # Clear compound rate-limiting throttle on successful authentication
-        throttle.reset_attempts(ip_address, identifier)
+        throttle.reset_target(ip_address, identifier)
 
         # Establish Django session and cycle session key to prevent session fixation
         django_login(request, user, backend='apps.accounts.backends.EmailOrUsernameModelBackend')

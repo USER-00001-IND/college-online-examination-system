@@ -25,6 +25,7 @@ class ProductionSecurityBaselineTests(SimpleTestCase):
             'CORS_ALLOWED_ORIGINS': 'https://exam.college.edu',
             'CSRF_TRUSTED_ORIGINS': 'https://exam.college.edu',
             'SECURE_SSL_REDIRECT': 'True',
+            'REDIS_URL': 'redis://127.0.0.1:6379/1',
         }
         cls.rf = RequestFactory()
 

@@ -134,23 +134,45 @@ if isinstance(raw_trust_client_ip, str) and raw_trust_client_ip.strip().lower() 
 TRUST_PROXY_CLIENT_IP = env.bool('TRUST_PROXY_CLIENT_IP', default=False)
 
 # --------------------------------------------------------------------------
-# Production Authentication Throttling & Cache Backend Gate (Finding C)
+# Production Authentication Throttling & Cache Backend Gate (Round 3 Finding)
 # --------------------------------------------------------------------------
-# In production, authentication rate limiting requires an atomic, shared cache backend
-# to prevent race conditions across concurrent multi-worker processes.
+# In production, authentication rate limiting strictly requires a shared Redis cache backend
+# to prevent race conditions and ensure atomic check-and-reserve across multi-worker processes.
+# LocMemCache, DummyCache, FileBasedCache, and unconfigured backends are rejected at startup.
 CACHE_URL = env('CACHE_URL', default=None)
 REDIS_URL = env('REDIS_URL', default=None)
+raw_cache_url = REDIS_URL or CACHE_URL
 
-if REDIS_URL or CACHE_URL:
-    CACHES = {
-        'default': env.cache_url('REDIS_URL' if REDIS_URL else 'CACHE_URL')
-    }
-
-# Disallow DummyCache in production under all circumstances
-if CACHES['default']['BACKEND'] == 'django.core.cache.backends.dummy.DummyCache':
+if not raw_cache_url:
     raise ImproperlyConfigured(
-        "CRITICAL SECURITY CONFIGURATION ERROR: DummyCache is strictly forbidden in production. "
-        "Authentication rate limiting requires an active cache backend."
+        "CRITICAL SECURITY CONFIGURATION ERROR: Production requires an explicit shared cache backend "
+        "for atomic authentication rate limiting. REDIS_URL (or CACHE_URL) must be configured."
+    )
+
+clean_cache_url = raw_cache_url.strip()
+valid_schemes = ('redis://', 'rediss://', 'unix://')
+if not any(clean_cache_url.startswith(scheme) for scheme in valid_schemes):
+    raise ImproperlyConfigured(
+        f"CRITICAL SECURITY CONFIGURATION ERROR: Unsupported production cache URL '{raw_cache_url}'. "
+        "Production authentication throttling requires a Redis backend ('redis://', 'rediss://', or 'unix://')."
+    )
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': clean_cache_url,
+    }
+}
+
+forbidden_backends = (
+    'django.core.cache.backends.locmem.LocMemCache',
+    'django.core.cache.backends.dummy.DummyCache',
+    'django.core.cache.backends.filebased.FileBasedCache',
+)
+if CACHES['default']['BACKEND'] in forbidden_backends:
+    raise ImproperlyConfigured(
+        f"CRITICAL SECURITY CONFIGURATION ERROR: Backend '{CACHES['default']['BACKEND']}' "
+        "is forbidden in production. Shared atomic Redis cache is required."
     )
 
 # HTTPS and Cookie Security

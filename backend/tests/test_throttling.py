@@ -1,19 +1,27 @@
 """
-Tests for Authentication Rate Limiting, Brute-Force Throttling, and Cache Gates.
+Tests for Authentication Rate Limiting, Brute-Force Throttling, Concurrency, and Production Cache Gates.
 College Online Examination System.
 """
 
+import concurrent.futures
+import importlib
+import os
+import time
+from unittest.mock import patch
+
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
-from django.test import Client, TestCase, override_settings
+from django.test import Client, RequestFactory, TestCase
 from django.urls import reverse
 from rest_framework import status
+from rest_framework.test import APIRequestFactory
 
 from apps.accounts.models import RoleChoices, User
-from apps.accounts.throttling import AuthenticationThrottle
+from apps.accounts.throttling import AuthenticationThrottle, ThrottleBackendError
+from apps.accounts.views import LoginView
 
 
-class AuthenticationThrottlingTests(TestCase):
+class AuthenticationThrottlingAPITests(TestCase):
     """
     Verifies dual-dimension rate limiting across client IP addresses and target identifiers.
     Ensures enumeration resistance, case normalization, and window expiration.
@@ -60,7 +68,7 @@ class AuthenticationThrottlingTests(TestCase):
         """Verify exceeding target threshold returns HTTP 429 RATE_LIMIT_EXCEEDED."""
         client, csrf_token = self._get_csrf_client()
 
-        # Submit 5 failed attempts (configured target limit)
+        # Submit 5 attempts (configured target limit)
         for _ in range(5):
             response = client.post(
                 self.login_url,
@@ -200,7 +208,7 @@ class AuthenticationThrottlingTests(TestCase):
 
         # After success, counter is reset: read updated CSRF token from active session
         current_csrf = client.cookies.get('csrftoken').value
-        # 3 more failed attempts must still be allowed
+        # 3 more failed attempts must still be allowed without hitting 429
         for _ in range(3):
             resp = client.post(
                 self.login_url,
@@ -234,14 +242,212 @@ class AuthenticationThrottlingTests(TestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
 
-    def test_production_cache_gate_rejects_dummy_cache(self):
-        """Verify production configuration gate raises ImproperlyConfigured if DummyCache is used."""
-        unsafe_caches = {
-            'default': {
-                'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
-            }
+
+class ProductionCacheSettingsGateTests(TestCase):
+    """
+    Verifies that the actual production settings module rejects unsafe cache backends
+    and requires an explicit Redis backend at startup.
+    """
+
+    def setUp(self):
+        self.base_prod_env = {
+            'SECRET_KEY': 'production-secret-key-that-is-at-least-50-characters-long-and-random',
+            'ALLOWED_HOSTS': 'exam.gauhati.ac.in',
+            'DB_NAME': 'test_db',
+            'DB_USER': 'test_user',
+            'DB_PASSWORD': 'test_password',
+            'DB_HOST': '127.0.0.1',
+            'TRUST_PROXY_SSL_HEADER': 'False',
+            'TRUST_PROXY_CLIENT_IP': 'False',
         }
-        with override_settings(CACHES=unsafe_caches):
-            # Check logic in production settings
-            backend = unsafe_caches['default']['BACKEND']
-            self.assertEqual(backend, 'django.core.cache.backends.dummy.DummyCache')
+
+    def test_missing_cache_url_rejected_in_production(self):
+        """Verify production startup fails closed if REDIS_URL/CACHE_URL is not provided."""
+        env = dict(self.base_prod_env)
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ImproperlyConfigured) as ctx:
+                import config.settings.production
+                importlib.reload(config.settings.production)
+            self.assertIn("REDIS_URL", str(ctx.exception))
+
+    def test_unsupported_cache_scheme_rejected_in_production(self):
+        """Verify non-Redis cache schemes are rejected in production."""
+        env = dict(self.base_prod_env)
+        env['REDIS_URL'] = 'http://insecure-cache-host:6379'
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ImproperlyConfigured) as ctx:
+                import config.settings.production
+                importlib.reload(config.settings.production)
+            self.assertIn("Unsupported production cache URL", str(ctx.exception))
+
+    def test_valid_redis_url_accepted_in_production(self):
+        """Verify valid redis:// URL is successfully accepted and configures RedisCache."""
+        env = dict(self.base_prod_env)
+        env['REDIS_URL'] = 'redis://127.0.0.1:6379/1'
+        with patch.dict(os.environ, env, clear=True):
+            import config.settings.production
+            importlib.reload(config.settings.production)
+            caches = config.settings.production.CACHES
+            self.assertEqual(caches['default']['BACKEND'], 'django.core.cache.backends.redis.RedisCache')
+            self.assertEqual(caches['default']['LOCATION'], 'redis://127.0.0.1:6379/1')
+
+
+class ConcurrentRateLimitingTests(TestCase):
+    """
+    Verifies concurrency-safe atomic admission under simultaneous multi-threaded bursts.
+    Proves that check-and-reserve eliminates race conditions.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.rf = APIRequestFactory()
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_concurrency_same_ip_burst(self):
+        """
+        Test A — Same-IP burst:
+        Submit 30 concurrent admission requests with IP limit = 15.
+        Exactly 15 must be admitted, and remaining 15 denied.
+        """
+        throttle = AuthenticationThrottle(ip_limit=15, ip_window=60, target_limit=50, target_window=60)
+        results = []
+
+        def submit_attempt(i):
+            return throttle.acquire_admission('192.168.1.50', f'burst_user_{i}')
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(submit_attempt, i) for i in range(30)]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+
+        admitted = [r for r in results if r[0] is True]
+        denied = [r for r in results if r[0] is False]
+
+        self.assertEqual(len(admitted), 15, f"Expected exactly 15 admitted, got {len(admitted)}")
+        self.assertEqual(len(denied), 15, f"Expected exactly 15 denied, got {len(denied)}")
+        for r in denied:
+            self.assertEqual(r[2], 'IP_LIMIT')
+
+    def test_concurrency_same_identifier_burst(self):
+        """
+        Test B — Same-identifier burst:
+        Submit 20 concurrent admission requests for the same IP and target with target limit = 5.
+        Exactly 5 must be admitted, and remaining 15 denied.
+        """
+        throttle = AuthenticationThrottle(ip_limit=50, ip_window=60, target_limit=5, target_window=60)
+        results = []
+
+        def submit_attempt(i):
+            return throttle.acquire_admission('192.168.1.60', 'same_target_user')
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(submit_attempt, i) for i in range(20)]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+
+        admitted = [r for r in results if r[0] is True]
+        denied = [r for r in results if r[0] is False]
+
+        self.assertEqual(len(admitted), 5, f"Expected exactly 5 admitted, got {len(admitted)}")
+        self.assertEqual(len(denied), 15, f"Expected exactly 15 denied, got {len(denied)}")
+        for r in denied:
+            self.assertEqual(r[2], 'TARGET_LIMIT')
+            self.assertGreater(r[1], 0)  # retry_after must be positive
+
+    def test_shared_worker_state(self):
+        """
+        Test C — Shared worker state:
+        Two independent limiter instances using the same shared cache observe synchronized counters.
+        """
+        worker_1_limiter = AuthenticationThrottle(target_limit=5, target_window=60)
+        worker_2_limiter = AuthenticationThrottle(target_limit=5, target_window=60)
+
+        # Worker 1 admits 3 attempts
+        for _ in range(3):
+            admitted, _, _ = worker_1_limiter.acquire_admission('10.0.0.5', 'shared_user')
+            self.assertTrue(admitted)
+
+        # Worker 2 must observe the state: admits 2 more
+        for _ in range(2):
+            admitted, _, _ = worker_2_limiter.acquire_admission('10.0.0.5', 'shared_user')
+            self.assertTrue(admitted)
+
+        # 6th attempt via Worker 1 must be denied
+        admitted, retry_after, reason = worker_1_limiter.acquire_admission('10.0.0.5', 'shared_user')
+        self.assertFalse(admitted)
+        self.assertEqual(reason, 'TARGET_LIMIT')
+
+    def test_backend_failure_fails_closed_without_password_check(self):
+        """
+        Test D — Backend failure:
+        When throttle backend fails, request fails closed with HTTP 503.
+        Password verification is NEVER executed.
+        """
+        view = LoginView.as_view()
+        request = self.rf.post(
+            '/api/v1/auth/login/',
+            data={'identifier': 'some_student', 'password': 'Password123!'},
+            format='json',
+            REMOTE_ADDR='192.168.1.1',
+        )
+
+        with patch.object(AuthenticationThrottle, 'acquire_admission', side_effect=ThrottleBackendError("Redis down")):
+            with patch.object(User, 'check_password') as mock_check_password:
+                response = view(request)
+                self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+                self.assertEqual(response.data['error']['code'], 'SERVICE_UNAVAILABLE')
+                # Proves password check was NEVER executed
+                mock_check_password.assert_not_called()
+
+    def test_sliding_window_expiration(self):
+        """
+        Test E — Expiration:
+        Exhaust limit in short window (1 second). After window expires, subsequent attempt is admitted.
+        """
+        short_throttle = AuthenticationThrottle(target_limit=2, target_window=1)
+
+        # 2 attempts admitted
+        self.assertTrue(short_throttle.acquire_admission('10.0.0.8', 'expiring_user')[0])
+        self.assertTrue(short_throttle.acquire_admission('10.0.0.8', 'expiring_user')[0])
+
+        # 3rd attempt denied
+        self.assertFalse(short_throttle.acquire_admission('10.0.0.8', 'expiring_user')[0])
+
+        # Wait for 1-second window to expire
+        time.sleep(1.1)
+
+        # Subsequent attempt must be admitted
+        admitted, _, reason = short_throttle.acquire_admission('10.0.0.8', 'expiring_user')
+        self.assertTrue(admitted, f"Expected admitted after expiry, got reason {reason}")
+
+    def test_boundary_condition_single_slot_concurrency(self):
+        """
+        Test F — Boundary condition:
+        When exactly 1 admission slot remains, 10 concurrent threads attempt to reserve it.
+        Exactly 1 must succeed; all other 9 must be rejected.
+        """
+        throttle = AuthenticationThrottle(target_limit=5, target_window=60)
+
+        # Reserve 4 slots
+        for _ in range(4):
+            admitted, _, _ = throttle.acquire_admission('10.0.0.9', 'boundary_user')
+            self.assertTrue(admitted)
+
+        # 1 slot remains: launch 10 simultaneous attempts
+        results = []
+
+        def race_for_last_slot(i):
+            return throttle.acquire_admission('10.0.0.9', 'boundary_user')
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(race_for_last_slot, i) for i in range(10)]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+
+        admitted = [r for r in results if r[0] is True]
+        denied = [r for r in results if r[0] is False]
+
+        self.assertEqual(len(admitted), 1, f"Expected exactly 1 admitted for last slot, got {len(admitted)}")
+        self.assertEqual(len(denied), 9, f"Expected 9 denied, got {len(denied)}")

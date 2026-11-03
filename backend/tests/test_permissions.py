@@ -268,17 +268,45 @@ class RoleBasedAccessControlTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_student_cannot_be_escalated_via_granular_role(self):
-        """Verify primary role STUDENT is hard-barred from administrative endpoints even if granular role exists."""
-        exam_officer_role = Role.objects.create(code='EXAM_OFFICER_STUDENT_TEST', name='Exam Officer')
+        """
+        Verify primary role STUDENT is hard-barred from privileged endpoints even if assigned
+        the exact institutional 'EXAM_OFFICER' role code (Finding B & Round 3 correction).
+        """
+        exam_officer_role, _ = Role.objects.get_or_create(
+            code='EXAM_OFFICER',
+            defaults={'name': 'Exam Officer'},
+        )
         UserRole.objects.create(
             user=self.student,
             role=exam_officer_role,
             assigned_by=self.superadmin,
         )
 
+        # 1. UserRole is linked and student.has_role('EXAM_OFFICER') returns True
+        self.assertTrue(self.student.has_role('EXAM_OFFICER'))
+
         self.client.force_login(self.student)
+
+        # 2. Administrator endpoint access remains strictly 403 Forbidden
         response = self.client.get(self.admin_url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data['error']['code'], 'PERMISSION_DENIED')
+
+        # 3. Faculty endpoint access remains strictly 403 Forbidden
+        response = self.client.get(self.faculty_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data['error']['code'], 'PERMISSION_DENIED')
+
+        # 4. College superadministrator permission remains denied
+        class DummyRequest:
+            def __init__(self, user):
+                self.user = user
+
+        self.assertFalse(IsCollegeSuperAdmin().has_permission(DummyRequest(self.student), None))
+
+        # 5. The ordinary student endpoint remains accessible
+        response = self.client.get(self.student_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_inactive_and_anonymous_users_strictly_denied(self):
         """Verify inactive and unauthenticated users receive 401 on protected endpoints."""

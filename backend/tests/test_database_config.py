@@ -54,6 +54,7 @@ class DatabaseConfigurationTests(SimpleTestCase):
             'DB_PASSWORD': 'strong_production_password_value',
             'DB_HOST': 'db-cluster.internal',
             'DB_PORT': '3306',
+            'REDIS_URL': 'redis://127.0.0.1:6379/1',
         }
         with mock.patch.dict(os.environ, env_vars, clear=False):
             prod = importlib.import_module('config.settings.production')

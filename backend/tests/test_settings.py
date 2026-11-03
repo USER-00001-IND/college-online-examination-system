@@ -63,6 +63,7 @@ class SettingsLoadingTests(TestCase):
             'CORS_ALLOWED_ORIGINS': 'https://exam.college.edu',
             'CSRF_TRUSTED_ORIGINS': 'https://exam.college.edu',
             'SECURE_SSL_REDIRECT': 'True',
+            'REDIS_URL': 'redis://127.0.0.1:6379/1',
         }
         with mock.patch.dict(os.environ, env_vars, clear=False):
             prod_settings = importlib.import_module('config.settings.production')
@@ -86,6 +87,7 @@ class SettingsLoadingTests(TestCase):
             'DB_PASSWORD': 'strong_production_password_value',
             'DB_HOST': 'db-cluster.internal',
             'DB_PORT': '3306',
+            'REDIS_URL': 'redis://127.0.0.1:6379/1',
             'TRUST_PROXY_SSL_HEADER': 'True',
         }
         with mock.patch.dict(os.environ, env_vars, clear=False):

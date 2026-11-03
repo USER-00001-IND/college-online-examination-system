@@ -26,18 +26,20 @@ class AuditPersistenceError(Exception):
     pass
 
 
-def get_validated_client_ip(request) -> str:
+def get_validated_client_ip(request) -> Optional[str]:
     """
     Extracts and strictly validates the client IP address.
 
-    Security Specification:
+    Security Specification (Round 3 Correction):
     1. Independent Trust Boundary: Does NOT rely on TRUST_PROXY_SSL_HEADER.
        Only inspects HTTP_X_FORWARDED_FOR if TRUST_PROXY_CLIENT_IP is explicitly True.
     2. Strict Validation: Uses Python's ipaddress.ip_address() to validate syntax.
        Malformed, spoofed, or injected non-IP strings are strictly rejected.
     3. Safe Fallback: When proxy trust is disabled or forwarded values are invalid,
        falls back to validated REMOTE_ADDR.
-    4. Safe Default: If REMOTE_ADDR is missing or malformed, returns '127.0.0.1'.
+    4. Fail-Closed on Missing/Invalid Address: Never invents an authentic loopback
+       address ('127.0.0.1') when REMOTE_ADDR is missing or malformed. Returns None
+       so callers can enforce fail-closed security.
     """
     trust_proxy = getattr(settings, 'TRUST_PROXY_CLIENT_IP', False)
     candidate_ip: Optional[str] = None
@@ -45,7 +47,6 @@ def get_validated_client_ip(request) -> str:
     if trust_proxy:
         forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
         if forwarded and isinstance(forwarded, str):
-            # First hop is the client-facing ingress IP when behind trusted reverse proxy
             first_hop = forwarded.split(',')[0].strip()
             try:
                 ip_obj = ipaddress.ip_address(first_hop)
@@ -63,9 +64,12 @@ def get_validated_client_ip(request) -> str:
                 candidate_ip = str(ip_obj)
             except ValueError:
                 logger.warning("Rejected syntactically invalid REMOTE_ADDR IP address.")
-                candidate_ip = '127.0.0.1'
+                candidate_ip = None
         else:
-            candidate_ip = '127.0.0.1'
+            candidate_ip = None
+
+    if candidate_ip is None:
+        return None
 
     return candidate_ip[:45]
 
@@ -114,7 +118,7 @@ def record_auth_event(
     - For failure events (e.g. LOGIN_FAILED), raise_on_failure=False logs a critical error
       without masking the primary failure or leaking database exceptions to clients.
     """
-    ip_address = get_validated_client_ip(request)
+    ip_address = get_validated_client_ip(request) or 'UNKNOWN'
     identifier_entered = sanitize_identifier(raw_identifier)
     user_agent = sanitize_user_agent(request)
 

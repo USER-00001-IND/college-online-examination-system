@@ -1,11 +1,11 @@
-# Chunk 04: Authentication and Roles Audit Report (Round 2 Security Corrections)
+# Chunk 04: Authentication and Roles Audit Report (Round 3 Rate-Limiting & Concurrency Corrections)
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-03 (Round 2 Revision)  
+**Date:** 2026-11-03 (Round 3 Revision)  
 **Stage:** Chunk 04 — Authentication and Roles  
-**Last Audited Commit:** `ee4cf67669095b1e74090debc882fe689c396050`  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 4 Round 2 security findings [2 HIGH, 2 MEDIUM] have been resolved, verified, and backed by 113 passing automated tests; Chunk 05 onward remains strictly gated).
+**Last Audited Commit:** `784341672bff82651435a5a1f71addf80a3b7ffe`  
+**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (All 3 Round 3 findings [1 HIGH, 1 MEDIUM, 1 LOW] and the client IP fallback review have been resolved, verified, and backed by 123 passing automated tests; Chunk 05 onward remains strictly gated).
 
 ---
 
@@ -414,16 +414,160 @@ The public authentication endpoint did not enforce application-level rate limiti
 
 ---
 
-## 8. Verification and Test Results Summary
+## 8. Verification and Test Results Summary (Round 2 Baseline)
+
+- **Round 2 Test Suite:** 113 passing tests.
+- **Round 2 Audit Verdict:** Revision required (1 HIGH, 1 MEDIUM, 1 LOW).
+
+---
+
+## 9. Round 3 — Production Throttling, Concurrency, and Privilege Escalation Corrections
+
+### 9.1 Summary of Addressed Findings
+
+| Finding ID | Severity | Description | Status |
+| :--- | :---: | :--- | :---: |
+| **Finding 1** | **HIGH** | Unsafe production authentication cache defaults to local memory (`LocMemCache`) | **RESOLVED** |
+| **Finding 2** | **MEDIUM** | Non-atomic rate-limit admission allows concurrent brute-force race conditions | **RESOLVED** |
+| **Finding 3** | **LOW** | Privilege-escalation regression test uses arbitrary role code instead of institutional `EXAM_OFFICER` | **RESOLVED** |
+| **Review Item**| **DEFENSE**| Client IP fallback returns `'127.0.0.1'` when `REMOTE_ADDR` is missing or invalid | **RESOLVED** |
+
+---
+
+### 9.2 Finding 1 (HIGH) — Mandatory Production Shared Cache Enforcement
+
+#### 1. Root Cause
+In Round 2, `backend/config/settings/production.py` used `env.cache('REDIS_URL', default=None)`. If operators did not provide `REDIS_URL` or `CACHE_URL`, Django defaulted to local-memory caching (`LocMemCache`). In a multi-worker production environment (e.g., Gunicorn with 4–8 workers), each worker maintained an independent in-memory cache, fragmenting brute-force rate-limit counters and allowing attackers to multiply allowable login attempts by the number of active workers.
+
+#### 2. Resolution & Production Gate
+- Updated `backend/config/settings/production.py`:
+  - Strictly requires `REDIS_URL` or `CACHE_URL` environment variable.
+  - Validates cache URL scheme strictly against approved shared cache protocols (`redis://`, `rediss://`, `unix://`).
+  - Configures `CACHES['default']` with `django.core.cache.backends.redis.RedisCache`.
+  - Rejects `LocMemCache`, `DummyCache`, `FileBasedCache`, `DatabaseCache`, or missing cache variables with a blocking `django.core.exceptions.ImproperlyConfigured`.
+  - Documented production Redis requirements and cluster topologies in `backend/.env.example` and `.env.example`.
+  - Installed `redis>=5.0.0,<6.0.0` (version 5.3.1) in `backend/requirements.txt`.
+
+#### 3. Verification
+- `tests.test_throttling.ProductionCacheSettingsGateTests`:
+  - `test_production_rejects_missing_cache_url`: Confirms `ImproperlyConfigured` is raised when neither `REDIS_URL` nor `CACHE_URL` is set.
+  - `test_production_rejects_unsupported_cache_scheme`: Confirms `ImproperlyConfigured` is raised when unsupported schemes (e.g. `locmem://`, `file://`) are provided.
+  - `test_production_configures_redis_cache_when_valid`: Confirms `RedisCache` is configured and bound when valid `redis://` URL is provided.
+
+---
+
+### 9.3 Finding 2 (MEDIUM) — Atomic Check-and-Reserve Rate-Limit Admission
+
+#### 1. Root Cause & Concurrency Vulnerability
+In Round 2, rate limiting followed a check-then-increment pattern: `LoginView` checked if attempts were within limits using `cache.get()`, proceeded with password verification, and only incremented the counter via `record_attempt()` post-authentication. Under concurrent bursts, multiple parallel requests could evaluate `is_admitted() == True` before any failed attempt was committed, allowing attackers to perform high-volume credential stuffing within a single concurrency window.
+
+#### 2. Resolution: Check-and-Reserve Admission Semantics
+- Redesigned `backend/apps/accounts/throttling.py` around `acquire_admission(ip, identifier) -> (admitted, retry_after, reason)`:
+  - **Check-and-Reserve Pattern:** Every login request atomically checks the threshold and reserves an attempt counter slot *before* password verification or hashing is executed.
+  - **Redis Lua Script Atomicity (`REDIS_CHECK_AND_RESERVE_LUA`):**
+    ```lua
+    local ip_key = KEYS[1]
+    local target_key = KEYS[2]
+    local ip_limit = tonumber(ARGV[1])
+    local ip_window = tonumber(ARGV[2])
+    local target_limit = tonumber(ARGV[3])
+    local target_window = tonumber(ARGV[4])
+
+    local ip_count = tonumber(redis.call('get', ip_key) or '0')
+    if ip_count >= ip_limit then
+        local ttl = redis.call('ttl', ip_key)
+        return {0, ttl, 'IP_LIMIT'}
+    end
+
+    local target_count = tonumber(redis.call('get', target_key) or '0')
+    if target_count >= target_limit then
+        local ttl = redis.call('ttl', target_key)
+        return {0, ttl, 'TARGET_LIMIT'}
+    end
+
+    local new_ip = redis.call('incr', ip_key)
+    if new_ip == 1 then
+        redis.call('expire', ip_key, ip_window)
+    end
+
+    local new_target = redis.call('incr', target_key)
+    if new_target == 1 then
+        redis.call('expire', target_key, target_window)
+    end
+
+    return {1, 0, 'OK'}
+    ```
+  - **Local/Test Thread-Locked Atomic Cache:** For non-Redis caches in development and testing, an identical check-and-reserve transaction is executed under `_local_throttle_lock = threading.RLock()`.
+  - **Standardized HTTP 429:** Denied requests immediately return HTTP 429 Too Many Requests (`RATE_LIMIT_EXCEEDED`) with a RFC-compliant `Retry-After: <seconds>` HTTP header.
+  - **Fail-Closed on Infrastructure Outage:** If the cache backend is unavailable or throws an exception, `acquire_admission()` raises `ThrottleBackendError`. `LoginView` catches this and returns HTTP 503 Service Unavailable (`SERVICE_UNAVAILABLE`). Crucially, zero password verification, dummy hashing, or PBKDF2 operations are executed, preserving backend resources during cache failures.
+  - **Target Attempt Reset:** On successful authentication, target identifier attempts are cleared via `reset_target(ip, identifier)` to restore access for legitimate users. The IP-level attempt counter is deliberately retained to prevent password spraying across multiple student accounts from a single IP.
+
+#### 3. Concurrency Test Evidence
+- `tests.test_throttling.ConcurrentRateLimitingTests`:
+  - **Test A (`test_concurrency_same_ip_burst`):** 30 concurrent threads submit admission requests for the same IP (limit = 15). Exactly 15 are admitted, and 15 are denied with `IP_LIMIT`. Zero race condition leakage.
+  - **Test B (`test_concurrency_same_identifier_burst`):** 20 concurrent threads submit admission requests for the same identifier (limit = 5). Exactly 5 are admitted, and 15 are denied with `TARGET_LIMIT` and positive `Retry-After`.
+  - **Test C (`test_shared_worker_state`):** Independent throttle instances sharing the underlying cache observe identical counters and enforce thresholds uniformly.
+  - **Test D (`test_backend_failure_fails_closed_without_password_check`):** Simulating a cache backend failure returns HTTP 503 `SERVICE_UNAVAILABLE` and asserts `mock_check_password.assert_not_called()`.
+  - **Test E (`test_sliding_window_expiration`):** Exhausts a 1-second window, waits for expiration, and confirms subsequent attempts are successfully admitted.
+  - **Test F (`test_boundary_single_slot_remaining`):** With 1 slot remaining, 10 concurrent threads attempt admission; exactly 1 succeeds and 9 are rejected.
+
+---
+
+### 9.4 Finding 3 (LOW) — Institutional Role Privilege-Escalation Regression Test
+
+#### 1. Root Cause
+In Round 2, `test_student_cannot_be_escalated_via_granular_role` used a synthetic role code `EXAM_OFFICER_STUDENT_TEST`. While it verified basic role non-escalation, it did not exercise the actual institutional role `EXAM_OFFICER` (`RoleChoices.EXAM_OFFICER`) against the real permission classes.
+
+#### 2. Resolution & Verification
+- Updated `backend/tests/test_permissions.py:test_student_cannot_be_escalated_via_granular_role`:
+  - Creates the authentic institutional role `Role.objects.create(code=RoleChoices.EXAM_OFFICER, name='Examination Officer')`.
+  - Assigns this role to an active student user via `UserRole`.
+  - Asserts `student.has_role(RoleChoices.EXAM_OFFICER)` is `True`.
+  - Requests `/api/v1/auth/test/admin-only/` with authenticated student session -> returns HTTP 403 Forbidden.
+  - Requests `/api/v1/auth/test/faculty-only/` with authenticated student session -> returns HTTP 403 Forbidden.
+  - Evaluates `IsCollegeSuperAdmin().has_permission(request, None)` -> returns `False`.
+  - Requests `/api/v1/auth/test/student-only/` with authenticated student session -> returns HTTP 200 OK.
+
+---
+
+### 9.5 Client IP Fallback Review — Fail-Closed Ingress Resolution
+
+#### 1. Root Cause & Review
+In Round 2, `get_validated_client_ip()` defaulted candidate IP strings to `'127.0.0.1'` when `REMOTE_ADDR` was missing or syntactically invalid. In production or behind improperly configured proxies, this could cause distinct external clients with missing headers to share the loopback rate-limit bucket or bypass IP tracking.
+
+#### 2. Resolution
+- Updated `backend/apps/accounts/audit.py:get_validated_client_ip()`:
+  - If `REMOTE_ADDR` is missing or syntactically invalid, returns `None` (never fabricates `'127.0.0.1'`).
+- Updated `backend/apps/accounts/views.py:LoginView`:
+  - If `ip_address is None`, immediately rejects the request with HTTP 400 Bad Request (`VALIDATION_ERROR: "Unable to determine client IP address."`).
+  - Completely stops authentication processing and bypasses password verification.
+- Verified in `tests.test_audit.AuditMetadataValidationTests`:
+  - `test_missing_remote_addr_returns_none`
+  - `test_malformed_remote_addr_returns_none`
+  - `test_login_fails_closed_when_client_ip_cannot_be_determined`
+
+---
+
+### 9.6 Unverified Infrastructure Assumptions
+
+> [!IMPORTANT]
+> **REDIS CONCURRENCY VERIFICATION: NOT EXECUTED**
+> All automated concurrency tests (`ConcurrentRateLimitingTests`) were executed in the test environment using Python's `concurrent.futures.ThreadPoolExecutor` against the thread-locked atomic cache implementation (`_local_throttle_lock`).
+> Testing against a live, running Redis cluster daemon with real network socket latency was **NOT executed** in this environment because no live Redis service is running locally.
+> The atomic Redis Lua script (`REDIS_CHECK_AND_RESERVE_LUA`) was statically analyzed and validated, but full live multi-node Redis cluster validation remains an operational deployment verification requirement (carried over to Chunk 16 Deployment).
+
+---
+
+## 10. Verification and Test Results Summary
 
 ```bash
 $ .venv/bin/python backend/manage.py test tests --settings=config.settings.test
-Found 113 test(s).
+Found 123 test(s).
 Creating test database for alias 'default'...
 System check identified no issues (0 silenced).
-.................................................................................................................
+...........................................................................................................................
 ----------------------------------------------------------------------
-Ran 113 tests in 0.394s
+Ran 123 tests in 1.537s
 
 OK
 Destroying test database for alias 'default'...
@@ -431,12 +575,13 @@ Destroying test database for alias 'default'...
 
 ```bash
 $ .venv/bin/pytest backend/tests --ds=config.settings.test
-============================= 113 passed in 0.63s ==============================
+============================= 123 passed in 1.79s ==============================
 ```
 
 - **Django Development Check:** `System check identified no issues (0 silenced).`
 - **Django Migration Dry-Run:** `No changes detected.`
 - **Django Production Deploy Check:** `System check identified no issues (0 silenced).`
 - **Protected Files Integrity:** [`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), and [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md) remain strictly unmodified.
-- **Next Stage Gating:** Chunk 05 onward remains strictly gated.
+- **Stage Gating:** Chunk 04 is complete and submitted for independent audit. Chunk 05 onward remains strictly gated.
+
 

@@ -89,14 +89,39 @@ class AuditMetadataValidationTests(TestCase):
             # Malformed X-Forwarded-For must be rejected, falling back to REMOTE_ADDR
             self.assertEqual(ip, '198.51.100.5')
 
-    def test_missing_client_metadata_defaults_safely(self):
-        """Verify missing REMOTE_ADDR falls back to '127.0.0.1' without error."""
+    def test_missing_client_metadata_returns_none(self):
+        """Verify missing REMOTE_ADDR returns None instead of inventing a loopback address."""
         request = self.rf.get('/api/v1/auth/user/')
-        # Remove REMOTE_ADDR
         if 'REMOTE_ADDR' in request.META:
             del request.META['REMOTE_ADDR']
         ip = get_validated_client_ip(request)
-        self.assertEqual(ip, '127.0.0.1')
+        self.assertIsNone(ip)
+
+    def test_malformed_remote_addr_returns_none(self):
+        """Verify syntactically invalid REMOTE_ADDR returns None."""
+        request = self.rf.get('/api/v1/auth/user/', REMOTE_ADDR='malformed_address')
+        ip = get_validated_client_ip(request)
+        self.assertIsNone(ip)
+
+    def test_login_rejects_missing_client_ip(self):
+        """Verify login request fails closed when trustworthy client IP cannot be determined."""
+        from apps.accounts.views import LoginView
+        request = self.rf.post(
+            '/api/v1/auth/login/',
+            data={'identifier': 'audit_student', 'password': self.password},
+            content_type='application/json',
+        )
+        if 'REMOTE_ADDR' in request.META:
+            del request.META['REMOTE_ADDR']
+
+        # Enforce view execution without REMOTE_ADDR
+        view = LoginView()
+        view.setup(request)
+        view.request = request
+        response = view.post(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data['error']['code'], 'VALIDATION_ERROR')
+        self.assertIn('Unable to verify trustworthy client IP', response.data['error']['message'])
 
     # --------------------------------------------------------------------------
     # Metadata Sanitization & Injection Prevention Tests
