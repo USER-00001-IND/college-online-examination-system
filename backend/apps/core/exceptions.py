@@ -1,10 +1,13 @@
 """
 Centralized error handling conventions for College Online Examination System.
-Standardizes all DRF error responses into a consistent JSON envelope and suppresses
-internal stack traces and sensitive error data from API responses and production logs.
+Normalizes DRF error responses into a consistent JSON envelope and suppresses
+internal stack traces, sensitive error data, and untrusted request identifiers
+from API responses and production logs.
 """
 
 import logging
+import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -14,6 +17,10 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 
 logger = logging.getLogger('college.exceptions')
+
+# Strict Request-ID normalization pattern:
+# Allows only ASCII alphanumeric characters, hyphens, and underscores up to 64 chars.
+REQUEST_ID_REGEX = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 # Status code to machine-readable error code mapping
 STATUS_CODE_MAP = {
@@ -32,6 +39,34 @@ STATUS_CODE_MAP = {
 }
 
 
+def normalize_request_id(raw_request_id: Any) -> str:
+    """
+    Validates and normalizes an incoming request identifier.
+
+    Security & Validation Specification:
+    1. Only string instances strictly matching `^[A-Za-z0-9_-]{1,64}$` via full-string
+       matching are accepted as syntactically valid.
+    2. Rejects empty values, non-string types, whitespace, newlines, carriage returns,
+       control characters, Unicode characters, punctuation outside the allowlist,
+       and identifiers longer than 64 characters.
+    3. Malformed values are NEVER truncated and NEVER logged to prevent log injection
+       or credential leakage into diagnostic streams.
+    4. When missing, malformed, or invalid, generates a fresh server-side UUIDv4 identifier.
+
+    Trust-Boundary Clarification:
+    A syntactically validated request ID is safe for structured logging, but is NOT an
+    authenticated or trusted identity proof. In production, Nginx must be configured to
+    unconditionally overwrite the incoming request ID header:
+        `proxy_set_header X-Request-ID $request_id;`
+    If the application cannot verify that this proxy behavior is active, client-provided IDs
+    must not be relied upon for authentication, authorization, access control, or authoritative
+    audit correlation.
+    """
+    if isinstance(raw_request_id, str) and REQUEST_ID_REGEX.fullmatch(raw_request_id):
+        return raw_request_id
+    return str(uuid.uuid4())
+
+
 def _format_error_details(data: Any) -> Any:
     """Recursively formats DRF error detail structures into clean dictionaries/lists."""
     if isinstance(data, dict):
@@ -44,7 +79,7 @@ def _format_error_details(data: Any) -> Any:
 def custom_exception_handler(exc: Exception, context: Dict[str, Any]) -> Optional[Response]:
     """
     Centralized DRF exception handler.
-    Guarantees that every error response conforms to the standardized envelope:
+    Normalizes error responses to conform to the standardized envelope:
     {
         "error": {
             "code": "ERROR_CODE",
@@ -53,8 +88,10 @@ def custom_exception_handler(exc: Exception, context: Dict[str, Any]) -> Optiona
             "timestamp": "2026-11-03T03:30:00Z"
         }
     }
-    Enforces strict production log sanitization: raw exception messages and stack traces
-    are never emitted into production logs or returned in production HTTP responses.
+    Enforces production log sanitization: raw exception messages, unsanitized tracebacks,
+    and untrusted client request identifiers are never emitted into production logs or
+    returned in production HTTP responses. The system relies on data minimization,
+    traceback suppression, strict request-ID normalization, and defense-in-depth redaction.
     """
     response = drf_exception_handler(exc, context)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -101,10 +138,11 @@ def custom_exception_handler(exc: Exception, context: Dict[str, Any]) -> Optiona
     sanitized_view = view.__class__.__name__ if hasattr(view, '__class__') else str(view or 'UnknownView')
 
     request = context.get('request', None)
-    request_id = 'N/A'
+    raw_request_id = None
     if request and hasattr(request, 'META') and isinstance(request.META, dict):
-        request_id = str(request.META.get('HTTP_X_REQUEST_ID', 'N/A'))
+        raw_request_id = request.META.get('HTTP_X_REQUEST_ID')
 
+    request_id = normalize_request_id(raw_request_id)
     exc_class = exc.__class__.__name__
     error_category = 'UnhandledServerException'
 
