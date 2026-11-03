@@ -2491,3 +2491,597 @@ class SemesterChangeMappingRevalidationRegressionTests(TestCase):
         with self.assertRaises(ValidationError) as cm:
             self.offering.clean()
         self.assertIn("semester", cm.exception.message_dict)
+
+
+class ConcurrentDirectMappingValidationRegressionTests(TestCase):
+    """
+    Round 5 Regression Tests for High Finding A:
+    Concurrent Direct Paper-Programme Mapping Mutation Safety.
+    Guarantees:
+    - Lock Order: Target PaperOffering (select_for_update) -> Programme (select_for_update) -> authoritative validation -> persistence.
+    - Validate mapping compatibility after acquiring row locks.
+    - Concurrent paper-offering semester update invalidating mapping duration coverage is detected under lock and rejected.
+    - Direct CREATE, UPDATE, and DELETE maintain is_common_paper flag and data integrity.
+    - Non-admin roles (Student, Faculty) are rejected with 403 Forbidden.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.college = College.objects.create(
+            name="Model College", code="MC-GU", contact_email="admin@mc.edu"
+        )
+        self.session = AcademicSession.objects.create(
+            college=self.college,
+            name="2026-2027",
+            start_date=date(2026, 7, 1),
+            end_date=date(2027, 6, 30),
+        )
+        self.prog_4sem = Programme.objects.create(
+            college=self.college, name="Diploma IT", code="DIT", duration_semesters=4
+        )
+        self.prog_8sem = Programme.objects.create(
+            college=self.college, name="BA", code="BA", duration_semesters=8
+        )
+        self.sem4 = Semester.objects.create(programme=self.prog_8sem, semester_number=4, name="Semester 4")
+        self.sem6 = Semester.objects.create(programme=self.prog_8sem, semester_number=6, name="Semester 6")
+        self.dept = Department.objects.create(college=self.college, name="Pol Sci", code="POL")
+        self.sub = Subject.objects.create(department=self.dept, name="Pol Sci", code="POLSCI")
+        self.cat = SubjectCategory.objects.create(
+            college=self.college, code="VAC", name="Value Addition", min_credits=Decimal("2.0"), max_credits=Decimal("4.0")
+        )
+        self.offering = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=self.sem4,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="VAC1014",
+            title="Environmental Studies",
+            credits=Decimal("2.0"),
+            is_common_paper=False,
+        )
+        self.admin = User.objects.create_user(
+            username="academic_admin",
+            email="admin@mc.edu",
+            password="Password123!",
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        self.student = User.objects.create_user(
+            username="student_user",
+            email="student@mc.edu",
+            password="Password123!",
+            role=RoleChoices.STUDENT,
+            is_active=True,
+        )
+        self.faculty = User.objects.create_user(
+            username="faculty_user",
+            email="faculty@mc.edu",
+            password="Password123!",
+            role=RoleChoices.FACULTY,
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.admin)
+        self.list_url = reverse("academics:paper-mapping-list")
+
+    def test_direct_mapping_creation_compatible_programme_succeeds(self):
+        """Creating mapping to compatible programme (sem 4 <= duration 4) succeeds and atomically sets is_common_paper."""
+        res = self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": self.prog_4sem.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.is_common_paper)
+        self.assertEqual(self.offering.programme_mappings.count(), 1)
+        mapping = self.offering.programme_mappings.first()
+        self.assertEqual(mapping.programme, self.prog_4sem)
+
+    def test_direct_mapping_creation_incompatible_programme_rejected(self):
+        """Creating mapping to programme with duration less than offering semester is rejected."""
+        prog_2sem = Programme.objects.create(
+            college=self.college, name="Cert IT", code="CIT", duration_semesters=2
+        )
+        res = self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": prog_2sem.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.is_common_paper)
+        self.assertEqual(self.offering.programme_mappings.count(), 0)
+
+    def test_direct_mapping_creation_cross_college_rejected(self):
+        """Creating mapping to programme of a different college is rejected with 400."""
+        other_college = College.objects.create(name="Other College", code="OC-GU", contact_email="admin@oc.edu")
+        prog_other = Programme.objects.create(
+            college=other_college, name="Other BA", code="OBA", duration_semesters=8
+        )
+        res = self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": prog_other.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.programme_mappings.count(), 0)
+
+    def test_direct_mapping_creation_duplicate_rejected(self):
+        """Creating a duplicate mapping for the same offering and programme is rejected with 400."""
+        self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": self.prog_4sem.id,
+        })
+        res = self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": self.prog_4sem.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(PaperProgrammeMapping.objects.filter(paper_offering=self.offering).count(), 1)
+
+    def test_concurrent_paper_semester_mutation_race_condition_blocked_at_persistence(self):
+        """
+        Deterministic High Finding A Race Reproduction:
+        Request A validates mapping of offering (currently sem 4) to prog_4sem (duration 4).
+        Preliminary serializer validation passes.
+        Concurrent update moves offering to sem 6 and commits.
+        Request A attempts serializer.save() under lock.
+        Authoritative validation under lock discovers prog_4sem duration (4) < paper semester (6)
+        and raises ValidationError!
+        """
+        from apps.academics.serializers import PaperProgrammeMappingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        serializer = PaperProgrammeMappingSerializer(data={
+            "paper_offering": self.offering.id,
+            "programme": self.prog_4sem.id,
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent mutation commits before serializer.save() acquires lock
+        self.offering.semester = self.sem6
+        self.offering.save(update_fields=["semester"])
+
+        # Under row lock, authoritative validation re-checks and blocks the mutation
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        # Database remains clean: no invalid mapping was created
+        self.assertEqual(PaperProgrammeMapping.objects.filter(paper_offering=self.offering).count(), 0)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.semester, self.sem6)
+
+    def test_direct_mapping_patch_revalidates_under_lock(self):
+        """PATCHing existing mapping to incompatible programme is rejected with 400."""
+        mapping = PaperProgrammeMapping.objects.create(
+            paper_offering=self.offering, programme=self.prog_8sem
+        )
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        prog_2sem = Programme.objects.create(
+            college=self.college, name="Cert IT", code="CIT", duration_semesters=2
+        )
+        detail_url = reverse("academics:paper-mapping-detail", kwargs={"pk": mapping.id})
+        res = self.client.patch(detail_url, {"programme": prog_2sem.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        mapping.refresh_from_db()
+        self.assertEqual(mapping.programme, self.prog_8sem)
+
+    def test_concurrent_patch_race_condition_blocked_at_persistence(self):
+        """
+        Deterministic High Finding A Race Reproduction on PATCH:
+        Mapping exists with prog_8sem (offering at sem 4).
+        Serializer validates change to prog_4sem (duration 4). Preliminary validation passes.
+        Concurrent update moves offering to sem 6 and commits.
+        serializer.save() discovers prog_4sem (4) < offering semester (6) under lock and fails!
+        """
+        from apps.academics.serializers import PaperProgrammeMappingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        mapping = PaperProgrammeMapping.objects.create(
+            paper_offering=self.offering, programme=self.prog_8sem
+        )
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        serializer = PaperProgrammeMappingSerializer(
+            instance=mapping, data={"programme": self.prog_4sem.id}, partial=True
+        )
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent update moves offering to sem 6
+        self.offering.semester = self.sem6
+        self.offering.save(update_fields=["semester"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        mapping.refresh_from_db()
+        self.assertEqual(mapping.programme, self.prog_8sem)
+
+    def test_direct_mapping_patch_preserves_omitted_fields(self):
+        """PATCHing mapping with partial data updates only supplied fields."""
+        prog_6sem = Programme.objects.create(
+            college=self.college, name="BSc", code="BSC", duration_semesters=6
+        )
+        mapping = PaperProgrammeMapping.objects.create(
+            paper_offering=self.offering, programme=self.prog_8sem
+        )
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        detail_url = reverse("academics:paper-mapping-detail", kwargs={"pk": mapping.id})
+        res = self.client.patch(detail_url, {"programme": prog_6sem.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        mapping.refresh_from_db()
+        self.assertEqual(mapping.programme, prog_6sem)
+        self.assertEqual(mapping.paper_offering, self.offering)
+
+    def test_direct_mapping_delete_cleans_up_safely(self):
+        """Deleting mapping via DELETE endpoint removes mapping cleanly with 204."""
+        mapping = PaperProgrammeMapping.objects.create(
+            paper_offering=self.offering, programme=self.prog_4sem
+        )
+        detail_url = reverse("academics:paper-mapping-detail", kwargs={"pk": mapping.id})
+        res = self.client.delete(detail_url)
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(PaperProgrammeMapping.objects.filter(pk=mapping.id).exists())
+
+    def test_failed_mapping_operations_leave_database_unmodified(self):
+        """Failed mapping creation leaves database state completely unchanged."""
+        prog_2sem = Programme.objects.create(
+            college=self.college, name="Cert IT", code="CIT", duration_semesters=2
+        )
+        res = self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": prog_2sem.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(PaperProgrammeMapping.objects.count(), 0)
+        self.offering.refresh_from_db()
+        self.assertFalse(self.offering.is_common_paper)
+
+    def test_unauthorized_student_and_faculty_mapping_operations_rejected(self):
+        """Student and Faculty users cannot create or modify mappings (403 Forbidden)."""
+        self.client.force_authenticate(user=self.student)
+        res = self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": self.prog_4sem.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=self.faculty)
+        res = self.client.post(self.list_url, {
+            "paper_offering": self.offering.id,
+            "programme": self.prog_4sem.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class DependentAcademicRecordIntegrityRegressionTests(TestCase):
+    """
+    Round 5 Regression Tests for Medium Finding B:
+    Parent Academic Record Updates Invalidate Dependent Records.
+    Guarantees:
+    - Programme duration cannot be reduced below existing semester numbers.
+    - Programme duration cannot be reduced below mapped paper offerings' semester numbers.
+    - Programme college cannot be changed when dependent paper offerings or mappings exist.
+    - Semester number cannot exceed programme duration or mapped programme durations.
+    - Semester college cannot be changed when dependent offerings exist.
+    - Department college cannot be changed when dependent offerings exist.
+    - Subject department cannot be changed to another college when dependent offerings exist.
+    - Subject category min_credits/max_credits cannot violate existing paper offerings.
+    - Subject category college cannot be changed when dependent offerings exist.
+    - Academic session college cannot be changed when dependent offerings exist.
+    - Academic session start_date must strictly precede end_date.
+    - Valid metadata updates succeed.
+    - Failed parent updates leave database state completely unmodified.
+    - Model .clean() enforces dependent record invariants.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.college = College.objects.create(
+            name="Model College", code="MC-GU", contact_email="admin@mc.edu"
+        )
+        self.other_college = College.objects.create(
+            name="Other College", code="OC-GU", contact_email="admin@oc.edu"
+        )
+        self.session = AcademicSession.objects.create(
+            college=self.college,
+            name="2026-2027",
+            start_date=date(2026, 7, 1),
+            end_date=date(2027, 6, 30),
+        )
+        self.prog = Programme.objects.create(
+            college=self.college, name="Bachelor of Arts", code="BA", duration_semesters=8
+        )
+        self.sem1 = Semester.objects.create(programme=self.prog, semester_number=1, name="Sem 1")
+        self.sem4 = Semester.objects.create(programme=self.prog, semester_number=4, name="Sem 4")
+        self.sem6 = Semester.objects.create(programme=self.prog, semester_number=6, name="Sem 6")
+        self.dept = Department.objects.create(college=self.college, name="Pol Sci", code="POL")
+        self.sub = Subject.objects.create(department=self.dept, name="Pol Sci", code="POLSCI")
+        self.cat = SubjectCategory.objects.create(
+            college=self.college, code="MAJOR", name="Major", min_credits=Decimal("2.0"), max_credits=Decimal("4.0")
+        )
+        self.offering = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=self.sem4,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="POL1014",
+            title="Political Theory",
+            credits=Decimal("3.0"),
+        )
+        self.admin = User.objects.create_user(
+            username="admin_user",
+            email="admin@mc.edu",
+            password="Password123!",
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+    def test_reduce_programme_duration_below_existing_semester_rejected(self):
+        """Reducing programme duration below existing semester 6 is rejected with 400."""
+        url = reverse("academics:programme-detail", kwargs={"pk": self.prog.id})
+        res = self.client.patch(url, {"duration_semesters": 5})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.prog.refresh_from_db()
+        self.assertEqual(self.prog.duration_semesters, 8)
+
+    def test_reduce_programme_duration_below_mapped_paper_semester_rejected(self):
+        """
+        Programme duration cannot be reduced below mapped common paper semester number.
+        Here prog_secondary has duration 8 and only semester 1, but offering (sem 4) is mapped to it.
+        Attempting to reduce prog_secondary duration to 3 must be rejected with 400.
+        """
+        prog_secondary = Programme.objects.create(
+            college=self.college, name="BSc", code="BSC", duration_semesters=8
+        )
+        PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=prog_secondary)
+        self.offering.is_common_paper = True
+        self.offering.save()
+
+        url = reverse("academics:programme-detail", kwargs={"pk": prog_secondary.id})
+        res = self.client.patch(url, {"duration_semesters": 3})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        prog_secondary.refresh_from_db()
+        self.assertEqual(prog_secondary.duration_semesters, 8)
+
+    def test_increase_programme_duration_succeeds(self):
+        """Increasing programme duration from 8 to 10 semesters succeeds."""
+        url = reverse("academics:programme-detail", kwargs={"pk": self.prog.id})
+        res = self.client.patch(url, {"duration_semesters": 10})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.prog.refresh_from_db()
+        self.assertEqual(self.prog.duration_semesters, 10)
+
+    def test_change_programme_college_rejected_if_dependent_offerings_exist(self):
+        """Changing programme college is rejected when dependent paper offerings exist."""
+        url = reverse("academics:programme-detail", kwargs={"pk": self.prog.id})
+        res = self.client.patch(url, {"college": self.other_college.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.prog.refresh_from_db()
+        self.assertEqual(self.prog.college, self.college)
+
+    def test_change_programme_college_rejected_if_dependent_mappings_exist(self):
+        """Changing programme college is rejected when dependent programme mappings exist."""
+        prog_secondary = Programme.objects.create(
+            college=self.college, name="BSc", code="BSC", duration_semesters=8
+        )
+        PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=prog_secondary)
+
+        url = reverse("academics:programme-detail", kwargs={"pk": prog_secondary.id})
+        res = self.client.patch(url, {"college": self.other_college.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        prog_secondary.refresh_from_db()
+        self.assertEqual(prog_secondary.college, self.college)
+
+    def test_increase_semester_number_beyond_programme_duration_rejected(self):
+        """Increasing semester number beyond programme duration (8) is rejected with 400."""
+        url = reverse("academics:semester-detail", kwargs={"pk": self.sem6.id})
+        res = self.client.patch(url, {"semester_number": 9})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.sem6.refresh_from_db()
+        self.assertEqual(self.sem6.semester_number, 6)
+
+    def test_change_semester_number_invalidating_mapped_programme_rejected(self):
+        """
+        Changing semester number of an offering's semester beyond a mapped programme's duration
+        must be rejected with 400.
+        """
+        prog_4sem = Programme.objects.create(
+            college=self.college, name="Diploma IT", code="DIT", duration_semesters=4
+        )
+        PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=prog_4sem)
+
+        # sem4 is offering's semester; changing sem4 number to 5 violates prog_4sem (duration 4)
+        url = reverse("academics:semester-detail", kwargs={"pk": self.sem4.id})
+        res = self.client.patch(url, {"semester_number": 5})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.sem4.refresh_from_db()
+        self.assertEqual(self.sem4.semester_number, 4)
+
+    def test_change_semester_programme_to_different_college_rejected(self):
+        """Reassigning semester to a programme in another college is rejected if offerings exist."""
+        other_prog = Programme.objects.create(
+            college=self.other_college, name="Other BA", code="OBA", duration_semesters=8
+        )
+        url = reverse("academics:semester-detail", kwargs={"pk": self.sem4.id})
+        res = self.client.patch(url, {"programme": other_prog.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.sem4.refresh_from_db()
+        self.assertEqual(self.sem4.programme, self.prog)
+
+    def test_valid_semester_update_succeeds(self):
+        """Updating semester title and valid semester number succeeds."""
+        url = reverse("academics:semester-detail", kwargs={"pk": self.sem1.id})
+        res = self.client.patch(url, {"name": "First Semester", "semester_number": 2})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.sem1.refresh_from_db()
+        self.assertEqual(self.sem1.name, "First Semester")
+        self.assertEqual(self.sem1.semester_number, 2)
+
+    def test_change_department_college_rejected_if_dependent_offerings_exist(self):
+        """Changing department college is rejected when dependent paper offerings exist."""
+        url = reverse("academics:department-detail", kwargs={"pk": self.dept.id})
+        res = self.client.patch(url, {"college": self.other_college.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.dept.refresh_from_db()
+        self.assertEqual(self.dept.college, self.college)
+
+    def test_change_subject_department_to_different_college_rejected_if_offerings_exist(self):
+        """Reassigning subject to department of another college is rejected if offerings exist."""
+        other_dept = Department.objects.create(
+            college=self.other_college, name="Other Dept", code="ODEPT"
+        )
+        url = reverse("academics:subject-detail", kwargs={"pk": self.sub.id})
+        res = self.client.patch(url, {"department": other_dept.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.sub.refresh_from_db()
+        self.assertEqual(self.sub.department, self.dept)
+
+    def test_increase_subject_category_min_credits_above_existing_offering_rejected(self):
+        """Increasing min_credits above an existing paper offering's credits (3.0) is rejected."""
+        url = reverse("academics:subject-category-detail", kwargs={"pk": self.cat.id})
+        res = self.client.patch(url, {"min_credits": "3.5"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.cat.refresh_from_db()
+        self.assertEqual(self.cat.min_credits, Decimal("2.0"))
+
+    def test_decrease_subject_category_max_credits_below_existing_offering_rejected(self):
+        """Decreasing max_credits below an existing paper offering's credits (3.0) is rejected."""
+        url = reverse("academics:subject-category-detail", kwargs={"pk": self.cat.id})
+        res = self.client.patch(url, {"max_credits": "2.5"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.cat.refresh_from_db()
+        self.assertEqual(self.cat.max_credits, Decimal("4.0"))
+
+    def test_change_subject_category_college_rejected_if_offerings_exist(self):
+        """Changing subject category college is rejected if dependent paper offerings exist."""
+        url = reverse("academics:subject-category-detail", kwargs={"pk": self.cat.id})
+        res = self.client.patch(url, {"college": self.other_college.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.cat.refresh_from_db()
+        self.assertEqual(self.cat.college, self.college)
+
+    def test_valid_subject_category_credit_range_expansion_succeeds(self):
+        """Expanding subject category credit bounds succeeds."""
+        url = reverse("academics:subject-category-detail", kwargs={"pk": self.cat.id})
+        res = self.client.patch(url, {"min_credits": "1.0", "max_credits": "5.0"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.cat.refresh_from_db()
+        self.assertEqual(self.cat.min_credits, Decimal("1.0"))
+        self.assertEqual(self.cat.max_credits, Decimal("5.0"))
+
+    def test_change_academic_session_college_rejected_if_offerings_exist(self):
+        """Changing academic session college is rejected if dependent paper offerings exist."""
+        url = reverse("academics:session-detail", kwargs={"pk": self.session.id})
+        res = self.client.patch(url, {"college": self.other_college.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.college, self.college)
+
+    def test_invalid_academic_session_dates_rejected(self):
+        """Setting start_date >= end_date on academic session is rejected with 400."""
+        url = reverse("academics:session-detail", kwargs={"pk": self.session.id})
+        res = self.client.patch(url, {
+            "start_date": "2027-01-01",
+            "end_date": "2026-01-01",
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.start_date, date(2026, 7, 1))
+
+    def test_valid_parent_metadata_updates_succeed(self):
+        """Updating non-conflicting parent metadata succeeds."""
+        prog_url = reverse("academics:programme-detail", kwargs={"pk": self.prog.id})
+        res = self.client.patch(prog_url, {"name": "BA (Honours)"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.prog.refresh_from_db()
+        self.assertEqual(self.prog.name, "BA (Honours)")
+
+        dept_url = reverse("academics:department-detail", kwargs={"pk": self.dept.id})
+        res = self.client.patch(dept_url, {"name": "Dept of Political Science"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.dept.refresh_from_db()
+        self.assertEqual(self.dept.name, "Dept of Political Science")
+
+    def test_failed_parent_updates_leave_database_unmodified(self):
+        """Failed parent updates preserve original database values."""
+        url = reverse("academics:programme-detail", kwargs={"pk": self.prog.id})
+        res = self.client.patch(url, {"duration_semesters": 2})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.prog.refresh_from_db()
+        self.assertEqual(self.prog.duration_semesters, 8)
+
+    def test_model_clean_enforces_dependent_record_invariants(self):
+        """Direct model .clean() rejects invalid mutations on parent models."""
+        # 1. Programme duration below existing semester
+        self.prog.duration_semesters = 3
+        with self.assertRaises(ValidationError) as cm:
+            self.prog.clean()
+        self.assertIn("duration_semesters", cm.exception.message_dict)
+        self.prog.duration_semesters = 8
+
+        # 2. Programme college change with offerings
+        self.prog.college = self.other_college
+        with self.assertRaises(ValidationError) as cm:
+            self.prog.clean()
+        self.assertIn("college", cm.exception.message_dict)
+        self.prog.college = self.college
+
+        # 3. Semester number exceeding mapped programme duration
+        prog_4sem = Programme.objects.create(
+            college=self.college, name="Diploma IT", code="DIT", duration_semesters=4
+        )
+        PaperProgrammeMapping.objects.create(paper_offering=self.offering, programme=prog_4sem)
+        self.sem4.semester_number = 5
+        with self.assertRaises(ValidationError) as cm:
+            self.sem4.clean()
+        self.assertIn("semester_number", cm.exception.message_dict)
+        self.sem4.semester_number = 4
+
+        # 4. Department college change with offerings
+        self.dept.college = self.other_college
+        with self.assertRaises(ValidationError) as cm:
+            self.dept.clean()
+        self.assertIn("college", cm.exception.message_dict)
+        self.dept.college = self.college
+
+        # 5. Subject department college change with offerings
+        other_dept = Department.objects.create(
+            college=self.other_college, name="Other Dept", code="ODEPT"
+        )
+        self.sub.department = other_dept
+        with self.assertRaises(ValidationError) as cm:
+            self.sub.clean()
+        self.assertIn("department", cm.exception.message_dict)
+        self.sub.department = self.dept
+
+        # 6. Category credit range violation
+        self.cat.min_credits = Decimal("3.5")  # offering has 3.0
+        with self.assertRaises(ValidationError) as cm:
+            self.cat.clean()
+        self.assertIn("min_credits", cm.exception.message_dict)
+        self.cat.min_credits = Decimal("2.0")
+
+        self.cat.max_credits = Decimal("2.5")  # offering has 3.0
+        with self.assertRaises(ValidationError) as cm:
+            self.cat.clean()
+        self.assertIn("max_credits", cm.exception.message_dict)
+        self.cat.max_credits = Decimal("4.0")
+
+        # 7. Category college change with offerings
+        self.cat.college = self.other_college
+        with self.assertRaises(ValidationError) as cm:
+            self.cat.clean()
+        self.assertIn("college", cm.exception.message_dict)
+        self.cat.college = self.college
+
+        # 8. Session college change with offerings
+        self.session.college = self.other_college
+        with self.assertRaises(ValidationError) as cm:
+            self.session.clean()
+        self.assertIn("college", cm.exception.message_dict)
+        self.session.college = self.college

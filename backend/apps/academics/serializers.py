@@ -24,8 +24,16 @@ from apps.academics.models import (
 )
 from apps.academics.services import (
     create_institutional_config,
+    create_paper_programme_mapping,
+    update_academic_session,
+    update_department,
     update_institutional_config,
     update_paper_offering,
+    update_paper_programme_mapping,
+    update_programme,
+    update_semester,
+    update_subject,
+    update_subject_category,
     validate_paper_offering_relationships,
     validate_paper_programme_mapping,
 )
@@ -93,6 +101,17 @@ class AcademicSessionSerializer(serializers.ModelSerializer):
             })
         return attrs
 
+    def update(self, instance, validated_data):
+        try:
+            return update_academic_session(
+                session_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
 
 class ProgrammeSerializer(serializers.ModelSerializer):
     college_code = serializers.CharField(source="college.code", read_only=True)
@@ -117,6 +136,17 @@ class ProgrammeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Duration in semesters must be at least 1.")
         return value
 
+    def update(self, instance, validated_data):
+        try:
+            return update_programme(
+                programme_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
 
 class DepartmentSerializer(serializers.ModelSerializer):
     college_code = serializers.CharField(source="college.code", read_only=True)
@@ -132,6 +162,17 @@ class DepartmentSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def update(self, instance, validated_data):
+        try:
+            return update_department(
+                department_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
 
 class SemesterSerializer(serializers.ModelSerializer):
@@ -175,6 +216,17 @@ class SemesterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return attrs
 
+    def update(self, instance, validated_data):
+        try:
+            return update_semester(
+                semester_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
 
 class SubjectCategorySerializer(serializers.ModelSerializer):
     college_code = serializers.CharField(source="college.code", read_only=True)
@@ -216,6 +268,17 @@ class SubjectCategorySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return attrs
 
+    def update(self, instance, validated_data):
+        try:
+            return update_subject_category(
+                category_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
 
 class SubjectSerializer(serializers.ModelSerializer):
     department_code = serializers.CharField(source="department.code", read_only=True)
@@ -233,6 +296,17 @@ class SubjectSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def update(self, instance, validated_data):
+        try:
+            return update_subject(
+                subject_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
 
 class PaperOfferingSerializer(serializers.ModelSerializer):
@@ -416,28 +490,26 @@ class PaperProgrammeMappingSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        with transaction.atomic():
-            paper = PaperOffering.objects.select_for_update().get(pk=validated_data["paper_offering"].pk)
-            mapping = super().create(validated_data)
-            if not paper.is_common_paper:
-                paper.is_common_paper = True
-                paper.save(update_fields=["is_common_paper"])
-            return mapping
+        try:
+            return create_paper_programme_mapping(
+                paper_offering_id=validated_data["paper_offering"].pk,
+                programme_id=validated_data["programme"].pk,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
     def update(self, instance, validated_data):
-        with transaction.atomic():
-            target_paper_offering = validated_data.get("paper_offering", instance.paper_offering)
-            pks = sorted({instance.paper_offering_id, target_paper_offering.pk})
-            locked_offerings = {
-                po.pk: po
-                for po in PaperOffering.objects.select_for_update().filter(pk__in=pks).order_by("pk")
-            }
-            mapping = super().update(instance, validated_data)
-            paper = locked_offerings[target_paper_offering.pk]
-            if not paper.is_common_paper:
-                paper.is_common_paper = True
-                paper.save(update_fields=["is_common_paper"])
-            return mapping
+        try:
+            return update_paper_programme_mapping(
+                mapping_id=instance.pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
 
 class InstitutionalConfigSerializer(serializers.ModelSerializer):

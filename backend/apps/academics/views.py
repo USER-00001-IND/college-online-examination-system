@@ -42,6 +42,7 @@ from apps.academics.serializers import (
 )
 from apps.academics.services import (
     delete_institutional_config,
+    delete_paper_programme_mapping,
     map_paper_to_programmes,
     set_current_academic_session,
     update_paper_offering,
@@ -56,6 +57,24 @@ class BaseAcademicViewSet(viewsets.ModelViewSet):
     Returns HTTP 409 Conflict if restricted foreign keys prevent record deletion.
     """
     permission_classes = [IsAcademicAdminOrReadOnly]
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        try:
+            serializer.save()
+        except DjangoValidationError as exc:
+            raise DRFValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        try:
+            serializer.save()
+        except DjangoValidationError as exc:
+            raise DRFValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
     def destroy(self, request, *args, **kwargs):
         try:
@@ -257,6 +276,27 @@ class PaperProgrammeMappingViewSet(BaseAcademicViewSet):
     ).all()
     serializer_class = PaperProgrammeMappingSerializer
     filterset_fields = ["paper_offering", "programme"]
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        try:
+            delete_paper_programme_mapping(mapping_id=instance.pk)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except (models.ProtectedError, models.RestrictedError) as exc:
+            logger.warning(
+                "Restricted deletion prevented for PaperProgrammeMapping [error_type=%s]",
+                type(exc).__name__,
+            )
+            return Response(
+                {
+                    "error": {
+                        "code": "RESOURCE_CONFLICT",
+                        "message": "Cannot delete record because it is referenced by existing academic data.",
+                    }
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
 
 class InstitutionalConfigViewSet(BaseAcademicViewSet):

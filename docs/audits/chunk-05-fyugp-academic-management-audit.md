@@ -443,3 +443,98 @@ Across all academic mutation paths, consistent lock acquisition order is strictl
 1. **Deferred Production Database Concurrency Gate:** Multi-process concurrency verification on live MySQL 8 InnoDB remains an outstanding gate requirement before production activation (carried over from Chunk 04 Pass with Warnings).
 2. **Reverse Proxy Trust Gate:** TLS termination and arrival timestamp verification (`X-Request-Arrival-Time`, `X-Request-ID`) remain dependent on production Nginx deployment configuration.
 
+---
+
+## 15. ROUND 5 — CONCURRENT MAPPING SAFETY AND DEPENDENT ACADEMIC RECORD INTEGRITY
+
+**Audit Baseline Commit:** `7473751bc66a5e65e7d55672ebee9e0b12d11ec0`  
+**Execution Date:** 2026-11-04  
+**Status:** IMPLEMENTATION COMPLETE — READY FOR INDEPENDENT AUDIT  
+
+---
+
+### 15.1 Summary of Findings Corrected
+
+| Finding ID | Severity | Root Cause | Correction Implemented | Status |
+| :--- | :---: | :--- | :--- | :---: |
+| **Finding A** | **HIGH** | `PaperProgrammeMappingSerializer.create()` and `update()` validated programme compatibility during initial serializer `validate()` before acquiring database row locks. A concurrent paper-offering semester mutation could commit between validation and persistence, allowing an incompatible mapping to be inserted without revalidation. | Encapsulated direct mapping mutations into dedicated atomic services (`create_paper_programme_mapping`, `update_paper_programme_mapping`, `delete_paper_programme_mapping`). Enforced strict lock acquisition order: affected `PaperOffering` rows (ascending PK) -> target `Programme` (`select_for_update`) -> authoritative re-validation under lock -> persistence. Automatically maintains `is_common_paper = True` under lock. | **CORRECTED** |
+| **Finding B** | **MEDIUM** | Academic validation was only performed when child records (`PaperOffering`, `PaperProgrammeMapping`) were modified. Mutating parent records (`Programme`, `Semester`, `Department`, `Subject`, `SubjectCategory`, `AcademicSession`) could invalidate dependent offerings and mappings (e.g., reducing programme duration below existing semester numbers or mapped paper offerings, moving semester numbers beyond programme or mapped programme coverage, altering entity colleges violating cross-college boundaries, or tightening category credit bounds violating existing paper offerings). | Implemented 6 dedicated atomic parent update services (`update_programme`, `update_semester`, `update_department`, `update_subject`, `update_subject_category`, `update_academic_session`), wired them into serializer `update()` methods, and mirrored all relational integrity checks into model `clean()` methods. Enforced comprehensive cross-college isolation and dependent record invariants. | **CORRECTED** |
+
+---
+
+### 15.2 High Finding A Correction: Concurrent Direct Mapping Mutation Safety
+
+To eliminate the race condition where concurrent paper mutations bypass mapping compatibility checks:
+1. **Direct Mapping CREATE (`create_paper_programme_mapping`):**
+   - Exclusively locks target `PaperOffering` row (`select_for_update().select_related("academic_session", "semester")`).
+   - Exclusively locks target `Programme` row (`select_for_update()`).
+   - Authoritative compatibility revalidation under lock:
+     - Cross-college isolation: `programme.college_id == offering.academic_session.college_id`.
+     - Duration coverage: `programme.duration_semesters >= offering.semester.semester_number`.
+   - Checks uniqueness under lock (rejects duplicates with HTTP 400).
+   - Creates `PaperProgrammeMapping` record.
+   - Atomically maintains `offering.is_common_paper = True`.
+2. **Direct Mapping UPDATE (`update_paper_programme_mapping`):**
+   - Identifies current and proposed `PaperOffering` PKs and locks affected rows in deterministic ascending order (`filter(pk__in=pks).order_by("pk")`).
+   - Exclusively locks existing `PaperProgrammeMapping` row (`select_for_update()`).
+   - Exclusively locks target `Programme` row (`select_for_update()`).
+   - Authoritatively revalidates cross-college isolation and duration coverage under lock.
+   - Checks uniqueness under lock.
+   - Applies explicitly supplied fields and saves.
+   - Atomically maintains `target_offering.is_common_paper = True`.
+3. **Direct Mapping DELETE (`delete_paper_programme_mapping`):**
+   - Exclusively locks `PaperOffering` row (`select_for_update()`).
+   - Exclusively locks `PaperProgrammeMapping` row (`select_for_update()`).
+   - Deletes mapping cleanly.
+4. **Lock Acquisition Order Discipline:**
+   - Single offering: `PaperOffering (select_for_update)` -> `Programme (select_for_update)` -> Validation -> Persistence.
+   - Multiple offerings: `PaperOffering rows in ascending PK` -> `PaperProgrammeMapping (select_for_update)` -> `Programme (select_for_update)` -> Validation -> Persistence.
+
+---
+
+### 15.3 Medium Finding B Correction: Dependent Academic Record Integrity
+
+To prevent parent entity modifications from corrupting or invalidating dependent records:
+1. **`Programme` Updates (`update_programme` & `Programme.clean`):**
+   - Rejects reducing `duration_semesters` below any existing `Semester`'s `semester_number`.
+   - Rejects reducing `duration_semesters` below any mapped `PaperOffering`'s semester number.
+   - Rejects altering `college` if any dependent `PaperOffering` or `PaperProgrammeMapping` exists.
+2. **`Semester` Updates (`update_semester` & `Semester.clean`):**
+   - Rejects `semester_number` exceeding target `Programme.duration_semesters`.
+   - Rejects `semester_number` exceeding the duration of any `Programme` mapped to dependent `PaperOffering` records.
+   - Rejects reassigning semester to a `Programme` belonging to another college if dependent `PaperOffering` records exist.
+3. **`Department` Updates (`update_department` & `Department.clean`):**
+   - Rejects changing `college` if any dependent `PaperOffering` references a `Subject` of this department.
+4. **`Subject` Updates (`update_subject` & `Subject.clean`):**
+   - Rejects reassigning `department` to a department in a different college if dependent `PaperOffering` records exist.
+5. **`SubjectCategory` Updates (`update_subject_category` & `SubjectCategory.clean`):**
+   - Rejects increasing `min_credits` above any dependent `PaperOffering`'s credit value.
+   - Rejects decreasing `max_credits` below any dependent `PaperOffering`'s credit value.
+   - Rejects changing `college` if dependent `PaperOffering` records exist.
+6. **`AcademicSession` Updates (`update_academic_session` & `AcademicSession.clean`):**
+   - Strictly enforces `start_date < end_date`.
+   - Rejects changing `college` if dependent `PaperOffering` records exist.
+
+---
+
+### 15.4 Round 5 Regression Test Coverage Summary
+
+| Test Class | Tests Added | Scope Verified |
+| :--- | :---: | :--- |
+| `ConcurrentDirectMappingValidationRegressionTests` | 11 | Direct mapping creation to compatible programme succeeds (HTTP 201) and sets `is_common_paper = True`; direct mapping creation to incompatible duration programme rejected (HTTP 400); cross-college mapping rejected (HTTP 400); duplicate mapping rejected (HTTP 400); deterministic concurrent semester mutation race condition blocked under lock at persistence; direct mapping PATCH revalidates compatibility under lock; deterministic concurrent PATCH race condition blocked under lock at persistence; direct mapping PATCH preserves omitted fields; direct mapping DELETE cleanly removes mapping (HTTP 204); failed operations leave database unmodified; student and faculty access rejected (HTTP 403). |
+| `DependentAcademicRecordIntegrityRegressionTests` | 20 | Reducing programme duration below existing semester rejected (HTTP 400); reducing programme duration below mapped paper semester rejected (HTTP 400); increasing programme duration succeeds (HTTP 200); changing programme college rejected if offerings exist (HTTP 400); changing programme college rejected if mappings exist (HTTP 400); increasing semester number beyond programme duration rejected (HTTP 400); changing semester number invalidating mapped programme duration rejected (HTTP 400); changing semester programme across colleges rejected (HTTP 400); valid semester updates succeed (HTTP 200); changing department college rejected if offerings exist (HTTP 400); reassigning subject department across colleges rejected if offerings exist (HTTP 400); increasing category min_credits above existing offering rejected (HTTP 400); decreasing category max_credits below existing offering rejected (HTTP 400); changing category college rejected if offerings exist (HTTP 400); valid category credit range expansion succeeds (HTTP 200); changing session college rejected if offerings exist (HTTP 400); invalid session dates rejected (HTTP 400); valid parent metadata updates succeed (HTTP 200); failed parent updates leave database state unmodified; comprehensive model `clean()` validation covers all 10 parent integrity constraints. |
+
+- **Total New Regression Tests Added in Round 5:** 31 tests.
+- **Total Academic Tests:** 174 tests (all passed).
+- **Total Full Test Suite:** 380 tests discovered, 370 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+- **Clean System Checks:** Zero issues identified across development and production checks (`check --deploy`).
+- **Protected Files Integrity:** All 4 protected architectural documents verified 100% byte-identical and unmodified.
+
+---
+
+### 15.5 MySQL Concurrency Integration & Live Redis Status
+
+- **MySQL Concurrency Integration:** **NOT EXECUTED**. Multi-connection MySQL InnoDB concurrency verification requires an isolated MySQL database container/service. Automated test execution ran against the configured test runner (SQLite in-memory) without claiming that SQLite establishes MySQL InnoDB engine row-lock proof. The code strictly utilizes ANSI SQL `SELECT ... FOR UPDATE` row-level locks, explicit transaction boundaries (`@transaction.atomic`), and deterministic lock-order discipline targeting production MySQL 8.x InnoDB.
+- **Live Redis Integration:** **DEFERRED (10 Tests Cleanly Skipped)**. The 10 opt-in live Redis integration tests (`SafeLiveRedisIntegrationTests`) skipped cleanly as expected due to the absence of the disposable test Redis service gate (`RUN_REDIS_INTEGRATION_TESTS=1`). Mocked Redis throttle tests (125 tests) ran and passed with 100% success.
+
+

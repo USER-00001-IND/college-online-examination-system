@@ -81,6 +81,13 @@ class AcademicSession(models.Model):
         super().clean()
         if self.start_date and self.end_date and self.start_date >= self.end_date:
             raise ValidationError({"end_date": "Academic session start_date must precede end_date."})
+        if self.pk:
+            orig = AcademicSession.objects.filter(pk=self.pk).values("college_id").first()
+            if orig and orig["college_id"] != self.college_id:
+                if self.paper_offerings.exists():
+                    raise ValidationError({
+                        "college": "Cannot change academic session college while dependent paper offerings exist."
+                    })
 
     def __str__(self) -> str:
         return f"{self.name} - {self.college.code}"
@@ -127,6 +134,31 @@ class Programme(models.Model):
         super().clean()
         if self.duration_semesters < 1:
             raise ValidationError({"duration_semesters": "Duration in semesters must be at least 1."})
+        if self.pk:
+            max_sem = self.semesters.aggregate(max_num=models.Max("semester_number"))["max_num"]
+            if max_sem is not None and self.duration_semesters < max_sem:
+                raise ValidationError({
+                    "duration_semesters": (
+                        f"Cannot reduce programme duration to {self.duration_semesters}: semester {max_sem} exists."
+                    )
+                })
+            max_mapped = self.paper_mappings.aggregate(
+                max_sem=models.Max("paper_offering__semester__semester_number")
+            )["max_sem"]
+            if max_mapped is not None and self.duration_semesters < max_mapped:
+                raise ValidationError({
+                    "duration_semesters": (
+                        f"Cannot reduce programme duration to {self.duration_semesters}: mapped paper offering exists in semester {max_mapped}."
+                    )
+                })
+            orig = Programme.objects.filter(pk=self.pk).values("college_id").first()
+            if orig and orig["college_id"] != self.college_id:
+                has_offerings = self.semesters.filter(paper_offerings__isnull=False).exists()
+                has_mappings = self.paper_mappings.exists()
+                if has_offerings or has_mappings:
+                    raise ValidationError({
+                        "college": "Cannot change programme college while dependent paper offerings or mappings exist."
+                    })
 
     def __str__(self) -> str:
         return f"{self.name} ({self.code})"
@@ -158,6 +190,16 @@ class Department(models.Model):
                 name="uk_department_college_code",
             )
         ]
+
+    def clean(self):
+        super().clean()
+        if self.pk:
+            orig = Department.objects.filter(pk=self.pk).values("college_id").first()
+            if orig and orig["college_id"] != self.college_id:
+                if self.subjects.filter(paper_offerings__isnull=False).exists():
+                    raise ValidationError({
+                        "college": "Cannot change department college while dependent paper offerings exist."
+                    })
 
     def __str__(self) -> str:
         return f"{self.name} ({self.code})"
@@ -200,6 +242,22 @@ class Semester(models.Model):
                 raise ValidationError({
                     "semester_number": f"Semester number ({self.semester_number}) exceeds programme duration ({max_dur})."
                 })
+        if self.pk:
+            min_mapped = self.paper_offerings.aggregate(
+                min_dur=models.Min("programme_mappings__programme__duration_semesters")
+            )["min_dur"]
+            if min_mapped is not None and self.semester_number > min_mapped:
+                raise ValidationError({
+                    "semester_number": (
+                        f"Cannot change semester number to {self.semester_number}: mapped programme exists with duration {min_mapped}."
+                    )
+                })
+            orig = Semester.objects.filter(pk=self.pk).values("programme__college_id").first()
+            if orig and self.programme_id and orig["programme__college_id"] != self.programme.college_id:
+                if self.paper_offerings.exists():
+                    raise ValidationError({
+                        "programme": "Cannot reassign semester to a programme in a different college while dependent paper offerings exist."
+                    })
 
     def __str__(self) -> str:
         return f"{self.programme.code} - {self.name}"
@@ -252,6 +310,23 @@ class SubjectCategory(models.Model):
             raise ValidationError({"min_credits": "Minimum credits cannot be negative."})
         if self.max_credits < self.min_credits:
             raise ValidationError({"max_credits": "Maximum credits cannot be less than minimum credits."})
+        if self.pk:
+            min_c = self.paper_offerings.aggregate(min_c=models.Min("credits"))["min_c"]
+            if min_c is not None and self.min_credits > min_c:
+                raise ValidationError({
+                    "min_credits": f"Cannot increase min_credits to {self.min_credits}: existing paper offering exists with {min_c} credits."
+                })
+            max_c = self.paper_offerings.aggregate(max_c=models.Max("credits"))["max_c"]
+            if max_c is not None and self.max_credits < max_c:
+                raise ValidationError({
+                    "max_credits": f"Cannot decrease max_credits to {self.max_credits}: existing paper offering exists with {max_c} credits."
+                })
+            orig = SubjectCategory.objects.filter(pk=self.pk).values("college_id").first()
+            if orig and orig["college_id"] != self.college_id:
+                if self.paper_offerings.exists():
+                    raise ValidationError({
+                        "college": "Cannot change subject category college while dependent paper offerings exist."
+                    })
 
     def __str__(self) -> str:
         return f"{self.name} ({self.code})"
@@ -285,6 +360,16 @@ class Subject(models.Model):
                 name="uk_subject_department_code",
             )
         ]
+
+    def clean(self):
+        super().clean()
+        if self.pk and self.department_id:
+            orig = Subject.objects.filter(pk=self.pk).values("department__college_id").first()
+            if orig and orig["department__college_id"] != self.department.college_id:
+                if self.paper_offerings.exists():
+                    raise ValidationError({
+                        "department": "Cannot reassign subject to a department in a different college while dependent paper offerings exist."
+                    })
 
     def __str__(self) -> str:
         return f"{self.name} ({self.code})"
