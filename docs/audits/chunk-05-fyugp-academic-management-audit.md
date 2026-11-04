@@ -4,7 +4,7 @@
 **Author:** Antigravity Agent  
 **Date:** 2026-11-04 (Round 7 Revisions Completed)  
 **Stage:** Chunk 05 — FYUGP Academic Management  
-**Status:** **IN REVIEW — PENDING INDEPENDENT AUDIT** (Round 7 corrections complete, backed by 213 dedicated academic tests, 419 total discovered tests [409 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
+**Status:** **IN REVIEW — PASS WITH WARNINGS (AWAITING OWNER APPROVAL)** (Round 7 corrections passed independent code audit with warnings; test results reported by development environment: 213 dedicated academic tests, 419 total discovered tests [409 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
 
 ---
 
@@ -385,7 +385,7 @@ To eliminate the TOCTOU authorization gap:
 1. Every configuration mutation (API create, API update, API delete, service update) enforces the strict lock hierarchy:
    **College lock (`select_for_update`) -> InstitutionalConfig lock (`select_for_update`) -> authorization recheck -> validation -> mutation.**
 2. Locking the `College` row first serializes all configuration modifications for that institution, preventing concurrent creation races on the same key.
-3. Locking the `InstitutionalConfig` row guarantees that the authoritative sensitivity state is re-read directly from MySQL InnoDB storage while holding exclusive locks.
+3. Locking the `InstitutionalConfig` row ensures that the authoritative sensitivity state is re-read directly under row lock prior to mutation.
 4. If an ordinary administrator's stale request attempts to update or delete a configuration that a superadministrator sensitized in the interim, the recheck under lock detects `is_sensitive=True` and raises `PermissionDenied` (HTTP 403).
 5. Authorization failure causes an immediate transaction rollback, leaving the database completely unmodified.
 
@@ -647,7 +647,7 @@ Level 5: Persistence & Atomic Commit
 
 ### 16.6 MySQL Concurrency Integration & Live Redis Status
 
-- **MySQL Concurrency Integration:** **NOT EXECUTED**. Automated test execution ran against the configured test runner (SQLite in-memory). Concurrency safety is guaranteed by strict ANSI SQL `SELECT ... FOR UPDATE` row-level locks, explicit transaction boundaries (`@transaction.atomic`), single-table locking queries without `select_related()`, and deterministic lock-order discipline targeting production MySQL 8.x InnoDB. Multi-connection MySQL concurrency verification remains deferred pending an isolated MySQL container service.
+- **MySQL Concurrency Integration:** **NOT EXECUTED**. Automated test execution ran against the configured test runner (SQLite in-memory). The implementation uses Django `transaction.atomic()`, MySQL-compatible `select_for_update()` locking, authoritative state validation and documented lock ordering. Source inspection and deterministic regression tests support the intended concurrency design. However, live multi-connection MySQL 8 InnoDB concurrency tests have not been executed. Production database concurrency safety remains subject to integration verification. SQLite test execution is not equivalent to live MySQL 8 InnoDB row-lock verification. Multi-connection MySQL concurrency verification remains deferred pending an isolated MySQL container service.
 - **Live Redis Integration:** **DEFERRED (10 Tests Cleanly Skipped)**. The 10 opt-in live Redis integration tests (`SafeLiveRedisIntegrationTests`) skipped cleanly as expected due to the absence of the disposable test Redis service gate (`RUN_REDIS_INTEGRATION_TESTS=1`). Mocked Redis throttle tests (125 tests) ran and passed with 100% success.
 
 ---
@@ -680,7 +680,7 @@ Following the Round 6 independent audit of Chunk 05, three findings were reporte
 - **Deterministic College Row Locks:** All candidate colleges are locked in deterministic ascending PK order via `lock_colleges(*candidate_college_ids)`.
 - **Single-Table `select_for_update()` Discipline:** Parent entities (`AcademicSession`, `Semester`, `Programme`, `Subject`, `Department`, `SubjectCategory`) are reloaded and locked individually without `select_related()`.
 - **Lock Coverage Verification:** The authoritative college owners of all locked entities (`actual_college_ids`) are verified against `locked_colleges`. If any entity's institutional ownership shifted concurrently prior to lock acquisition, the mutation fails safely with `ValidationError({"college": "Academic entity institutional ownership changed concurrently."})`.
-- **Authoritative Relation Binding:** Freshly locked related objects are explicitly bound (`locked_sem.programme = locked_prog`, `locked_sub.department = locked_dept`) before passing to `validate_paper_offering_relationships()`, guaranteeing that relation lookups evaluate locked database state without issuing uncached/stale queries.
+- **Authoritative Relation Binding:** Freshly locked related objects are explicitly bound (`locked_sem.programme = locked_prog`, `locked_sub.department = locked_dept`) before passing to `validate_paper_offering_relationships()`, ensuring that relation lookups evaluate locked database state without issuing uncached/stale queries.
 - **Relational Invariant Verification:** Cross-college boundaries (`academic_session.college == locked_prog.college == locked_dept.college == locked_cat.college`), programme duration bounds (`semester_number <= locked_prog.duration_semesters`), and category credit bounds are authoritatively evaluated.
 
 #### 2. Academic Session Transfer & Current-Session Invariant (Finding B)
@@ -694,7 +694,7 @@ Following the Round 6 independent audit of Chunk 05, three findings were reporte
   - Reloads and locks `AcademicSession` via `AcademicSession.objects.select_for_update().get(pk=session_id)`.
   - Authoritatively validates `locked_session.college_id == locked_college.pk`.
   - Clears `is_current=False` on all other sessions of that college.
-  - Sets `locked_session.is_current = True` and commits atomically. Exactly one current session per college is mathematically guaranteed.
+  - Sets `locked_session.is_current = True` and commits atomically, enforcing that exactly one current session exists per college.
 
 #### 3. Programme Degree Type Default Alignment (Finding C)
 - In `create_programme()`, replaced the hardcoded `"UG"` fallback with `Programme._meta.get_field("degree_type").default` (`"UNDERGRADUATE"`).
@@ -709,12 +709,16 @@ Following the Round 6 independent audit of Chunk 05, three findings were reporte
 | Test Class | Tests Added | Scope Verified |
 | :--- | :---: | :--- |
 | `AuthoritativeRelationshipValidationRegressionTests` | 9 | **Test 1:** Valid single-college paper creation succeeds (HTTP 201).<br>**Test 2:** Cross-college academic session and semester rejected (HTTP 400).<br>**Test 3:** Cross-college subject-department rejected (HTTP 400).<br>**Test 4:** Cross-college subject-category rejected (HTTP 400).<br>**Test 5:** Serializer validated before semester programme reassignment to College B -> `create_paper_offering` detects cross-college mismatch under lock, raises `DRFValidationError`, 0 rows inserted.<br>**Test 6:** Serializer validated before subject department reassignment to College B -> `create_paper_offering` detects cross-college mismatch under lock, raises `DRFValidationError`, 0 rows inserted.<br>**Test 7:** Paper creation rechecks semester programme duration under lock.<br>**Test 8:** Paper creation rechecks category credit bounds under lock.<br>**Test 9:** Direct service `create_paper_offering` enforces authoritative relationship validation. |
-| `CurrentAcademicSessionTransferIntegrityRegressionTests` | 10 | **Test 1:** Current session cannot be reassigned to another college via PATCH (HTTP 400).<br>**Test 2:** Noncurrent session without offerings can be reassigned (HTTP 200).<br>**Test 3:** Noncurrent session with dependent offerings cannot be reassigned (HTTP 400).<br>**Test 4:** Rejected transfer preserves original college and `is_current=True`.<br>**Test 5:** Rejected transfer does not alter target college's current session.<br>**Test 6:** Direct service `update_academic_session` rejects transferring current session.<br>**Test 7:** Direct model `session.clean()` rejects transferring current session.<br>**Test 8:** Dedicated `set-current` action reloads under lock and guarantees exactly one current session in college.<br>**Test 9:** Stale session activation rejected when college mismatch occurs.<br>**Test 10:** Student and faculty forbidden from invoking `set-current` (HTTP 403). |
+| `CurrentAcademicSessionTransferIntegrityRegressionTests` | 10 | **Test 1:** Current session cannot be reassigned to another college via PATCH (HTTP 400).<br>**Test 2:** Noncurrent session without offerings can be reassigned (HTTP 200).<br>**Test 3:** Noncurrent session with dependent offerings cannot be reassigned (HTTP 400).<br>**Test 4:** Rejected transfer preserves original college and `is_current=True`.<br>**Test 5:** Rejected transfer does not alter target college's current session.<br>**Test 6:** Direct service `update_academic_session` rejects transferring current session.<br>**Test 7:** Direct model `session.clean()` rejects transferring current session.<br>**Test 8:** Dedicated `set-current` action reloads under lock and enforces exactly one current session in college.<br>**Test 9:** Stale session activation rejected when college mismatch occurs.<br>**Test 10:** Student and faculty forbidden from invoking `set-current` (HTTP 403). |
 | `ProgrammeDegreeTypeDefaultRegressionTests` | 5 | **Test 1:** Creating programme without degree_type defaults to "UNDERGRADUATE" via API (HTTP 201).<br>**Test 2:** Creating programme without degree_type defaults to "UNDERGRADUATE" via service.<br>**Test 3:** Creating programme with explicit degree_type ("DIPLOMA", "POSTGRADUATE") preserves value.<br>**Test 4:** Model schema default and service default agree on "UNDERGRADUATE".<br>**Test 5:** `makemigrations --check --dry-run` reports no database migration required. |
 
-- **Total New Regression Tests Added in Round 7:** 24 tests.
-- **Total Academic Tests:** 213 tests (all passed).
-- **Total Full Test Suite:** 419 tests discovered, 409 passed, 10 cleanly skipped (`SafeLiveRedisIntegrationTests`), zero failures.
+- **Latest Reported Test Baseline (Results Reported by Development Environment, Not Independent Execution):**
+  - **Total Tests Discovered:** 419.
+  - **Tests Passed:** 409.
+  - **Tests Skipped:** 10 (`SafeLiveRedisIntegrationTests`).
+  - **Tests Failed:** 0.
+  - **Academic Tests Passed:** 213.
+  - **New Regression Tests Added in Round 7:** 24.
 - **Clean System Checks:** Zero issues identified across development and production checks (`check --deploy`).
 - **Protected Files Integrity:** All 4 protected architectural documents verified 100% byte-identical and unmodified.
 
@@ -722,15 +726,20 @@ Following the Round 6 independent audit of Chunk 05, three findings were reporte
 
 ### 17.4 MySQL Concurrency Integration & Live Redis Status
 
-- **MySQL Concurrency Integration:** **NOT EXECUTED**. Automated test execution ran against the configured test runner (SQLite in-memory). Concurrency safety is guaranteed by strict ANSI SQL `SELECT ... FOR UPDATE` row-level locks, explicit transaction boundaries (`@transaction.atomic`), single-table locking queries without `select_related()`, lock coverage validation, and deterministic lock-order discipline targeting production MySQL 8.x InnoDB. Multi-connection MySQL concurrency verification remains deferred pending an isolated MySQL container service.
+- **MySQL Concurrency Integration:** **NOT EXECUTED**. Automated test execution ran against the configured test runner (SQLite in-memory). The implementation uses Django `transaction.atomic()`, MySQL-compatible `select_for_update()` locking, authoritative state validation and documented lock ordering. Source inspection and deterministic regression tests support the intended concurrency design. However, live multi-connection MySQL 8 InnoDB concurrency tests have not been executed. Production database concurrency safety remains subject to integration verification. SQLite test execution is not equivalent to live MySQL 8 InnoDB row-lock verification.
 - **Live Redis Integration:** **DEFERRED (10 Tests Cleanly Skipped)**. The 10 opt-in live Redis integration tests (`SafeLiveRedisIntegrationTests`) skipped cleanly as expected due to the absence of the disposable test Redis service gate (`RUN_REDIS_INTEGRATION_TESTS=1`). Mocked Redis throttle tests (125 tests) ran and passed with 100% success.
+- **Outstanding Infrastructure Warnings:**
+  - **MySQL 8 InnoDB Multi-Connection Concurrency Integration:** **NOT EXECUTED**.
+  - **Live Redis Integration:** **10 TESTS SKIPPED**.
+  - **Production Nginx/TLS and Reverse-Proxy Security Verification:** **PENDING**.
+  *(None of these infrastructure warnings is waived).*
 
 ---
 
 ### 17.5 Gating & Authorizations
 
 - **Chunk 04 Status:** APPROVED WITH WARNINGS (2026-11-03).
-- **Chunk 05 Status:** IN REVIEW — REVISION COMPLETE (ROUND 7).
+- **Chunk 05 Status:** IN REVIEW — PASS WITH WARNINGS (AWAITING OWNER APPROVAL).
 - **Chunk 06+ Status:** GATED — NOT AUTHORIZED.
 
 
