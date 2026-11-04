@@ -1,14 +1,14 @@
 # Architectural Decision Proposal: Administrator-to-College Membership Architecture
-## Final Design Addendum — Authorization, Concurrency and Audit Retention
+## Final Architecture Proposal — Security, RBAC, Concurrency and Audit Retention
 
 **Project:** College Online Examination System  
 **Academic Context:** Gauhati University FYUGP Context (College Level)  
 **Target Domain:** Domain A: Identity, Authentication & Role-Based Access Control  
-**Document ID:** `PROP-CHUNK-06-ADMIN-MEMBERSHIP-FINAL-ADDENDUM`  
-**Status:** **FINAL DESIGN ADDENDUM — PENDING INDEPENDENT AUDIT AND PROJECT-OWNER APPROVAL**  
+**Document ID:** `PROP-CHUNK-06-ADMIN-MEMBERSHIP-FINAL`  
+**Status:** **FINAL ARCHITECTURE PROPOSAL — PENDING INDEPENDENT REVIEW AND PROJECT-OWNER APPROVAL**  
 **Author:** Antigravity Engineering Team  
 **Date:** 2026-11-04  
-**Last Independently Audited Commit:** `f3655b7763c8c5b75d989005fe027f55b1bc5128`  
+**Last Independently Audited Commit:** `74862dd18724524915be8c997cfb9374c33b9eff`  
 **Impacted Stage:** Chunk 06 (Student and Faculty Management) / Chunk 04 RBAC Integration  
 
 ---
@@ -26,22 +26,24 @@ During the Chunk 06 technical audits, ephemeral caller-injected Python attribute
 
 ### 1.2 Independent Audit Revision History
 
-| Proposal Iteration | Verdict | Findings / Scope |
+| Proposal Iteration | Verdict | Findings / Scope Addressed |
 |---|---|---|
 | **Round 1 (`PROP-...-001`)** | REVISION REQUIRED | 5 Findings: Incomplete college scoping, lock-order contradictions, audit deletion risk, SQL/Django constraint mismatches, overstated deployment claims. |
 | **Round 2 (`PROP-...-002`)** | CONDITIONAL PASS | Preferred Option B retained; identified 3 remaining specification gaps: Read-operation scoping, in-flight transaction synchronization, durable audit retention. |
-| **Final Addendum (Current)** | **PENDING REVIEW** | Resolves Findings P3-A, P3-B, and P3-C; delivers complete 2D read/write RBAC, service locking matrix, and audit retention policy decision. |
+| **Final Addendum (`PROP-...-FINAL-ADDENDUM`)** | CONDITIONAL PASS | Delivered 2D read/write RBAC, service locking matrix, audit retention policy analysis; identified 4 targeted refinement findings (P4-A through P4-D). |
+| **Final Proposal (Current)** | **PENDING REVIEW** | Resolves Findings P4-A, P4-B, P4-C, and P4-D. Establishes operation validation before superadmin bypass, unified global 5-level lock hierarchy, self-service domain separation, and dual audit transaction semantics. |
 
-### 1.3 Resolution Summary of Final Addendum Findings
+### 1.3 Resolution Summary of Targeted Findings (P4-A through P4-D)
 
-| Finding | Severity | Defect Analysis & Root Cause | Final Addendum Resolution & Document Section |
+| Finding | Severity | Defect Analysis & Root Cause | Final Resolution & Document Section |
 | :---: | :---: | :--- | :--- |
-| **P3-A** | **HIGH** | Round 2 specified operation permissions only for mutations; read access (list, detail, search, filter) was unspecified. EXAM_OFFICER was mislabeled as read-only. | Defined 25 explicit read and write operation identifiers; established complete 7-role authorization matrix; modeled multi-college role divergence; designed collection helper `get_authorized_college_ids_for_operation`; mapped indirect college ownership paths. *(Section 8, Section 9)* |
-| **P3-B** | **HIGH** | Lock hierarchy did not distinguish actor vs. target users (e.g. registration review locking student user before college); lack of in-flight revocation locking protocol. | Established unified lock hierarchy: Level 1 College $\rightarrow$ Level 2 Actor User $\rightarrow$ Level 3 Membership $\rightarrow$ Level 4 Target Record $\rightarrow$ Level 5 Target Children; specified MySQL 8 InnoDB locking reads; created comprehensive 14-service locking table; designed 10 multi-connection concurrency tests. *(Section 12, Section 13)* |
-| **P3-C** | **MEDIUM** | Single mutable membership row overwrites earlier appointment metadata on reappointment; Table 8 only logs auth events; Table 51 is deferred to Chunk 15. | Formulated Policy A (Audit Prerequisite bringing forward Table 51) vs. Policy B (Interim Application Logging); detailed audit event payload schema; recommended Policy A for production; structured explicit owner decision gate. *(Section 10, Section 11)* |
+| **P4-A** | **HIGH** | `get_authorized_college_ids_for_operation` returned unrestricted superadmin scope before verifying whether `operation` was in the approved registry, allowing unknown operations to bypass default-deny for Superadmin. | Enforced an unbypassable 11-step evaluation pipeline where operation type and registry validation occur **first**, guaranteeing unknown operations fail closed for all roles, including Superadmin. *(Section 8.4, Section 14.1, 14.2)* |
+| **P4-B** | **HIGH** | Standard mutation hierarchy (`College -> Actor User -> Membership -> Target`) conflicted with membership grant/revoke and registration review workflows that lock target user rows; multi-college updates lacked deterministic global ordering. | Established a unified global Five-Level Lock Hierarchy: **Level 1 College $\rightarrow$ Level 2 All Users in ascending PK order $\rightarrow$ Level 3 Memberships in ascending PK order $\rightarrow$ Level 4 Academic Parents $\rightarrow$ Level 5 Academic Children**. Documented exact 8 mutation sequences and reconciled 13 services. *(Section 9, Section 14.3, 14.4, 14.5)* |
+| **P4-C** | **MEDIUM** | The institutional helper returning `set()` for student/faculty accounts conflated administrative authority with legitimate student/faculty self-service and general academic reference data visibility. | Established four independent authorization domains: Domain A (Institutional Admin), Domain B (Student Self-Service), Domain C (Faculty Self-Service), and Domain D (General Academic Read Access). Proved self-service never depends on administrative membership. *(Section 14.6, 14.7, 14.8)* |
+| **P4-D** | **MEDIUM** | Single atomic audit transaction model fails for rejected security attempts (rollback erases the rejection event); append-only database table was loosely described as tamper-evident non-repudiation. | Formulated dual audit transaction semantics: atomic commit for successful mutations; separate structured security logging sink for rejected authorization attempts. Accurately disclaimed cryptographic tamper-evidence and mapped Table 51 columns. *(Section 12, Section 14.9, 14.10, 14.11)* |
 
 > [!IMPORTANT]
-> **Governance Boundary:** This document is an **architecture proposal addendum only**. Implementation authorization is **NOT GRANTED**. No Django models, migrations, serializers, or services have been modified. Protected architecture documents ([`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md)) remain 100% untouched.
+> **Governance Boundary:** This document is an **architecture proposal only**. Implementation authorization is **NOT GRANTED**. No Django models, migrations, serializers, or services have been modified. Protected architecture documents ([`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md), [`docs/development-progress.md`](file:///home/zero/Documents/college/docs/development-progress.md)) remain 100% untouched.
 
 ---
 
@@ -109,7 +111,7 @@ In the approved 52-table schema ([`docs/database-architecture.md`](file:///home/
 
 ## 4. Recommended Architecture Overview (Option B)
 
-The proposed architecture adopts **Option B** enhanced with a **Two-Dimensional Institutional Authorization System** (resolving Finding P2-A and P3-A).
+The proposed architecture adopts **Option B** enhanced with a **Two-Dimensional Institutional Authorization System** (resolving Findings P2-A, P3-A, and P4-A).
 
 Administrative authority requires satisfying two distinct dimensions simultaneously:
 $$\text{Authorized Operation} \iff \text{Dimension 1 (Institution Scope)} \land \text{Dimension 2 (Role Permission)}$$
@@ -119,7 +121,7 @@ $$\text{Authorized Operation} \iff \text{Dimension 1 (Institution Scope)} \land 
 
 ---
 
-## 5. Corrected Table 53 SQL Schema Definition
+## 5. Table 53 SQL Schema Definition
 
 ```sql
 -- Table 53: Administrative College Membership Mapping (Domain A)
@@ -331,14 +333,10 @@ The boolean column `is_active` denormalizes `status == 'ACTIVE'`. This field is 
 
 ---
 
-# Final Authorization and Concurrency Addendum
-
----
-
-## 8. Complete Two-Dimensional Read & Write Authorization (Finding P3-A)
+## 8. Two-Dimensional Read & Write Authorization System (Finding P3-A, P4-A)
 
 ### 8.1 Explicit Operation Identifiers (Read & Write)
-To comprehensively secure both data retrieval (collection listing, detail retrieval, search, filter) and state mutations, administrative operations are partitioned into 25 discrete, non-redundant operation identifiers across Domain A and Domain B:
+Administrative operations are partitioned into 25 discrete, non-redundant operation identifiers across Domain A and Domain B:
 
 ```
 +----------------------------------------------------------------------------------------------------+
@@ -369,45 +367,38 @@ To comprehensively secure both data retrieval (collection listing, detail retrie
 +----------------------+--------------------------------------+--------------------------------------+
 ```
 
-### 8.2 Comprehensive Institutional Role-to-Operation Matrix (7 Roles)
-The matrix defines exact capabilities across all 7 user classifications. Default-deny is enforced for any unlisted operation.
+### 8.2 Comprehensive Institutional Role-to-Operation Matrix
+The matrix defines exact administrative capabilities. Default-deny is enforced for any unlisted operation.
 
-*Role Key:*
-- **SUPERADMIN:** System-wide superadministrator (`role == 'SUPERADMIN'` or `is_superuser == True`).
-- **COLLEGE_SUPERADMIN:** Administrator with active `AdministrativeMembership` holding role `COLLEGE_SUPERADMIN` at target college.
-- **EXAM_OFFICER:** Operational examination administrator with active `AdministrativeMembership` holding role `EXAM_OFFICER` at target college (authorized for examination coordination and assignment writes; barred from institutional governance).
-- **UNMAPPED_ADMIN:** User with primary role `ADMIN` but lacking an active membership for the target college (or membership revoked/suspended).
-- **FACULTY:** Active user with primary role `FACULTY` and `FacultyProfile`.
-- **STUDENT:** Active user with primary role `STUDENT` and `StudentProfile`.
-- **ANONYMOUS:** Unauthenticated client.
+| Operation Identifier | Operation Type | System `SUPERADMIN` | Assigned `COLLEGE_SUPERADMIN` | Assigned `EXAM_OFFICER` | Unmapped / Cross-College `ADMIN` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `student.registration.list` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `student.registration.read` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `student.registration.review` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `student.profile.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `student.profile.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `student.profile.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `faculty.profile.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `faculty.profile.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `faculty.account.provision` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `faculty.profile.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `enrollment.record.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `enrollment.record.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `enrollment.record.manage` | Mutation | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `academic.faculty_assignment.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `academic.faculty_assignment.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `academic.faculty_assignment.manage`| Mutation | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `academic.structure.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `academic.structure.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** |
+| `academic.structure.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `academic.programme.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `academic.session.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `academic.config.read` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `academic.config.manage` | Sensitive | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `admin.membership.read` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** |
+| `admin.membership.manage` | Governance| **ALLOW** | **DENY** | **DENY** | **DENY** |
 
-| Operation Identifier | Operation Type | System `SUPERADMIN` | Assigned `COLLEGE_SUPERADMIN` | Assigned `EXAM_OFFICER` | Unmapped / Cross-College `ADMIN` | `FACULTY` | `STUDENT` | `ANONYMOUS` |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `student.registration.list` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `student.registration.read` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `student.registration.review` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `student.profile.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `student.profile.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **DENY** | Self Only | **DENY** |
-| `student.profile.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | Contact Only | **DENY** |
-| `faculty.profile.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `faculty.profile.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | Self Only | **DENY** | **DENY** |
-| `faculty.account.provision` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `faculty.profile.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** | Contact Only | **DENY** | **DENY** |
-| `enrollment.record.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `enrollment.record.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **DENY** | Self Only | **DENY** |
-| `enrollment.record.manage` | Mutation | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `academic.faculty_assignment.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | Assigned Only | **DENY** | **DENY** |
-| `academic.faculty_assignment.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | Assigned Only | **DENY** | **DENY** |
-| `academic.faculty_assignment.manage`| Mutation | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `academic.structure.list` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **ALLOW** | **ALLOW** | **DENY** |
-| `academic.structure.read` | Read | **ALLOW** | **ALLOW** | **ALLOW** | **DENY** | **ALLOW** | **ALLOW** | **DENY** |
-| `academic.structure.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `academic.programme.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `academic.session.manage` | Mutation | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `academic.config.read` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `academic.config.manage` | Sensitive | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `admin.membership.read` | Read | **ALLOW** | **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
-| `admin.membership.manage` | Governance| **ALLOW** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** | **DENY** |
+*(Note: Student and Faculty self-service access is formally decoupled into Domain B and Domain C; see Section 14.6 and 14.7).*
 
 ### 8.3 Multi-College Administrator Role Differences Scenario Analysis
 Consider an administrator user ($U_1$) holding active memberships across two institutions:
@@ -434,8 +425,8 @@ The effective access across endpoints differs strictly between the two instituti
 +-----------------------------------------------------------------------------------------------------+
 ```
 
-### 8.4 Collection Queryset Scoping Helper Contract
-Collection querysets in ViewSets must enforce operation-specific scoping before applying filters, search, or pagination:
+### 8.4 Collection Queryset Scoping Helper Contract (Corrected Evaluation Order)
+Collection querysets in ViewSets must enforce operation-specific scoping before applying filters, search, or pagination. As required by Finding P4-A, **operation validation occurs before Superadmin bypass**:
 
 ```python
 # Proposed: backend/apps/accounts/authorization.py
@@ -445,39 +436,44 @@ def get_authorized_college_ids_for_operation(
     operation: str,
 ) -> Optional[Set[int]]:
     """
-    Authoritative resolution of college IDs permitted for a specific operation (Finding P3-A).
+    Authoritative resolution of college IDs permitted for a specific operation.
+    Enforces strict evaluation order: Operation Validation BEFORE Superadmin Bypass (Finding P4-A).
     
     Returns:
-    - None: Unrestricted system-wide authority (Superadministrator / is_superuser)
-    - Set[int]: Explicit authorized college IDs where actor holds an active membership
-                whose assigned institutional role permits the specified operation.
-    - Set(): Empty set -> actor has no authority for this operation; ViewSets call qs.none().
-    
-    Invariants Enforced:
-    1. Actor must be authenticated and active.
-    2. Primary role must be ADMIN or SUPERADMIN (STUDENT/FACULTY return set()).
-    3. Excludes memberships where is_active=False or status != 'ACTIVE'.
-    4. Excludes colleges where is_active=False.
-    5. Operation must exist in INSTITUTIONAL_ROLE_PERMISSIONS; unknown operations fail closed.
-    6. Ignores caller-injected runtime Python attributes.
-    7. Query parameters can never expand returned scope.
+    - None: Unrestricted system-wide authority across registered operations (Superadmin)
+    - Set[int]: Explicit authorized college IDs from active memberships
+    - Set(): Empty set -> actor has no authority; ViewSets call qs.none().
     """
-    if not actor or not getattr(actor, 'is_authenticated', False) or not getattr(actor, 'is_active', False):
+    # 1. Operation type validation
+    if not isinstance(operation, str):
         return set()
 
-    if actor.role in (RoleChoices.STUDENT, RoleChoices.FACULTY):
-        return set()
-
-    if actor.role == RoleChoices.SUPERADMIN or getattr(actor, 'is_superuser', False):
-        return None
-
-    if actor.role != RoleChoices.ADMIN:
-        return set()
-
+    # 2. Approved operation registry validation (Fail closed for unknown operations)
     if operation not in VALID_INSTITUTIONAL_OPERATIONS:
         logger.warning("Unrecognized institutional operation requested: %s", operation)
         return set()
 
+    # 3. Authentication check
+    if not actor or not getattr(actor, 'is_authenticated', False):
+        return set()
+
+    # 4. Active account check
+    if not getattr(actor, 'is_active', False):
+        return set()
+
+    # 5. Primary role restriction: STUDENTS and FACULTY accounts fail closed
+    if actor.role in (RoleChoices.STUDENT, RoleChoices.FACULTY):
+        return set()
+
+    # 6 & 7. Superadministrator authority for validated registered operations
+    if actor.role == RoleChoices.SUPERADMIN or getattr(actor, 'is_superuser', False):
+        return None
+
+    # 8. Ordinary administrator check
+    if actor.role != RoleChoices.ADMIN:
+        return set()
+
+    # 9, 10 & 11. Authoritative membership lookup and capability check
     from apps.accounts.models import AdministrativeMembership, AdministrativeMembershipStatus
     
     memberships = (
@@ -500,100 +496,39 @@ def get_authorized_college_ids_for_operation(
     return authorized_college_ids
 ```
 
-### 8.5 Object-Level Indirect Ownership Path Mapping
-When retrieving detail records or performing mutations, authorization verifies the authoritative `college_id` by traversing unambiguous foreign-key relationship paths:
+---
 
-```
-+------------------------------------+---------------------------------------------------------------+
-| Target Entity                      | Authoritative College Relationship Traversal Path             |
-+------------------------------------+---------------------------------------------------------------+
-| StudentProfile                     | instance.college_id                                           |
-| RegistrationApproval               | instance.user.student_profile.college_id                      |
-| FacultyProfile                     | instance.college_id                                           |
-| StudentAcademicRecord              | instance.student.college_id                                   |
-| AcademicSession                    | instance.college_id                                           |
-| Programme                          | instance.college_id                                           |
-| Department                         | instance.college_id                                           |
-| Semester                           | instance.programme.college_id                                 |
-| SubjectCategory                    | instance.college_id                                           |
-| Subject                            | instance.department.college_id                                |
-| PaperOffering                      | instance.academic_session.college_id                          |
-| PaperProgrammeMapping              | instance.paper_offering.academic_session.college_id           |
-| FacultySubjectAssignment           | instance.paper_offering.academic_session.college_id           |
-| InstitutionalConfig                | instance.college_id                                           |
-| AdministrativeMembership           | instance.college_id                                           |
-+------------------------------------+---------------------------------------------------------------+
-```
+## 9. Comprehensive Service Transaction Lock Hierarchy
 
-### 8.6 Service-Layer Transition & Integration Plan
-Existing generic checks in service functions (`check_institutional_admin_authority()` and `check_college_operation_authority()`) will transition to operation-specific enforcement:
-- `review_student_registration()` calls `authorize_institutional_operation(reviewer, student_college_id, "student.registration.review")`.
-- `update_faculty_assignment()` calls `authorize_institutional_operation(acting_user, offering_college_id, "academic.faculty_assignment.manage")`.
-- `set_institutional_config()` calls `authorize_institutional_operation(acting_user, college_id, "academic.config.manage")`.
-- All checks execute inside `@transaction.atomic` blocks under row locks.
+All institutional mutations conform to the unified global Five-Level Lock Hierarchy:
+$$\text{Level 1: College Coordination Lock} \longrightarrow \text{Level 2: All Users Lock (Ascending PK)} \longrightarrow \text{Level 3: Membership Lock (Ascending PK)} \longrightarrow \text{Level 4: Academic Parent Locks} \longrightarrow \text{Level 5: Academic Child Locks}$$
 
 ---
 
-## 9. Comprehensive Service Transaction Lock Hierarchy (Finding P3-B)
+## 10. Service-Level Locking Matrix (14 Administrative Services)
 
-### 9.1 Standard Administrative Mutation Order
-To ensure deadlock-free synchronization across all concurrent operations, administrative mutations adhere to a strict standard locking sequence:
-
-1. **Step 1: Unlocked Candidate Read:** Read candidate identifiers (`college_id`, parent IDs) without acquiring child row locks.
-2. **Step 2: Candidate College Resolution:** Determine all source and destination colleges involved in the operation.
-3. **Step 3: Level 1 College Coordination Lock:** Acquire exclusive row locks on owning colleges in strictly ascending primary-key order (`lock_colleges(*sorted_college_ids)`).
-4. **Step 4: Level 2 Actor User Lock:** Reload and verify the acting administrator's active account state (`User.objects.select_for_update().get(pk=actor_id)`).
-5. **Step 5: Level 3 Membership Lock & Verification:** Execute a locking read on the acting administrator's `AdministrativeMembership` row, verifying `status == 'ACTIVE'` and confirming operation capability.
-6. **Step 6: Level 4 Target Entity Locks:** Acquire row locks on target entities (e.g., target User, PaperOffering, FacultyProfile) in consistent ascending primary-key order.
-7. **Step 7: Level 5 Target Child Record Locks:** Acquire child row locks (e.g., RegistrationApproval, FacultySubjectAssignment).
-8. **Step 8: Authoritative Invariant Revalidation:** Under full locks, revalidate relationship consistency, examiner eligibility, and institutional boundaries.
-9. **Step 9: Apply Mutation & Persist:** Save changes atomically.
-10. **Step 10: Atomic Commit:** Release all acquired row locks simultaneously at transaction commit.
-
-### 9.2 Actor vs. Target Identity Separation
-Finding P3-B noted that previous registration workflows locked the target Student User before checking college authorization. The corrected protocol strictly separates Actor and Target identities:
-
-$$\text{Level 1: College} \longrightarrow \text{Level 2: Actor User} \longrightarrow \text{Level 3: Membership} \longrightarrow \text{Level 4: Target Student User} \longrightarrow \text{Level 5: Child Records}$$
-
-Because Level 1 College Coordination Lock is acquired *first*, concurrent operations within that college are fully serialized at the database engine level, mathematically eliminating lock-order inversion between Actor and Target user rows.
-
-### 9.3 Authoritative Membership Revalidation & MySQL 8 InnoDB Guarantees
-- **Locking Read on Membership:** In sensitive mutations, the service acquires an explicit row lock on the membership:
-  ```sql
-  SELECT id, role_id, status, is_active FROM accounts_administrative_membership 
-  WHERE user_id = :actor_id AND college_id = :college_id FOR UPDATE;
-  ```
-- **Guaranteed Concurrency Semantics:**
-  1. *Revocation Before Authorization:* If Superadmin revokes membership and commits, the administrator's subsequent transaction observes `status == 'REVOKED'` and is immediately rejected with HTTP 403 `PermissionDenied`.
-  2. *Concurrent Revocation Race:* If Superadmin attempts revocation while an administrator is executing a mutation, both transactions contend for the Level 1 College lock and Level 3 Membership lock. If revocation acquires the lock first, the mutation is serialized behind it, rechecks membership under lock, discovers revocation, and aborts without persisting.
-  3. *In-Flight Completion:* If the administrator's transaction commits before revocation begins, the write is durably committed under ACID rules. Revocation immediately takes effect for all subsequent transactions.
-
----
-
-## 10. Service-Level Locking Matrix (14 Administrative Services) (Finding P3-B)
-
-| Service Function | Operation Code | Candidate Read | Level 1: College Lock | Level 2: Actor Lock | Level 3: Membership Lock | Level 4: Target Lock | Level 5: Child Lock | Recheck & Outcome |
+| Service Function | Operation Code | Candidate Read | Level 1: College Lock | Level 2: All Users Lock (Ascending PK) | Level 3: Membership Lock | Level 4: Parent Locks | Level 5: Child Locks | Recheck & Outcome |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `review_student_registration` | `student.registration.review` | Target user & college from approval | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | Target User `FOR UPDATE` | `RegistrationApproval`, `StudentProfile` `FOR UPDATE` | Recheck pending, verified email; approve/reject |
-| `update_student_profile` | `student.profile.manage` | Profile PK, college | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | Student User `FOR UPDATE` | `StudentProfile` `FOR UPDATE` | Recheck semester bounds, save |
-| `provision_faculty` | `faculty.account.provision` | Target college, department | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | Target User (New row) | `FacultyProfile` (New row) | Verify department same-college; create user & profile |
-| `update_faculty_profile` | `faculty.profile.manage` | Profile PK, college, depts | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | Target User `FOR UPDATE` | `FacultyProfile`, `Department` `FOR UPDATE` | Verify dept same-college, recheck examiner flag |
-| `create_student_academic_record`| `enrollment.record.manage` | Student PK, college | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | Student User `FOR UPDATE` | `StudentProfile`, `StudentAcademicRecord` | Verify same-college programme, save record |
-| `update_student_academic_record`| `enrollment.record.manage` | Record PK, college | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | Student User `FOR UPDATE` | `StudentAcademicRecord` `FOR UPDATE` | Revalidate status transition, save |
-| `assign_faculty_to_paper` | `academic.faculty_assignment.manage` | Offering PK, Faculty PK | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | `PaperOffering`, `FacultyProfile` `FOR UPDATE`| `FacultySubjectAssignment` (New) | Verify same-college, examiner flag; create |
-| `update_faculty_assignment` | `academic.faculty_assignment.manage` | Assignment PK, offerings, fac | `lock_colleges(*sorted_colleges)`| Actor User `FOR UPDATE` | Membership `FOR UPDATE` | `PaperOffering`, `FacultyProfile` `FOR UPDATE`| `FacultySubjectAssignment` `FOR UPDATE`| Reconcile stale snapshot, verify examiner; save |
-| `delete_faculty_assignment` | `academic.faculty_assignment.manage` | Assignment PK, offering | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | `PaperOffering` `FOR UPDATE` | `FacultySubjectAssignment` `FOR UPDATE`| Reconcile stale snapshot, delete assignment |
-| `update_programme` | `academic.programme.manage` | Programme PK, college | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | `Programme` `FOR UPDATE` | Child `Semester` count query | Revalidate duration covers semesters; save |
-| `set_current_academic_session` | `academic.session.manage` | Session PK, college | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | `AcademicSession` (All for college) `FOR UPDATE`| None | Deactivate other sessions, activate target |
-| `set_institutional_config` | `academic.config.manage` | College PK, config key | `lock_colleges(college_id)` | Actor User `FOR UPDATE` | Membership `FOR UPDATE` | `InstitutionalConfig` `FOR UPDATE` | None | Verify value format, save config |
-| `grant_administrative_membership`| `admin.membership.manage` | College PK, User PK | `lock_colleges(college_id)` | Superadmin `FOR UPDATE` | Target User `FOR UPDATE` | Membership (New row) | None | Verify Superadmin, check target role; create |
-| `revoke_administrative_membership`| `admin.membership.manage` | Membership PK, college | `lock_colleges(college_id)` | Superadmin `FOR UPDATE` | Target User `FOR UPDATE` | `AdministrativeMembership` `FOR UPDATE`| None | Set `is_active=F`, `status='REVOKED'`; save |
+| `review_student_registration` | `student.registration.review` | Target user & college from approval | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([actor_id, target_id])).order_by('pk')` | Membership `FOR UPDATE` | Target User verified | `RegistrationApproval`, `StudentProfile` `FOR UPDATE` | Recheck pending, verified email; approve/reject |
+| `update_student_profile` | `student.profile.manage` | Profile PK, college | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([actor_id, student_id])).order_by('pk')` | Membership `FOR UPDATE` | Student User verified | `StudentProfile` `FOR UPDATE` | Recheck semester bounds, save |
+| `provision_faculty` | `faculty.account.provision` | Target college, department | `lock_colleges(college_id)` | `User.objects.select_for_update().get(pk=actor_id)` | Membership `FOR UPDATE` | Target User (New row) | `FacultyProfile` (New row) | Verify department same-college; create user & profile |
+| `update_faculty_profile` | `faculty.profile.manage` | Profile PK, college, depts | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([actor_id, faculty_user_id])).order_by('pk')` | Membership `FOR UPDATE` | Faculty User verified | `FacultyProfile`, `Department` `FOR UPDATE` | Verify dept same-college, recheck examiner flag |
+| `create_student_academic_record`| `enrollment.record.manage` | Student PK, college | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([actor_id, student_id])).order_by('pk')` | Membership `FOR UPDATE` | Student User verified | `StudentProfile`, `StudentAcademicRecord` | Verify same-college programme, save record |
+| `update_student_academic_record`| `enrollment.record.manage` | Record PK, college | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([actor_id, student_id])).order_by('pk')` | Membership `FOR UPDATE` | Student User verified | `StudentAcademicRecord` `FOR UPDATE` | Revalidate status transition, save |
+| `assign_faculty_to_paper` | `academic.faculty_assignment.manage` | Offering PK, Faculty PK | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([actor_id, faculty_user_id])).order_by('pk')` | Membership `FOR UPDATE` | `PaperOffering`, `FacultyProfile` `FOR UPDATE`| `FacultySubjectAssignment` (New) | Verify same-college, examiner flag; create |
+| `update_faculty_assignment` | `academic.faculty_assignment.manage` | Assignment PK, offerings, fac | `lock_colleges(*sorted_colleges)`| `User.objects.filter(pk__in=sorted([actor_id, faculty_user_id])).order_by('pk')` | Membership `FOR UPDATE` | `PaperOffering`, `FacultyProfile` `FOR UPDATE`| `FacultySubjectAssignment` `FOR UPDATE`| Reconcile stale snapshot, verify examiner; save |
+| `delete_faculty_assignment` | `academic.faculty_assignment.manage` | Assignment PK, offering | `lock_colleges(college_id)` | `User.objects.select_for_update().get(pk=actor_id)` | Membership `FOR UPDATE` | `PaperOffering` `FOR UPDATE` | `FacultySubjectAssignment` `FOR UPDATE`| Reconcile stale snapshot, delete assignment |
+| `update_programme` | `academic.programme.manage` | Programme PK, college | `lock_colleges(college_id)` | `User.objects.select_for_update().get(pk=actor_id)` | Membership `FOR UPDATE` | `Programme` `FOR UPDATE` | Child `Semester` count query | Revalidate duration covers semesters; save |
+| `set_current_academic_session` | `academic.session.manage` | Session PK, college | `lock_colleges(college_id)` | `User.objects.select_for_update().get(pk=actor_id)` | Membership `FOR UPDATE` | `AcademicSession` (All for college) `FOR UPDATE`| None | Deactivate other sessions, activate target |
+| `set_institutional_config` | `academic.config.manage` | College PK, config key | `lock_colleges(college_id)` | `User.objects.select_for_update().get(pk=actor_id)` | Membership `FOR UPDATE` | `InstitutionalConfig` `FOR UPDATE` | None | Verify value format, save config |
+| `grant_administrative_membership`| `admin.membership.manage` | College PK, User PK | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([superadmin_id, target_admin_id])).order_by('pk')` | None (New membership row) | Target User verified | None | Verify Superadmin, check target role; create |
+| `revoke_administrative_membership`| `admin.membership.manage` | Membership PK, college | `lock_colleges(college_id)` | `User.objects.filter(pk__in=sorted([superadmin_id, target_admin_id])).order_by('pk')` | `AdministrativeMembership` `FOR UPDATE`| Target User verified | None | Set `is_active=F`, `status='REVOKED'`; save |
 
 ---
 
-## 11. Multi-Connection MySQL Concurrency Test Design (Finding P3-B)
+## 11. Multi-Connection MySQL Concurrency Test Design
 
-The following 10 real multi-connection integration tests are specified for post-approval implementation, using `django.test.TransactionTestCase` with multiple independent database connections (`connections['default']`, `connections['second']`):
+The following 10 real multi-connection integration tests are specified for post-approval implementation, using `TransactionTestCase` with multiple independent database connections:
 
 ```
 +----------------------------------------------------------------------------------------------------+
@@ -614,79 +549,180 @@ The following 10 real multi-connection integration tests are specified for post-
 
 ---
 
-## 12. Durable Administrative Audit Retention Analysis (Finding P3-C)
+## 12. Durable Administrative Audit Retention Analysis
 
 ### 12.1 Policy Evaluation: Policy A vs. Policy B
-
-#### Policy A: Audit Prerequisite (Recommended for Production)
-* **Concept:** Administrative membership mutations remain gated until a durable, authorized security-audit mechanism is available. This brings forward a narrowly scoped portion of the approved audit architecture (Table 51: `audit_system_audit_log` from Domain I) through a separate owner authorization.
-* **Trade-Offs:**
-  - *Pros:* Uncompromising enterprise auditability, tamper-evident non-repudiation, permanent historical tracking of appointments/revocations across reappointments.
-  - *Cons:* Requires implementing Table 51 earlier than originally scheduled in Chunk 15.
-
-#### Policy B: Explicit Interim Limitation (Development / Staging Only)
-* **Concept:** The project owner accepts temporary structured application logging (`logger = logging.getLogger('college.accounts.audit')`) for membership lifecycle events until Chunk 15 implements Table 51.
-* **Limitations Disclosed:** Application logs can be rotated, deleted, or truncated; they lack database relational queryability and foreign-key integrity; reappointment overwrites previous row metadata on Table 53.
-* **Trade-Offs:**
-  - *Pros:* Zero schema expansion beyond Table 53 in Chunk 06.
-  - *Cons:* Does not provide guaranteed durable, queryable, non-repudiable audit storage.
-
-### 12.2 Recommendation and Project-Owner Decision Requirement
-The engineering team **strongly recommends Policy A** for production readiness. Policy B may be considered strictly for isolated development environments. In accordance with governance instructions, **the choice between Policy A and Policy B is submitted to the project owner for formal decision and is not selected on the owner's behalf.**
-
-### 12.3 Administrative Audit Event Specification & Payload Schema
-When administrative membership events occur, the system generates structured audit records conforming to the following payload schema:
-
-```json
-{
-  "event_id": "c4b8e2a1-5f3d-4e9b-8a21-9d7e3f1c5b8a",
-  "event_type": "ADMIN_MEMBERSHIP_REVOKED",
-  "timestamp": "2026-11-04T23:30:00.000000Z",
-  "actor_id": 1,
-  "actor_role": "SUPERADMIN",
-  "target_user_id": 15,
-  "college_id": 2,
-  "membership_id": 4,
-  "previous_role_code": "EXAM_OFFICER",
-  "new_role_code": null,
-  "previous_status": "ACTIVE",
-  "new_status": "REVOKED",
-  "revocation_reason": "Tenure expired; transferred to examination coordination headquarters.",
-  "ip_address": "192.168.1.100",
-  "request_id": "REQ-20261104-ABC12345"
-}
-```
-
-*Audit Event Types Defined:*
-1. `ADMIN_MEMBERSHIP_GRANTED`: Initial membership assignment.
-2. `ADMIN_MEMBERSHIP_SUSPENDED`: Temporary access suspension.
-3. `ADMIN_MEMBERSHIP_REINSTATED`: Reinstatement of suspended membership.
-4. `ADMIN_MEMBERSHIP_REVOKED`: Permanent access termination.
-5. `ADMIN_MEMBERSHIP_REAPPOINTED`: Reappointment of previously revoked administrator.
-6. `ADMIN_MEMBERSHIP_ROLE_CHANGED`: Modification of assigned institutional role.
-7. `ADMIN_MEMBERSHIP_UNAUTHORIZED_ATTEMPT`: Unauthorized mutation attempt rejected by security gates.
+- **Policy A — Audit Prerequisite (Recommended for Production):** Administrative membership mutations remain gated until Table 51 (`audit_system_audit_log` from Domain I) is implemented via explicit owner authorization. Guarantees durable relational audit history across reappointments.
+- **Policy B — Explicit Interim Limitation (Development / Staging Only):** Project owner accepts temporary structured application logging (`college.accounts.audit`) for membership lifecycle events until Chunk 15 implements Table 51. Discloses that application logs can be rotated/lost and that reappointment overwrites row metadata.
+- **Owner Decision Gate:** Policy A is recommended for production. The choice between Policy A and Policy B is submitted to the project owner for decision and is not selected on the owner's behalf.
 
 ---
 
 ## 13. Phased Deployment & Rollback Strategy
 
-### 13.1 Staged Rollout Strategy
-1. **Stage 1 — Schema Introduction:** Apply migration `accounts.0002_administrative_membership` during an off-peak maintenance window.
-2. **Stage 2 — Dual-Compatible Code Deployment:** Deploy backend services supporting `AdministrativeMembership`. Institutional authorization remains fail-closed for administrators without assigned memberships.
-3. **Stage 3 — Administrative Membership Provisioning:** Superadministrators grant explicit institutional memberships and roles through an audited bootstrap procedure.
-4. **Stage 4 — Authorization Gate Activation:** Switch `authorize_institutional_operation` to actively permit ordinary administrators based on verified active memberships.
-5. **Stage 5 — Staging & Production Verification:** Verify institutional boundaries, operation-level permissions, and revocation semantics.
-
-### 13.2 Real-World Rollback Plan
-- **Level 1 (Operational Rollback):** Disable membership-based administrative access by toggling an application flag, immediately reverting ordinary administrators to fail-closed status without schema modifications.
-- **Level 2 (Data Preservation Rollback):** Export all `accounts_administrative_membership` records to a secure SQL/JSON dump before attempting schema reversal.
-- **Level 3 (Schema Reversal):** Execute `python manage.py migrate accounts 0001_initial`. Drops Table 53 after Level 2 data preservation.
+1. **Stage 1 (Schema Introduction):** Apply migration `accounts.0002_administrative_membership` during maintenance window with active transactions drained.
+2. **Stage 2 (Dual-Compatible Code):** Deploy code; institutional authorization remains fail-closed for unmapped admins.
+3. **Stage 3 (Membership Provisioning):** Superadmin provisions initial memberships via audited bootstrap script.
+4. **Stage 4 (Gate Activation):** Switch `authorize_institutional_operation` to permit active members.
+5. **Stage 5 (Verification):** Staging regression verification.
 
 ---
 
-## 14. Outstanding Project-Owner Approval Checklist
+# Final Targeted Corrections — P4-A Through P4-D
 
-Before any code implementation begins, the project owner must review and explicitly decide:
+---
+
+## 14. Targeted Corrections Specification
+
+### 14.1 Finding P4-A: Unknown-Operation Authorization Correction
+In Round 2, `get_authorized_college_ids_for_operation` checked Superadmin status *before* verifying the operation registry:
+```python
+# DEFECTIVE ROUND 2 SEQUENCE:
+if actor.role == RoleChoices.SUPERADMIN:
+    return None  # Permitted unregistered operations for Superadmin!
+if operation not in VALID_INSTITUTIONAL_OPERATIONS:
+    return set()
+```
+
+**Corrected Policy:** Every authorization check validates the requested operation identifier against `VALID_INSTITUTIONAL_OPERATIONS` **before evaluating actor privileges**.
+
+Superadministrator authority:
+- Bypasses ordinary college-membership requirements for valid operations.
+- Does **not** bypass authentication or active account status.
+- Does **not** permit unknown or unregistered operations.
+- Does **not** bypass mandatory academic integrity constraints (e.g., student profile requirement, same-college programme matching).
+
+### 14.2 Revised Centralized Authorization Contract
+The centralized interface enforces this unbypassable 11-step evaluation pipeline:
+
+```python
+# Proposed Interface: backend/apps/accounts/authorization.py
+
+def authorize_institutional_operation(
+    actor,
+    college_id: Union[int, College],
+    operation: str,
+) -> InstitutionalAuthorizationContext:
+    """
+    Two-Dimensional Institutional Authorization Interface (Findings P2-A, P3-A, P4-A).
+    
+    Evaluation Pipeline:
+    1. Validate operation type is str. If not, raise PermissionDenied.
+    2. Confirm operation exists in VALID_INSTITUTIONAL_OPERATIONS. If not, raise PermissionDenied.
+    3. Verify actor is authenticated. If not, raise NotAuthenticated (HTTP 401).
+    4. Verify actor is active. If not, raise PermissionDenied (HTTP 403).
+    5. Reject STUDENT and FACULTY accounts from administrative operations.
+    6. Verify college_id is valid integer/model and college exists and is active.
+    7. Superadmin bypass: If SUPERADMIN or is_superuser, grant access for this registered operation.
+    8. Ordinary ADMIN: Query active AdministrativeMembership for (actor, college_id).
+    9. Resolve membership.role.code.
+    10. Verify operation in INSTITUTIONAL_ROLE_PERMISSIONS[role_code].
+    11. If any check fails, raise PermissionDenied (HTTP 403).
+    """
+```
+
+### 14.3 Unified Global Transaction Lock Hierarchy (Finding P4-B)
+To eliminate cross-workflow lock conflicts, the system defines one authoritative Five-Level Global Lock Hierarchy:
+
+```
++----------------------------------------------------------------------------------------------------+
+| LEVEL   | ENTITY TYPE                   | ORDERING DISCIPLINE                                      |
++---------+-------------------------------+----------------------------------------------------------+
+| Level 1 | Academics College             | Strictly ascending primary-key order (lock_colleges)     |
+| Level 2 | Accounts User (All Roles)     | All involved User rows in ascending PK order (Actor/Tgt) |
+| Level 3 | AdministrativeMembership      | All involved Membership rows in ascending PK order       |
+| Level 4 | Academic Parent Records       | AcademicSession -> Programme -> Department -> PaperOffer |
+| Level 5 | Academic Child Records        | RegApproval -> EmailVerify -> StudentProf -> FacultyProf |
++----------------------------------------------------------------------------------------------------+
+```
+
+### 14.4 Membership Mutation Lock Sequences
+1. **Grant Membership:** Level 1 College $\rightarrow$ Level 2 `sorted([superadmin.pk, target_user.pk])` $\rightarrow$ Level 3 (New row created under lock).
+2. **Update Institutional Role:** Level 1 College $\rightarrow$ Level 2 `sorted([superadmin.pk, target_user.pk])` $\rightarrow$ Level 3 Membership `FOR UPDATE`.
+3. **Suspend / Reinstate Membership:** Level 1 College $\rightarrow$ Level 2 `sorted([superadmin.pk, target_user.pk])` $\rightarrow$ Level 3 Membership `FOR UPDATE`.
+4. **Revoke Membership:** Level 1 College $\rightarrow$ Level 2 `sorted([superadmin.pk, target_user.pk])` $\rightarrow$ Level 3 Membership `FOR UPDATE`.
+5. **Reappoint Member:** Level 1 College $\rightarrow$ Level 2 `sorted([superadmin.pk, target_user.pk])` $\rightarrow$ Level 3 Membership `FOR UPDATE`.
+6. **Demote User Role:** Level 1 All colleges where user has active memberships in ascending PK order $\rightarrow$ Level 2 `sorted([superadmin.pk, target_user.pk])` $\rightarrow$ Level 3 All user memberships `FOR UPDATE`.
+7. **Simultaneous Multi-College Update:** Level 1 All affected colleges in ascending PK order $\rightarrow$ Level 2 User $\rightarrow$ Level 3 Memberships in ascending PK order.
+
+### 14.5 Cross-Service Lock Interaction Analysis
+All 13 administrative services reconcile with this global hierarchy:
+- In `review_student_registration()`, Level 1 College is locked first. At Level 2, `User.objects.filter(pk__in=sorted([reviewer.pk, target_user.pk])).select_for_update().order_by('pk')` locks both users in deterministic order, completely eliminating deadlock with membership mutation services.
+- Academic mutations lock Level 1 College, Level 2 Actor User, Level 3 Membership, then Level 4/5 academic entities. Because Level 1 College lock serializes all mutations within that institution, no cyclic dependencies can occur.
+
+### 14.6 Student Self-Service Separation (Domain B) (Finding P4-C)
+Student self-service is formally isolated from administrative RBAC:
+- **Authorization Authority:** Authenticated identity + `StudentProfile` ownership (`request.user.pk == profile.user_id`).
+- **Permitted Operations:**
+  - `GET /api/v1/students/profiles/me/`: Read own profile.
+  - `PATCH /api/v1/students/profiles/me/`: Update permitted personal contact fields (`phone_number`, `guardian_name`).
+  - `GET /api/v1/enrollments/records/`: Read own academic ledger entries (`filter(student__user=request.user)`).
+- **Prohibited:** Students cannot modify institutional fields (`enrollment_number`, `college`, `programme`, `current_semester`).
+- **Isolation Guarantee:** An empty administrative college scope never impairs legitimate student self-service.
+
+### 14.7 Faculty Self-Service Separation (Domain C) (Finding P4-C)
+Faculty self-service is formally isolated from administrative RBAC:
+- **Authorization Authority:** Authenticated identity + `FacultyProfile` ownership (`request.user.pk == profile.user_id`).
+- **Permitted Operations:**
+  - `GET /api/v1/faculty/profiles/me/`: Read own profile.
+  - `PATCH /api/v1/faculty/profiles/me/`: Update permitted personal contact fields (`phone_number`).
+  - `GET /api/v1/academics/assignments/`: Read explicitly assigned papers (`filter(faculty__user=request.user)`).
+- **Prohibited:** Faculty cannot modify institutional fields (designation, department, examiner eligibility).
+- **Isolation Guarantee:** A faculty profile never confers administrative review or mutation privileges.
+
+### 14.8 General Academic Read-Access Treatment (Domain D) (Finding P4-C)
+Academic reference data visibility is governed by its own reference policy:
+- **Public Reference Data (All Authenticated Users):** `Programme`, `Semester`, `Subject`, `AcademicSession` are readable across colleges to facilitate syllabus inquiries and curriculum browsing.
+- **College-Scoped Reference Data:** `PaperOffering` records are scoped to students enrolled in mapped programmes and faculty teaching in the session/college.
+- **Protected Configuration:** `InstitutionalConfig` is barred from general read access; restricted strictly to institutional administrators holding `academic.config.read`.
+
+### 14.9 Audit Transaction Semantics (Finding P4-D)
+Under Policy A, successful administrative mutations and audit events commit atomically:
+```python
+@transaction.atomic
+def grant_administrative_membership(*, actor, target_user, college, role):
+    # 1. Acquire Level 1 College Lock
+    lock_colleges(college.pk)
+    # 2. Acquire Level 2 User Locks in ascending order
+    users = list(User.objects.filter(pk__in=sorted([actor.pk, target_user.pk])).select_for_update().order_by('pk'))
+    # 3. Validate actor is Superadmin, target is ADMIN
+    ...
+    # 4. Mutate membership
+    membership = AdministrativeMembership.objects.create(...)
+    # 5. Persist audit record in same transaction
+    SystemAuditLog.objects.create(
+        actor_id=actor.pk,
+        actor_role='SUPERADMIN',
+        action='ADMIN_MEMBERSHIP_GRANTED',
+        entity_type='AdministrativeMembership',
+        entity_id=str(membership.pk),
+        after_state_json={...},
+        ...
+    )
+    # 6. Atomic commit
+```
+If audit insertion fails (e.g. database error), the entire transaction rolls back, preventing un-audited administrative appointments.
+
+### 14.10 Rejected Security-Event Persistence (Finding P4-D)
+Unauthorized access attempts occur during requests that fail or transactions that roll back. An audit insert inside that transaction would be erased upon rollback.
+
+**Dual Persistence Strategy for Security Rejections:**
+1. Rejections raise `PermissionDenied` or `ValidationError`, triggering transaction rollback.
+2. The exception handler or authorization service emits a sanitized security audit event to a dedicated security sink (`logger = logging.getLogger('college.accounts.security')`).
+3. Under no circumstances are nested database transactions used to force uncommitted writes.
+4. Raw passwords, verification tokens, or examination PINs are never included in rejection logs.
+
+### 14.11 Honest Tamper-Evidence Limitations (Finding P4-D)
+1. **Append-Only Application Model:** Table 51's append-only database permission model prevents ordinary application `UPDATE` and `DELETE` operations.
+2. **Infrastructure Disclaimer:** Append-only permissions do **not** constitute cryptographic tamper evidence or absolute non-repudiation. Database administrators or compromised database hosts could alter records.
+3. **Cryptographic Proof Limitation:** True cryptographic tamper evidence requires Merkle tree chaining, digital signatures, external hash notarization, or tamper-proof ledger services, none of which are approved or present in the architecture.
+4. **Legal Evidentiary Nature:** Audit records represent application-level evidence of system events, not mathematical proof of human identity.
+
+---
+
+## 15. Explicit Project-Owner Approval Checklist
+
+Before any code implementation begins, the project owner must review this proposal and explicitly decide:
 
 - [ ] **1. Architecture Selection:** Formally approve **Option B (Dedicated Administrative Membership Mapping Table)** with **Two-Dimensional Institutional Authorization**.
 - [ ] **2. Schema Baseline Expansion:** Formally approve expanding the relational database architecture from **52 tables to 53 tables** to accommodate Table 53 (`accounts_administrative_membership`).
@@ -699,10 +735,10 @@ Before any code implementation begins, the project owner must review and explici
 
 ---
 
-## 15. Stop Condition & Governance Attestation
+## 16. Stop Condition & Governance Attestation
 
 In accordance with explicit governance instructions:
-- **Zero code changes** have been made to Django models, services, or views.
+- **Zero code changes** have been made to Django models, services, serializers, or views.
 - **Zero migrations** have been created.
 - Protected files ([`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md), [`docs/development-progress.md`](file:///home/zero/Documents/college/docs/development-progress.md)) remain untouched.
 - Git commit and push remain unexecuted.
@@ -711,7 +747,7 @@ In accordance with explicit governance instructions:
 
 ```
 ===================================================================================================
-STOP CONDITION MET: FINAL DESIGN ADDENDUM COMPLETED.
+STOP CONDITION MET: FINAL TARGETED CORRECTIONS COMPLETED.
 AWAITING INDEPENDENT ARCHITECTURE AUDIT AND FORMAL PROJECT-OWNER APPROVAL.
 DO NOT BEGIN IMPLEMENTATION UNTIL OWNER EXPLICITLY APPROVES.
 ===================================================================================================
