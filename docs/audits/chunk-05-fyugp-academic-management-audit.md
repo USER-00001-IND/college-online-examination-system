@@ -2,9 +2,9 @@
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
 **Author:** Antigravity Agent  
-**Date:** 2026-11-04 (Round 7 Revisions Completed)  
+**Date:** 2026-11-04 (Round 7 Revisions & Documentation Cleanup Completed)  
 **Stage:** Chunk 05 — FYUGP Academic Management  
-**Status:** **IN REVIEW — PASS WITH WARNINGS (AWAITING OWNER APPROVAL)** (Round 7 corrections passed independent code audit with warnings; test results reported by development environment: 213 dedicated academic tests, 419 total discovered tests [409 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
+**Status:** **IN REVIEW — INDEPENDENT AUDIT PASS WITH WARNINGS, OWNER APPROVAL PENDING** (Round 7 implementation complete; independent code audit passed with warnings; documentation cleanup completed, subject to verification; test results reported by development environment: 213 dedicated academic tests, 419 total discovered tests [409 passing, 10 cleanly skipped live Redis tests], zero failures, clean Django system checks, zero schema drift, and strict database schema compliance; Chunk 06 onward remains strictly gated).
 
 ---
 
@@ -210,13 +210,23 @@ All 4 architectural specification documents remain strictly unmodified (`git dif
 
 ---
 
-## 11. Gate Status & Conclusion
+## 11. Historical Gate Status (Round 4 Checkpoint)
+
+> [!NOTE]
+> **Historical Review Checkpoint:** This section records the historical gate status following the completion of Round 4 revisions. Subsequent revisions progressed through Round 5, Round 6, and Round 7.
+>
+> **Current Authoritative Status (Post-Round 7 Independent Audit):**
+> - **Round 7 Implementation:** COMPLETE.
+> - **Independent Code Audit:** PASS WITH WARNINGS.
+> - **Documentation Cleanup:** COMPLETED, subject to verification.
+> - **Project-Owner Approval:** PENDING.
+> - **Chunk 06:** GATED — NOT AUTHORIZED.
 
 - **Chunk 04 Status:** **APPROVED WITH WARNINGS — 2026-11-03**
-- **Chunk 05 Status:** **IN REVIEW (Round 4 Revisions Completed — Awaiting Independent Audit)**
+- **Chunk 05 Status (at Round 4 Checkpoint):** **IN REVIEW (Round 4 Revisions Completed — Awaiting Independent Audit)**
 - **Chunk 06 onward:** **GATED — NOT AUTHORIZED**
-- **Implementation State:** All Round 4 corrections on Chunk 05 are complete. No Chunk 06 code has been written.
-- **Git State:** Changes remain uncommitted in the working directory for project owner and independent audit review.
+- **Implementation State (at Round 4 Checkpoint):** All Round 4 corrections on Chunk 05 were complete. No Chunk 06 code has been written.
+- **Git State (at Round 4 Checkpoint):** Changes remained uncommitted in the working directory for project owner and independent audit review.
 
 ---
 
@@ -551,7 +561,7 @@ To prevent parent entity modifications from corrupting or invalidating dependent
 
 | Finding ID | Severity | Root Cause | Correction Implemented | Status |
 | :--- | :---: | :--- | :--- | :---: |
-| **Finding A** | **HIGH** | Parent update services locked the record being modified, but related child creation (`SemesterSerializer.create`, `create_semester`) and mapping operations (`create_paper_programme_mapping`, `map_paper_to_programmes`) did not consistently participate in a shared coordination locking protocol. A parent mutation (reducing programme duration from 8 to 4) and child mutation (creating semester 6, or mapping semester 6 paper to the programme) could run concurrently, pass separate validation against differing states, and commit contradictory academic records. Furthermore, ModelSerializer `create()` paths on child entities bypassed locking services. | Established the unified **Five-Level Academic Lock Hierarchy**: Level 1 College coordination row lock (`lock_colleges(*college_ids)` in deterministic ascending PK order), Level 2 Parent academic entities (`select_for_update`), Level 3 Child academic entities (`select_for_update`), Level 4 Authoritative validation under lock, Level 5 Persistence. Single-table `select_for_update()` queries are used exclusively without joined-table row locking (`select_related()`), ensuring 100% portability between MySQL InnoDB and SQLite. Delegated DRF `create()` and `update()` methods across all academic serializers to transactional service functions. | **CORRECTED** |
+| **Finding A** | **HIGH** | Parent update services locked the record being modified, but related child creation (`SemesterSerializer.create`, `create_semester`) and mapping operations (`create_paper_programme_mapping`, `map_paper_to_programmes`) did not consistently participate in a shared coordination locking protocol. A parent mutation (reducing programme duration from 8 to 4) and child mutation (creating semester 6, or mapping semester 6 paper to the programme) could run concurrently, pass separate validation against differing states, and commit contradictory academic records. Furthermore, ModelSerializer `create()` paths on child entities bypassed locking services. | Established the unified **Five-Level Academic Lock Hierarchy**: Level 1 College coordination row lock (`lock_colleges(*college_ids)` in deterministic ascending PK order), Level 2 Parent academic entities (`select_for_update`), Level 3 Child academic entities (`select_for_update`), Level 4 Authoritative validation under lock, Level 5 Persistence. Single-table `select_for_update()` queries are used exclusively without joined-table row locking (`select_related()`). The implementation uses Django ORM transactions and locking APIs designed for the MySQL 8 InnoDB production database. SQLite-based tests validate application logic but do not establish equivalent row-locking or concurrency guarantees. MySQL multi-connection integration testing remains pending. Delegated DRF `create()` and `update()` methods across all academic serializers to transactional service functions. | **CORRECTED** |
 | **Finding B** | **MEDIUM** | `update_subject_category()` locked the subject category before checking dependent offerings, but `create_paper_offering()` and `update_paper_offering()` did not coordinate locking on the category and college before validating credits. A concurrent category max/min update and paper offering creation/credit update could commit mutually contradictory states. | Coordinated Level 1 College locking and Level 2 SubjectCategory row locking across `update_subject_category`, `create_paper_offering`, and `update_paper_offering`. Paper creation and updates acquire the category lock and validate credits strictly against `[min_credits, max_credits]`; category updates acquire the category lock and validate against existing offerings' min/max credits. Reassignment to a new category revalidates against the target category's bounds under lock. Zero-credit offerings remain supported where `min_credits == Decimal("0.0")`. | **CORRECTED** |
 
 ---
@@ -569,7 +579,7 @@ Level 1: Owning College Row(s)
    ▼
 Level 2: Parent Academic Entity Rows
          select_for_update() on Programme / SubjectCategory / AcademicSession / Department
-         Single-table queries without select_related() (MySQL InnoDB & SQLite safe).
+         Single-table queries without select_related() (designed for MySQL InnoDB row locking; avoids joined-table locking side effects).
    │
    ▼
 Level 3: Child Academic Entity Rows
@@ -738,8 +748,9 @@ Following the Round 6 independent audit of Chunk 05, three findings were reporte
 
 ### 17.5 Gating & Authorizations
 
-- **Chunk 04 Status:** APPROVED WITH WARNINGS (2026-11-03).
-- **Chunk 05 Status:** IN REVIEW — PASS WITH WARNINGS (AWAITING OWNER APPROVAL).
-- **Chunk 06+ Status:** GATED — NOT AUTHORIZED.
+- **Chunk 00–03 Status:** APPROVED
+- **Chunk 04 Status:** APPROVED WITH WARNINGS (2026-11-03)
+- **Chunk 05 Status:** IN REVIEW — INDEPENDENT AUDIT PASS WITH WARNINGS, OWNER APPROVAL PENDING
+- **Chunk 06–16 Status:** GATED — NOT AUTHORIZED
 
 
