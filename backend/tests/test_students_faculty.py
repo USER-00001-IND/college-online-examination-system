@@ -2254,3 +2254,450 @@ class Chunk06Round4CorrectionsTests(BaseStudentFacultyTestCase):
             assignment_id=assign.pk,
         )
         self.assertFalse(FacultySubjectAssignment.objects.filter(pk=assign.pk).exists())
+
+
+class Chunk06Round5CorrectionsTests(BaseStudentFacultyTestCase):
+    """
+    Dedicated regression test suite verifying Chunk 06 Round 5 corrections:
+    - R5-A: Stale relationship overwrite prevention in update/delete faculty assignment.
+    - R5-B: Mandatory student identity integrity and evaluated profile locks during registration review.
+    - R5-C: Evaluated StudentProfile locks and non-partial cleanup refusal in registration cleanup.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from apps.academics.services import assign_faculty_to_paper
+        self.assign_faculty_to_paper = assign_faculty_to_paper
+
+        # Secondary faculty in College A for reassignment testing
+        self.faculty_user_2 = User.objects.create_user(
+            username="faculty_r5_2",
+            email="faculty_r5_2@gauhati.ac.in",
+            password=self.password,
+            first_name="Secondary",
+            last_name="Examiner",
+            role=RoleChoices.FACULTY,
+            is_active=True,
+        )
+        self.faculty_profile_2 = FacultyProfile.objects.create(
+            user=self.faculty_user_2,
+            college=self.college_a,
+            department=self.dept_cs,
+            employee_code="EMP-CS-R5-02",
+            designation="Associate Professor",
+            is_examiner=True,
+        )
+
+        # Secondary offering in College A
+        self.subject_math = Subject.objects.create(
+            department=self.dept_math,
+            name="Calculus",
+            code="MATH-101",
+        )
+        self.offering_2 = PaperOffering.objects.create(
+            academic_session=self.session_a,
+            semester=self.sem_1,
+            subject=self.subject_math,
+            subject_category=self.sub_cat,
+            paper_code="BCA-102-CALC",
+            credits=Decimal("4.0"),
+            max_marks_internal=Decimal("20.0"),
+            max_marks_external=Decimal("80.0"),
+            pass_marks_external=Decimal("32.0"),
+            is_active=True,
+        )
+
+    # --------------------------------------------------------------------------
+    # R5-A: Stale Relationship Protection in Faculty Assignment
+    # --------------------------------------------------------------------------
+    def test_faculty_assignment_update_role_only_preserves_relationships(self):
+        """Role-only update preserves authoritative faculty and paper-offering relationships."""
+        from apps.academics.services import update_faculty_assignment
+
+        assign = self.assign_faculty_to_paper(
+            acting_user=self.superadmin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+
+        updated = update_faculty_assignment(
+            assignment_id=assign.pk,
+            acting_user=self.superadmin,
+            validated_data={"role": FacultyAssignmentRole.INTERNAL_EXAMINER},
+        )
+        self.assertEqual(updated.role, FacultyAssignmentRole.INTERNAL_EXAMINER)
+        self.assertEqual(updated.faculty_id, self.faculty_profile.pk)
+        self.assertEqual(updated.paper_offering_id, self.paper_offering.pk)
+
+        assign.refresh_from_db()
+        self.assertEqual(assign.role, FacultyAssignmentRole.INTERNAL_EXAMINER)
+        self.assertEqual(assign.faculty_id, self.faculty_profile.pk)
+        self.assertEqual(assign.paper_offering_id, self.paper_offering.pk)
+
+    def test_faculty_assignment_update_stale_faculty_relationship_rejected(self):
+        """Concurrent modification to faculty relationship between candidate read and lock is rejected."""
+        import unittest.mock
+        from apps.academics.services import update_faculty_assignment
+
+        assign = self.assign_faculty_to_paper(
+            acting_user=self.superadmin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+
+        # Simulate concurrent change to faculty between candidate read and lock acquisition
+        original_sfu = PaperOffering.objects.select_for_update
+
+        def race_condition_concurrent_reassign(*args, **kwargs):
+            FacultySubjectAssignment.objects.filter(pk=assign.pk).update(faculty=self.faculty_profile_2)
+            return original_sfu(*args, **kwargs)
+
+        with unittest.mock.patch.object(PaperOffering.objects, "select_for_update", side_effect=race_condition_concurrent_reassign):
+            with self.assertRaises(ValidationError) as ctx:
+                update_faculty_assignment(
+                    assignment_id=assign.pk,
+                    acting_user=self.superadmin,
+                    validated_data={"role": FacultyAssignmentRole.INTERNAL_EXAMINER},
+                )
+            self.assertIn("assignment", ctx.exception.message_dict)
+            self.assertIn("Authoritative assignment relationships changed concurrently", ctx.exception.message_dict["assignment"][0])
+
+    def test_faculty_assignment_update_stale_offering_relationship_rejected(self):
+        """Concurrent modification to paper offering between candidate read and lock is rejected."""
+        import unittest.mock
+        from apps.academics.services import update_faculty_assignment
+
+        assign = self.assign_faculty_to_paper(
+            acting_user=self.superadmin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+
+        original_sfu = PaperOffering.objects.select_for_update
+
+        def race_condition_concurrent_offering_reassign(*args, **kwargs):
+            FacultySubjectAssignment.objects.filter(pk=assign.pk).update(paper_offering=self.offering_2)
+            return original_sfu(*args, **kwargs)
+
+        with unittest.mock.patch.object(PaperOffering.objects, "select_for_update", side_effect=race_condition_concurrent_offering_reassign):
+            with self.assertRaises(ValidationError) as ctx:
+                update_faculty_assignment(
+                    assignment_id=assign.pk,
+                    acting_user=self.superadmin,
+                    validated_data={"role": FacultyAssignmentRole.INTERNAL_EXAMINER},
+                )
+            self.assertIn("assignment", ctx.exception.message_dict)
+            self.assertIn("Authoritative assignment relationships changed concurrently", ctx.exception.message_dict["assignment"][0])
+
+    def test_faculty_assignment_delete_stale_relationship_rejected(self):
+        """Concurrent modification to assignment relationships before delete lock is rejected."""
+        import unittest.mock
+        from apps.academics.services import delete_faculty_assignment
+
+        assign = self.assign_faculty_to_paper(
+            acting_user=self.superadmin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+
+        original_sfu = PaperOffering.objects.select_for_update
+
+        def race_condition_concurrent_delete_reassign(*args, **kwargs):
+            FacultySubjectAssignment.objects.filter(pk=assign.pk).update(faculty=self.faculty_profile_2)
+            return original_sfu(*args, **kwargs)
+
+        with unittest.mock.patch.object(PaperOffering.objects, "select_for_update", side_effect=race_condition_concurrent_delete_reassign):
+            with self.assertRaises(ValidationError) as ctx:
+                delete_faculty_assignment(
+                    acting_user=self.superadmin,
+                    assignment_id=assign.pk,
+                )
+            self.assertIn("assignment", ctx.exception.message_dict)
+            self.assertIn("Authoritative assignment relationships changed concurrently", ctx.exception.message_dict["assignment"][0])
+
+    def test_faculty_assignment_delete_valid_authorized_succeeds(self):
+        """Clean, consistent faculty assignment deletion succeeds and deletes the record."""
+        from apps.academics.services import delete_faculty_assignment
+
+        assign = self.assign_faculty_to_paper(
+            acting_user=self.superadmin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+        delete_faculty_assignment(
+            acting_user=self.superadmin,
+            assignment_id=assign.pk,
+        )
+        self.assertFalse(FacultySubjectAssignment.objects.filter(pk=assign.pk).exists())
+
+    # --------------------------------------------------------------------------
+    # R5-B: Registration Review Identity Integrity Tests
+    # --------------------------------------------------------------------------
+    def test_review_student_registration_missing_student_profile_rejected(self):
+        """Reviewing student registration when StudentProfile is missing is rejected for both APPROVE and REJECT."""
+        user, profile, raw_token = register_student(
+            username="r5_noprofile_stud",
+            email="r5_noprofile@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="NoProfile",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-001",
+            registration_year=2026,
+        )
+        verify_email_token(raw_token)
+        approval = RegistrationApproval.objects.get(user=user)
+
+        # Delete profile to simulate incomplete/missing identity
+        profile.delete()
+
+        # Attempt APPROVE fails
+        with self.assertRaises(ValidationError) as ctx_approve:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("student_profile", ctx_approve.exception.message_dict)
+        self.assertIn("valid linked student profile is required", ctx_approve.exception.message_dict["student_profile"][0])
+
+        # Attempt REJECT also fails
+        with self.assertRaises(ValidationError) as ctx_reject:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="REJECT",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("student_profile", ctx_reject.exception.message_dict)
+        self.assertIn("valid linked student profile is required", ctx_reject.exception.message_dict["student_profile"][0])
+
+    def test_superadmin_cannot_approve_student_lacking_profile(self):
+        """Superadministrator authority does not bypass mandatory StudentProfile identity invariant."""
+        user, profile, raw_token = register_student(
+            username="r5_super_noprofile",
+            email="r5_super_noprofile@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="Super",
+            last_name="NoProfile",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-002",
+            registration_year=2026,
+        )
+        verify_email_token(raw_token)
+        approval = RegistrationApproval.objects.get(user=user)
+
+        profile.delete()
+
+        with self.assertRaises(ValidationError) as ctx:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("student_profile", ctx.exception.message_dict)
+
+    def test_review_student_registration_user_role_not_student_rejected(self):
+        """Review is rejected if user's role is not RoleChoices.STUDENT."""
+        user, profile, raw_token = register_student(
+            username="r5_wrongrole_stud",
+            email="r5_wrongrole@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="WrongRole",
+            last_name="User",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-003",
+            registration_year=2026,
+        )
+        verify_email_token(raw_token)
+        approval = RegistrationApproval.objects.get(user=user)
+
+        user.role = RoleChoices.FACULTY
+        user.save(update_fields=["role"])
+
+        with self.assertRaises(ValidationError) as ctx:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("user", ctx.exception.message_dict)
+        self.assertIn("User primary role must be 'STUDENT'", ctx.exception.message_dict["user"][0])
+
+    def test_review_student_registration_cross_college_programme_rejected(self):
+        """Review is rejected if student profile's programme belongs to a different college."""
+        user, profile, raw_token = register_student(
+            username="r5_crosscollege_stud",
+            email="r5_crosscollege@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="CrossCollege",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-004",
+            registration_year=2026,
+        )
+        verify_email_token(raw_token)
+        approval = RegistrationApproval.objects.get(user=user)
+
+        # Alter programme to College B programme
+        profile.programme = self.prog_b
+        profile.save(update_fields=["programme"])
+
+        with self.assertRaises(ValidationError) as ctx:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("programme", ctx.exception.message_dict)
+        self.assertIn("does not belong to the student's college", ctx.exception.message_dict["programme"][0])
+
+    def test_review_student_registration_wrong_college_admin_rejected(self):
+        """Review by an administrator lacking authority over student's college raises PermissionDenied."""
+        user, profile, raw_token = register_student(
+            username="r5_unauth_admin_stud",
+            email="r5_unauth_admin@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="UnauthAdmin",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-005",
+            registration_year=2026,
+        )
+        verify_email_token(raw_token)
+        approval = RegistrationApproval.objects.get(user=user)
+
+        # Ordinary administrator fails closed on institutional checks
+        with self.assertRaises(DjangoPermissionDenied):
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.admin,
+            )
+
+    def test_review_student_registration_unverified_email_rejected(self):
+        """Review APPROVE is rejected if student has not verified their email token."""
+        user, profile, raw_token = register_student(
+            username="r5_unverified_stud",
+            email="r5_unverified@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="Unverified",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-006",
+            registration_year=2026,
+        )
+        approval = RegistrationApproval.objects.get(user=user)
+
+        with self.assertRaises(ValidationError) as ctx:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("email", ctx.exception.message_dict)
+
+    # --------------------------------------------------------------------------
+    # R5-C: Evaluated StudentProfile Lock & Registration Cleanup Refusal Tests
+    # --------------------------------------------------------------------------
+    def test_cleanup_unverified_registration_missing_student_profile_refused(self):
+        """Cleanup refuses deletion if StudentProfile is missing, avoiding partial record purge."""
+        from apps.students.services import cleanup_unverified_registration
+
+        user, profile, raw_token = register_student(
+            username="r5_cleanup_noprofile",
+            email="r5_cleanup_noprofile@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="CleanupNoProfile",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-007",
+            registration_year=2026,
+        )
+        profile.delete()
+
+        result = cleanup_unverified_registration(user.pk)
+        self.assertFalse(result)
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())
+        self.assertTrue(RegistrationApproval.objects.filter(user=user).exists())
+        self.assertTrue(EmailVerification.objects.filter(user=user).exists())
+
+    def test_cleanup_unverified_registration_missing_approval_refused(self):
+        """Cleanup refuses deletion if RegistrationApproval is missing."""
+        from apps.students.services import cleanup_unverified_registration
+
+        user, profile, raw_token = register_student(
+            username="r5_cleanup_noapp",
+            email="r5_cleanup_noapp@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="CleanupNoApp",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-008",
+            registration_year=2026,
+        )
+        RegistrationApproval.objects.filter(user=user).delete()
+
+        result = cleanup_unverified_registration(user.pk)
+        self.assertFalse(result)
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())
+        self.assertTrue(StudentProfile.objects.filter(user=user).exists())
+
+    def test_cleanup_unverified_registration_missing_verification_refused(self):
+        """Cleanup refuses deletion if EmailVerification is missing."""
+        from apps.students.services import cleanup_unverified_registration
+
+        user, profile, raw_token = register_student(
+            username="r5_cleanup_noev",
+            email="r5_cleanup_noev@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="CleanupNoEV",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-009",
+            registration_year=2026,
+        )
+        EmailVerification.objects.filter(user=user).delete()
+
+        result = cleanup_unverified_registration(user.pk)
+        self.assertFalse(result)
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())
+        self.assertTrue(StudentProfile.objects.filter(user=user).exists())
+
+    def test_cleanup_unverified_registration_evaluates_profile_lock_and_succeeds(self):
+        """Cleanup succeeds when all preconditions and evaluated locks are met."""
+        from apps.students.services import cleanup_unverified_registration
+
+        user, profile, raw_token = register_student(
+            username="r5_cleanup_valid",
+            email="r5_cleanup_valid@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="CleanupValid",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R5-010",
+            registration_year=2026,
+        )
+        user_id = user.pk
+        profile_id = profile.pk
+
+        result = cleanup_unverified_registration(user_id)
+        self.assertTrue(result)
+        self.assertFalse(User.objects.filter(pk=user_id).exists())
+        self.assertFalse(StudentProfile.objects.filter(pk=profile_id).exists())
+        self.assertFalse(RegistrationApproval.objects.filter(user_id=user_id).exists())
+        self.assertFalse(EmailVerification.objects.filter(user_id=user_id).exists())

@@ -83,19 +83,19 @@ def send_student_verification_email(*, user: User, raw_token: str) -> None:
 def cleanup_unverified_registration(user_id: int) -> bool:
     """
     Atomically cleans up an unverified student registration after email delivery failure.
-    Enforces strict safety preconditions under the Unified Registration Lock Hierarchy:
+    Enforces strict safety preconditions under the Unified Registration Lock Hierarchy (Finding R5-C):
     Level 2: User (select_for_update)
     Level 3: RegistrationApproval (select_for_update)
     Level 4: EmailVerification (select_for_update)
     Level 5: StudentProfile (select_for_update)
 
     Preconditions verified under lock:
-    1. User is inactive (is_active is False).
-    2. User holds primary role STUDENT.
-    3. Registration approval is still pending (status is PENDING).
-    4. Email verification token was never consumed or verified (is_used is False, verified_at is None).
+    1. User exists, is inactive (is_active is False), and holds primary role STUDENT.
+    2. Registration approval exists and remains pending (status is PENDING).
+    3. Email verification token exists, was never consumed or verified (is_used is False, verified_at is None).
+    4. Student profile exists and links to the same User.
 
-    If any precondition check fails (e.g. concurrent verification or approval),
+    If any precondition check fails or any required record is missing,
     refuses deletion and returns False.
     Otherwise, atomically deletes related records and user in reverse dependency order, and returns True.
     """
@@ -112,20 +112,23 @@ def cleanup_unverified_registration(user_id: int) -> bool:
         logger.warning("Refusing cleanup: User %s role is '%s', not STUDENT.", user_id, user.role)
         return False
 
-    # Check RegistrationApproval under lock (Level 3)
+    # Level 3: Check RegistrationApproval under lock (evaluated query)
     approvals = list(RegistrationApproval.objects.select_for_update().filter(user=user))
     if not approvals or any(app.status != RegistrationApprovalStatus.PENDING for app in approvals):
         logger.warning("Refusing cleanup: User %s registration approval is missing or not pending.", user_id)
         return False
 
-    # Check EmailVerification under lock (Level 4)
+    # Level 4: Check EmailVerification under lock (evaluated query)
     verifications = list(EmailVerification.objects.select_for_update().filter(user=user))
     if not verifications or any(ev.is_used or ev.verified_at is not None for ev in verifications):
         logger.warning("Refusing cleanup: User %s verification token was already consumed or verified.", user_id)
         return False
 
-    # Lock StudentProfile (Level 5)
-    StudentProfile.objects.select_for_update().filter(user=user)
+    # Level 5: Check StudentProfile under lock (evaluated query)
+    profiles = list(StudentProfile.objects.select_for_update().filter(user=user))
+    if not profiles or any(p.user_id != user.pk for p in profiles):
+        logger.warning("Refusing cleanup: User %s student profile is missing or inconsistent.", user_id)
+        return False
 
     # Safe to clean up atomically in reverse dependency order
     StudentProfile.objects.filter(user=user).delete()
@@ -282,7 +285,7 @@ def review_student_registration(
 ) -> RegistrationApproval:
     """
     Performs administrative review on a pending registration approval.
-    Enforces Unified Registration Lock Hierarchy:
+    Enforces Unified Registration Lock Hierarchy and student identity integrity (Finding R5-B):
     Level 1: College Coordination Lock (if applicable)
     Level 2: User (select_for_update)
     Level 3: RegistrationApproval (select_for_update, single-table query)
@@ -311,13 +314,6 @@ def review_student_registration(
     if target_user_id == reviewer.pk:
         raise PermissionDenied("Administrators cannot approve their own registration requests.")
 
-    # Resolve target college for institutional authority check
-    candidate_college_id = StudentProfile.objects.filter(user_id=target_user_id).values_list("college_id", flat=True).first()
-    if candidate_college_id:
-        check_college_operation_authority(reviewer, candidate_college_id, "review_student_registration")
-    else:
-        check_institutional_admin_authority(reviewer)
-
     # 2. Acquire locks in strict unified hierarchy
     # Level 2: User lock
     user = User.objects.select_for_update().get(pk=target_user_id)
@@ -328,10 +324,44 @@ def review_student_registration(
     # Level 4: EmailVerification lock
     email_verifications = list(EmailVerification.objects.select_for_update().filter(user=user))
 
-    # Level 5: StudentProfile lock
-    student_profile = StudentProfile.objects.select_for_update().filter(user=user).first()
+    # Level 5: StudentProfile lock (evaluated single-table query)
+    student_profiles = list(StudentProfile.objects.select_for_update().filter(user=user))
 
-    # 3. Revalidate preconditions under lock
+    # 3. Revalidate student identity and relationships under lock (Finding R5-B)
+    if user.role != RoleChoices.STUDENT:
+        raise ValidationError({
+            "user": f"User primary role must be '{RoleChoices.STUDENT}'. Found: '{user.role}'."
+        })
+
+    if approval.user_id != user.pk:
+        raise ValidationError({
+            "approval": "Registration approval record does not belong to the target user."
+        })
+
+    if not student_profiles or len(student_profiles) != 1:
+        raise ValidationError({
+            "student_profile": "A valid linked student profile is required to review a registration."
+        })
+    student_profile = student_profiles[0]
+
+    if student_profile.user_id != user.pk:
+        raise ValidationError({
+            "student_profile": "Student profile is not linked to the target user."
+        })
+
+    if not student_profile.college_id:
+        raise ValidationError({
+            "college": "Student profile must be associated with an authoritative college."
+        })
+
+    if not student_profile.programme_id or student_profile.programme.college_id != student_profile.college_id:
+        raise ValidationError({
+            "programme": "Student profile programme does not belong to the student's college."
+        })
+
+    # Recheck reviewer institutional authority against authoritative student college
+    check_college_operation_authority(reviewer, student_profile.college_id, "review_student_registration")
+
     if approval.status != RegistrationApprovalStatus.PENDING:
         raise ValidationError({
             "status": f"Registration request is already {approval.status} and cannot be reviewed again."

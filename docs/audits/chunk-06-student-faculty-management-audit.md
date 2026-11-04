@@ -486,11 +486,185 @@ Eight new automated test cases were added to `backend/tests/test_students_facult
 
 ---
 
-## 14. Governance, Boundaries & Mandatory Next Steps
+## 15. Round 5 Technical Corrections — Stale Assignment Protection, Student Identity Integrity and Registration Cleanup
 
-Chunk 06 Round 4 technical corrections are complete, fully verified, and submitted for independent audit review.
+The Chunk 06 Round 4 implementation was independently audited and received verdict **REVISION REQUIRED**, identifying three specific technical findings:
+- **Finding R5-A (HIGH):** Faculty assignment update/delete can operate on stale relationships.
+- **Finding R5-B (MEDIUM):** Student registration approval permits missing StudentProfile.
+- **Finding R5-C (MEDIUM):** Unevaluated StudentProfile lock during registration cleanup.
 
-- **Chunk 06 Implementation Status:** `IN REVIEW: TECHNICAL CORRECTIONS COMPLETE; INSTITUTIONAL AUTHORIZATION DECISION PENDING`.
+All three findings have been resolved in Round 5 without schema changes or new migrations.
+
+---
+
+### 15.1 Finding R5-A: Stale Relationship Overwrite Prevention in `update_faculty_assignment()` and `delete_faculty_assignment()`
+
+1. **Root Cause Analysis:**
+   In `backend/apps/academics/services.py`:
+   - In `update_faculty_assignment()`, initial candidate foreign keys (`initial["faculty_id"]`, `initial["paper_offering_id"]`) were read prior to acquiring database locks. If a partial update dictionary (`validated_data={"role": "INTERNAL_EXAMINER"}`) omitted `faculty` or `paper_offering`, the service fell back to `initial["faculty_id"]` and `initial["paper_offering_id"]`. If a concurrent transaction reassigned the faculty or paper offering between the candidate read and lock acquisition, the subsequent save restored stale pre-lock candidate values, silently overwriting concurrent changes. Furthermore, the actual child row relationships were not compared against the candidate snapshot after acquiring row locks.
+   - In `delete_faculty_assignment()`, candidate `initial["paper_offering_id"]` was captured prior to locks. If another transaction reassigned the assignment to a different paper offering or faculty prior to lock acquisition, the deletion proceeded on the stale target without verifying that locked relationships matched the snapshot.
+
+2. **Exact Source Changes:**
+   - In `update_faculty_assignment()`:
+     - Read candidate snapshot `initial_faculty_id = initial["faculty_id"]` and `initial_offering_id = initial["paper_offering_id"]`.
+     - After acquiring Level 1 College locks, Level 2 `PaperOffering` locks, Level 3 `FacultyProfile` locks, and Level 4 child `FacultySubjectAssignment` lock, immediately compared actual authoritative relationships against the initial candidate snapshot:
+       ```python
+       if assignment.faculty_id != initial_faculty_id or assignment.paper_offering_id != initial_offering_id:
+           raise ValidationError({
+               "assignment": (
+                   "Authoritative assignment relationships changed concurrently. "
+                   "The assignment was modified before locks could be established. "
+                   "Please reload and retry the operation."
+               )
+           })
+       ```
+     - For role-only updates or partial updates omitting `faculty` or `paper_offering`, explicitly resolved `final_faculty = assignment.faculty` and `final_offering = assignment.paper_offering` from the freshly locked child row, never reverting to pre-lock snapshots.
+     - Enforced complete-state validation, institutional ownership boundary checks, and examiner eligibility checks under row locks before mutating.
+   - In `delete_faculty_assignment()`:
+     - Read candidate `initial_offering_id` and `initial_faculty_id`.
+     - Under Level 1 College and Level 2 `PaperOffering` row locks, verified `locked_offering.academic_session.college_id == target_college_id`.
+     - Under Level 4 single-table lock on `FacultySubjectAssignment`, reconciled authoritative relationships:
+       ```python
+       if assignment.paper_offering_id != initial_offering_id or assignment.faculty_id != initial_faculty_id:
+           raise ValidationError({
+               "assignment": "Authoritative assignment relationships changed concurrently. Stale delete rejected."
+           })
+       ```
+     - Rechecked actor's institutional authority under lock before deleting the row.
+
+3. **Before vs. After Behavior:**
+   - *Before:* Concurrent reassignment of a faculty member or paper offering could be overwritten by a concurrent role-only PATCH; DELETE could delete an assignment that had already moved to another offering or faculty member.
+   - *After:* Any concurrent relationship modification occurring between candidate read and row-lock acquisition immediately triggers a controlled `ValidationError` with HTTP 400. Stale operations are safely aborted, and role-only updates strictly preserve authoritative locked relationships.
+
+---
+
+### 15.2 Finding R5-B: Mandatory Student Identity Integrity and Evaluated Profile Locks in `review_student_registration()`
+
+1. **Root Cause Analysis:**
+   In `backend/apps/students/services.py:review_student_registration()`:
+   - The service acquired Level 2 User, Level 3 RegistrationApproval, Level 4 EmailVerification, and Level 5 StudentProfile locks, but if `student_profile` was `None`, the service fell back to generic `check_institutional_admin_authority(reviewer)`. This permitted superadministrators to approve or reject registration requests lacking a linked `StudentProfile`.
+   - Approving an account without a persistent student profile violates academic domain invariants, as active student accounts require persistent institutional affiliation, enrollment details, and programme linkages.
+
+2. **Exact Source Changes:**
+   - Evaluated the Level 5 `StudentProfile` locking query into a materialized list:
+     ```python
+     student_profiles = list(StudentProfile.objects.select_for_update().filter(user=user))
+     ```
+   - Enforced strict student identity integrity invariants under lock prior to permitting any status transition:
+     - Verified `user.role == RoleChoices.STUDENT`, rejecting non-student roles with `ValidationError({"user": ...})`.
+     - Verified `approval.user_id == user.pk`.
+     - Enforced `len(student_profiles) == 1`, rejecting registrations missing a linked `StudentProfile` with `ValidationError({"student_profile": "A valid linked student profile is required to review a registration."})`.
+     - Verified `student_profile.user_id == user.pk`.
+     - Verified `student_profile.college_id` is present and non-null.
+     - Verified `student_profile.programme_id` belongs to the student's authoritative college (`student_profile.programme.college_id == student_profile.college_id`).
+   - Rechecked reviewer institutional authority strictly against `student_profile.college_id` (`check_college_operation_authority(reviewer, student_profile.college_id, "review_student_registration")`), with zero generic fallback bypass for missing profile records.
+   - Superadministrator authority does NOT bypass mandatory student identity integrity checks.
+
+3. **Before vs. After Behavior:**
+   - *Before:* An approval request for a user without a `StudentProfile` could be approved or rejected by a superadmin, leaving an active student user without academic profile data.
+   - *After:* Both APPROVE and REJECT actions fail closed with `ValidationError` if the `StudentProfile` is missing, incomplete, or cross-institutional. Complete academic identity is guaranteed before account activation.
+
+---
+
+### 15.3 Finding R5-C: Evaluated `StudentProfile` Locks and Non-Partial Cleanup Refusal in `cleanup_unverified_registration()`
+
+1. **Root Cause Analysis:**
+   In `backend/apps/students/services.py:cleanup_unverified_registration()`:
+   - Line 266: `StudentProfile.objects.select_for_update().filter(user=user)` was an un-evaluated Django queryset expression. Because querysets are lazily evaluated, no SQL was issued, and zero row locks were acquired on `StudentProfile` under MySQL InnoDB.
+   - If a registration record was partially corrupted or had missing child records (e.g. missing `StudentProfile`, missing `RegistrationApproval`, or missing `EmailVerification`), partial deletion could occur or uncoordinated cleanup could race with concurrent verification.
+
+2. **Exact Source Changes:**
+   - Evaluated the Level 5 `StudentProfile` locking query immediately into a list inside the atomic transaction:
+     ```python
+     profiles = list(StudentProfile.objects.select_for_update().filter(user=user))
+     if not profiles or any(p.user_id != user.pk for p in profiles):
+         logger.warning("Refusing cleanup: User %s student profile is missing or inconsistent.", user_id)
+         return False
+     ```
+   - Enforced strict all-or-nothing preconditions across all four involved entities under evaluated row locks:
+     - User must exist, be inactive (`user.is_active is False`), and have role `STUDENT`.
+     - `approvals` must be non-empty and all records in `PENDING` status.
+     - `verifications` must be non-empty, `is_used is False`, and `verified_at is None`.
+     - `profiles` must be non-empty and belong to the target user.
+   - If any precondition fails or any expected record is missing, cleanup refuses deletion, logs a security warning, and returns `False` without deleting any records partially.
+
+3. **Before vs. After Behavior:**
+   - *Before:* `StudentProfile` row lock was unevaluated; missing profile or approval could lead to uncoordinated or partial cleanup.
+   - *After:* Row locks across User, RegistrationApproval, EmailVerification, and StudentProfile are fully evaluated and materialized. Cleanup requires all four records in valid pending states and refuses partial deletion if any record is missing.
+
+---
+
+### 15.4 Status of Persistent Administrator Membership Policy (Reaffirming R4-A Boundaries)
+
+As established in Round 4, ordinary administrators without verified institutional college linkage fail closed with `DjangoPermissionDenied` on all college-scoped operations.
+
+The architectural decision regarding ordinary administrator institutional membership remains:
+**`SECURITY BOUNDARY ENFORCED — OPERATIONAL AUTHORIZATION POLICY PENDING OWNER DECISION`**
+
+In accordance with explicit governance requirements:
+- No schema alterations (`accounts_user.college_id` or Table 53) were introduced in Round 5.
+- The system maintains strict 52-table schema adherence with zero migrations and zero schema drift.
+- Fail-closed security boundaries are fully enforced.
+
+---
+
+### 15.5 Test Suite Verification & Audit Evidence
+
+#### Automated Test Suite Execution
+
+The complete test suite was executed against the development environment with all Round 5 corrections active:
+
+```bash
+# Full Test Suite Execution (pytest)
+pytest backend/tests --ds=config.settings.test
+# Outcome: 525 passed, 10 skipped in 7.16s
+
+# Django Native Test Runner Execution
+python backend/manage.py test tests --settings=config.settings.test
+# Outcome: Ran 535 tests in 6.422s -> OK (skipped=10)
+
+# Django System Check
+python backend/manage.py check --settings=config.settings.development
+# Outcome: System check identified no issues (0 silenced).
+
+# Schema Drift & Migrations Dry Run
+python backend/manage.py makemigrations --check --dry-run --settings=config.settings.development
+# Outcome: No changes detected.
+
+# Protected Files Integrity Verification
+git diff --exit-code design.md handover.txt docs/architecture.md docs/database-architecture.md
+# Outcome: Clean (0 diff, 0 violations).
+```
+
+#### Dedicated Round 5 Regression Tests (`Chunk06Round5CorrectionsTests`)
+
+Fifteen new automated regression tests were added in `backend/tests/test_students_faculty.py`:
+
+| Test Name | Finding | Description & Invariant Verified |
+|---|---|---|
+| `test_faculty_assignment_update_role_only_preserves_relationships` | R5-A | Proves role-only PATCH preserves authoritative locked faculty and offering relationships. |
+| `test_faculty_assignment_update_stale_faculty_relationship_rejected` | R5-A | Proves concurrent faculty modification between candidate read and row lock is detected and rejected with `ValidationError`. |
+| `test_faculty_assignment_update_stale_offering_relationship_rejected` | R5-A | Proves concurrent offering modification between candidate read and row lock is detected and rejected with `ValidationError`. |
+| `test_faculty_assignment_delete_stale_relationship_rejected` | R5-A | Proves concurrent relationship modification before delete lock is detected and rejected with `ValidationError`. |
+| `test_faculty_assignment_delete_valid_authorized_succeeds` | R5-A | Proves valid authorized faculty assignment deletion succeeds and removes the record. |
+| `test_review_student_registration_missing_student_profile_rejected` | R5-B | Proves missing `StudentProfile` prevents both APPROVE and REJECT actions with `ValidationError({"student_profile": ...})`. |
+| `test_superadmin_cannot_approve_student_lacking_profile` | R5-B | Proves superadministrator privileges cannot bypass mandatory `StudentProfile` identity integrity invariant. |
+| `test_review_student_registration_user_role_not_student_rejected` | R5-B | Proves non-student user role (`FACULTY`) is rejected with `ValidationError({"user": ...})`. |
+| `test_review_student_registration_cross_college_programme_rejected` | R5-B | Proves mismatched student profile programme college is rejected with `ValidationError({"programme": ...})`. |
+| `test_review_student_registration_wrong_college_admin_rejected` | R5-B | Proves administrator lacking authority over student's college is rejected with `DjangoPermissionDenied`. |
+| `test_review_student_registration_unverified_email_rejected` | R5-B | Proves unverified email token prevents approval with `ValidationError({"email": ...})`. |
+| `test_cleanup_unverified_registration_missing_student_profile_refused` | R5-C | Proves cleanup returns `False` and refuses partial user deletion if `StudentProfile` is missing. |
+| `test_cleanup_unverified_registration_missing_approval_refused` | R5-C | Proves cleanup returns `False` and refuses partial deletion if `RegistrationApproval` is missing. |
+| `test_cleanup_unverified_registration_missing_verification_refused` | R5-C | Proves cleanup returns `False` and refuses partial deletion if `EmailVerification` is missing. |
+| `test_cleanup_unverified_registration_evaluates_profile_lock_and_succeeds` | R5-C | Proves valid cleanup evaluates all row locks and cleanly deletes all four associated records. |
+
+---
+
+## 16. Governance, Boundaries & Mandatory Next Steps
+
+Chunk 06 Round 5 technical corrections are complete, fully verified, and submitted for independent audit review.
+
+- **Chunk 06 Implementation Status:** `CHUNK 06 — IN REVIEW: ROUND 5 TECHNICAL CORRECTIONS COMPLETE; ADMINISTRATOR MEMBERSHIP POLICY PENDING OWNER DECISION AND INDEPENDENT AUDIT.`
 - **Finding R4-A Policy Status:** `SECURITY BOUNDARY ENFORCED — OPERATIONAL AUTHORIZATION POLICY PENDING OWNER DECISION`.
 - **Chunk 07 Onward:** Strictly **GATED — NOT AUTHORIZED**.
 - **Android Application Development:** Strictly **PAUSED — NOT AUTHORIZED**.
