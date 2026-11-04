@@ -12,8 +12,9 @@ from apps.accounts.models import RoleChoices
 class IsStudentAcademicRecordPermission(BasePermission):
     """
     Role-based permission for student academic records:
-    - Read (GET, HEAD, OPTIONS): Permitted for students (scoped to self), faculty, and admins.
-    - Write (POST, PUT, PATCH, DELETE): Strictly restricted to institutional administrators.
+    - Students: Read-only access strictly scoped to their own records.
+    - Faculty: Strictly denied access to private student academic records.
+    - Administrators: Full management privileges.
     """
     message = "You do not have permission to access or modify academic enrollment records."
 
@@ -22,10 +23,26 @@ class IsStudentAcademicRecordPermission(BasePermission):
         if not user or not user.is_authenticated or not user.is_active:
             return False
 
+        # Faculty accounts are strictly denied access to student academic records
+        if user.role == RoleChoices.FACULTY:
+            return False
+
         if request.method in SAFE_METHODS:
-            return True
+            # Students are permitted for list/detail; queryset/object-level check restricts to self
+            if user.role == RoleChoices.STUDENT:
+                return True
+
+            # Administrators permitted
+            if user.role in (RoleChoices.ADMIN, RoleChoices.SUPERADMIN) or user.is_superuser:
+                return True
+            if hasattr(user, 'has_role') and user.has_role('COLLEGE_SUPERADMIN', 'EXAM_OFFICER'):
+                return True
+            return False
 
         # Write operations require institutional administrator authority
+        if user.role == RoleChoices.STUDENT:
+            return False
+
         if user.role in (RoleChoices.ADMIN, RoleChoices.SUPERADMIN) or user.is_superuser:
             return True
 
@@ -39,10 +56,18 @@ class IsStudentAcademicRecordPermission(BasePermission):
         if not user or not user.is_authenticated or not user.is_active:
             return False
 
+        # Faculty accounts strictly denied
+        if user.role == RoleChoices.FACULTY:
+            return False
+
         if request.method in SAFE_METHODS:
             if user.role == RoleChoices.STUDENT:
                 return obj.student.user_id == user.pk
-            return True
+            if user.role in (RoleChoices.ADMIN, RoleChoices.SUPERADMIN) or user.is_superuser:
+                return True
+            if hasattr(user, 'has_role') and user.has_role('COLLEGE_SUPERADMIN', 'EXAM_OFFICER'):
+                return True
+            return False
 
         # Write operations require institutional administrator authority
         if user.role in (RoleChoices.ADMIN, RoleChoices.SUPERADMIN) or user.is_superuser:

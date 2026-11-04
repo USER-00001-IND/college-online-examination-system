@@ -89,6 +89,10 @@ class FacultyProfileViewSet(viewsets.ModelViewSet):
         out_serializer = FacultyProfileSerializer(profile, context={'request': request})
         return Response(out_serializer.data, status=status.HTTP_201_CREATED)
 
+    def destroy(self, request, *args, **kwargs):
+        """Prohibits deletion of faculty profiles to preserve academic and grading history."""
+        raise DRFPermissionDenied("Faculty profiles cannot be deleted. Institutional records must be preserved.")
+
     @action(detail=False, methods=['get', 'patch'], url_path='me')
     def me(self, request):
         """

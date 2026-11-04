@@ -28,6 +28,56 @@ from apps.students.models import StudentProfile
 logger = logging.getLogger('college.students')
 
 
+class VerificationEmailDeliveryError(Exception):
+    """Raised when dispatching account verification email fails."""
+    pass
+
+
+def send_student_verification_email(*, user: User, raw_token: str) -> None:
+    """
+    Dispatches an email verification message containing instructions and the raw token.
+    Fails closed if the email backend fails or encounters a network error.
+    Does not log the raw token.
+    """
+    from django.conf import settings
+    from django.core.mail import send_mail
+
+    subject = "College Online Examination System - Verify Your Student Email Address"
+    message = (
+        f"Dear {user.get_full_name() or user.username},\n\n"
+        f"Thank you for registering for the College Online Examination System.\n\n"
+        f"Your account username is: {user.username}\n"
+        f"Your verification token is: {raw_token}\n\n"
+        f"Please verify your email address by submitting this token to the verification endpoint "
+        f"or via the student registration portal within 24 hours.\n\n"
+        f"Note: Your account will remain pending administrator approval following email verification.\n\n"
+        f"Sincerely,\n"
+        f"Academic Administration"
+    )
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'noreply@college.edu')
+
+    try:
+        sent_count = send_mail(
+            subject=subject,
+            message=message,
+            from_email=from_email,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+        if sent_count < 1:
+            raise VerificationEmailDeliveryError("Email delivery backend did not accept message for recipient.")
+    except Exception as exc:
+        logger.error(
+            "Failed to dispatch verification email to student user_id=%s (error_type=%s)",
+            user.pk,
+            type(exc).__name__,
+            exc_info=False,
+        )
+        raise VerificationEmailDeliveryError(
+            "Email delivery infrastructure unavailable. Verification email could not be delivered."
+        ) from exc
+
+
 @transaction.atomic
 def register_student(
     *,
@@ -252,7 +302,12 @@ def update_student_profile(
     - Administrators can update current_semester (within programme duration) and personal fields.
     - Institutional fields (college, user, enrollment_number, registration_year) are immutable.
     """
+    initial = StudentProfile.objects.values("college_id", "programme_id").get(pk=profile_id)
+    lock_colleges(initial["college_id"])
+
+    locked_prog = Programme.objects.select_for_update().get(pk=initial["programme_id"])
     profile = StudentProfile.objects.select_for_update().get(pk=profile_id)
+    profile.programme = locked_prog
 
     is_admin = (
         acting_user.role in (RoleChoices.ADMIN, RoleChoices.SUPERADMIN)

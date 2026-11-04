@@ -6,7 +6,6 @@ and field-level role-based mutation permissions for faculty profiles.
 
 import logging
 from typing import Optional
-from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 
@@ -24,7 +23,6 @@ def create_faculty_profile(
     acting_user: User,
     username: str,
     email: str,
-    password: str,
     first_name: str,
     last_name: str,
     college: College,
@@ -36,6 +34,7 @@ def create_faculty_profile(
 ) -> FacultyProfile:
     """
     Atomically provisions a new faculty member account and associated FacultyProfile.
+    The account is created in an inactive state with an unusable password.
     Strictly restricted to institutional administrators.
     """
     check_institutional_admin_authority(acting_user)
@@ -65,22 +64,18 @@ def create_faculty_profile(
     if FacultyProfile.objects.filter(employee_code=employee_code).exists():
         raise ValidationError({"employee_code": f"Employee code '{employee_code}' is already registered."})
 
-    # 4. Password validation
-    dummy_user = User(username=username, email=email)
-    validate_password(password, user=dummy_user)
-
-    # 5. Atomic record creation
+    # 4. Atomic record creation with unusable password and inactive state
     user = User(
         username=username,
         email=email,
         first_name=first_name.strip(),
         last_name=last_name.strip(),
         role=RoleChoices.FACULTY,
-        is_active=True,
+        is_active=False,
         is_staff=False,
         is_superuser=False,
     )
-    user.set_password(password)
+    user.set_unusable_password()
     user.full_clean()
     user.save()
 
@@ -150,7 +145,20 @@ def update_faculty_profile(
         if 'designation' in validated_data:
             profile.designation = validated_data['designation'].strip()
         if 'is_examiner' in validated_data:
-            profile.is_examiner = bool(validated_data['is_examiner'])
+            new_is_examiner = bool(validated_data['is_examiner'])
+            if not new_is_examiner and profile.is_examiner:
+                from apps.academics.models import FacultyAssignmentRole, FacultySubjectAssignment
+                if FacultySubjectAssignment.objects.filter(
+                    faculty=profile,
+                    role__in=[FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER],
+                ).exists():
+                    raise ValidationError({
+                        "is_examiner": (
+                            f"Cannot revoke examiner eligibility for faculty member '{profile.employee_code}' "
+                            f"while active examiner assignments exist. Reassign or delete examiner assignments first."
+                        )
+                    })
+            profile.is_examiner = new_is_examiner
 
     if 'phone_number' in validated_data:
         profile.phone_number = validated_data['phone_number'].strip() if validated_data['phone_number'] else None

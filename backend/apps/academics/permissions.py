@@ -109,7 +109,10 @@ class IsInstitutionalConfigPermission(BasePermission):
 class IsFacultyOrAdminAssignmentPermission(BasePermission):
     """
     Access control for FacultySubjectAssignment (Table 20).
-    - Read (SAFE_METHODS): Permitted for Faculty and Administrators. Students are denied.
+    - Read (SAFE_METHODS):
+      * Faculty: Scoped strictly to assignments assigned to their own user account.
+      * Administrators: Permitted.
+      * Students: Denied.
     - Write: Strictly restricted to institutional administrators (IsAdminUserRole).
     """
     message = "Faculty or Administrator access required."
@@ -124,6 +127,23 @@ class IsFacultyOrAdminAssignmentPermission(BasePermission):
 
         if request.method in SAFE_METHODS:
             return True
+
+        admin_perm = IsAdminUserRole()
+        return admin_perm.has_permission(request, view)
+
+    def has_object_permission(self, request, view, obj) -> bool:
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated or not user.is_active:
+            return False
+
+        if user.role == RoleChoices.STUDENT:
+            return False
+
+        if request.method in SAFE_METHODS:
+            if user.role == RoleChoices.FACULTY:
+                return obj.faculty.user_id == user.pk
+            admin_perm = IsAdminUserRole()
+            return admin_perm.has_permission(request, view)
 
         admin_perm = IsAdminUserRole()
         return admin_perm.has_permission(request, view)

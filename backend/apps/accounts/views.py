@@ -343,26 +343,55 @@ class StudentRegisterView(APIView):
     Public student self-registration endpoint.
     Creates an inactive student user, StudentProfile, RegistrationApproval (PENDING),
     and cryptographic EmailVerification token.
+    Dispatches a verification email using the configured email backend.
     Never exposes plaintext password or raw verification token in the response.
+    If email delivery fails, fails closed and cleans up the unverified account.
     """
     authentication_classes = []
     permission_classes = [AllowAny]
 
     def post(self, request):
         from apps.students.serializers import StudentRegistrationSerializer
+        from apps.students.services import VerificationEmailDeliveryError, send_student_verification_email
         from django.core.exceptions import ValidationError as DjangoValidationError
 
         serializer = StudentRegistrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
             user = serializer.save()
+            raw_token = serializer.context.get('raw_token')
         except DjangoValidationError as exc:
             detail = exc.message_dict if hasattr(exc, "message_dict") else str(exc)
             return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Attempt verification email delivery outside database transaction lock
+        try:
+            send_student_verification_email(user=user, raw_token=raw_token)
+        except VerificationEmailDeliveryError:
+            # Clean up the unverified account so duplicate username/email/enrollment do not block future retries
+            try:
+                from apps.students.models import StudentProfile
+                from apps.accounts.models import EmailVerification, RegistrationApproval
+                StudentProfile.objects.filter(user=user).delete()
+                EmailVerification.objects.filter(user=user).delete()
+                RegistrationApproval.objects.filter(user=user).delete()
+                user.delete()
+            except Exception as cleanup_exc:
+                logger.error("Failed to clean up unverified user %s after email failure: %s", user.pk, type(cleanup_exc).__name__)
+
+            return Response(
+                {
+                    "error": {
+                        "code": "EMAIL_DELIVERY_UNAVAILABLE",
+                        "message": "Email delivery service is currently unavailable. Registration could not be completed. Please try again later.",
+                    }
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         return Response(
             {
-                "message": "Student registration submitted successfully. Please check your email to verify your account.",
+                "message": "Student registration submitted successfully. A verification email has been dispatched to your email address. Please verify your email before administrative approval.",
                 "user_id": user.pk,
                 "username": user.username,
                 "email": user.email,
@@ -374,14 +403,58 @@ class StudentRegisterView(APIView):
 class VerifyEmailView(APIView):
     """
     Public cryptographic email verification endpoint.
-    Accepts token via GET ?token=... or POST {"token": "..."}.
+    - POST {"token": "..."}: Consumes verification token atomically.
+    - GET ?token=...:
+      * With confirm=true: Consumes verification token atomically.
+      * Without confirm=true: Safely checks token validity WITHOUT consuming credentials,
+        instructing client to submit confirmation (prevents accidental consumption by link prefetchers).
     Validates token expiration (24h) and single-use constraint.
     Does NOT activate account; account remains inactive pending administrator approval.
     """
     authentication_classes = []
     permission_classes = [AllowAny]
 
-    def _verify(self, token_str):
+    def post(self, request):
+        token_str = request.data.get("token")
+        return self._consume_token(token_str)
+
+    def get(self, request):
+        token_str = request.query_params.get("token")
+        confirm = request.query_params.get("confirm", "").lower() in ("true", "1", "yes")
+        if confirm:
+            return self._consume_token(token_str)
+        return self._inspect_token(token_str)
+
+    def _inspect_token(self, token_str):
+        if not token_str or not str(token_str).strip():
+            return Response(
+                {"error": {"token": "Verification token is required."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        import hashlib
+        from django.utils import timezone
+        from apps.accounts.models import EmailVerification
+
+        token_hash = hashlib.sha256(str(token_str).strip().encode('utf-8')).hexdigest()
+        verification = EmailVerification.objects.filter(token_hash=token_hash).first()
+        if not verification:
+            return Response({"error": {"token": "Invalid verification token."}}, status=status.HTTP_400_BAD_REQUEST)
+        if verification.is_used:
+            return Response({"error": {"token": "Verification token has already been used."}}, status=status.HTTP_400_BAD_REQUEST)
+        if timezone.now() > verification.expires_at:
+            return Response({"error": {"token": "Verification token has expired (validity is 24 hours)."}}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "status": "CONFIRM_REQUIRED",
+                "action_required": "CONFIRM_REQUIRED",
+                "token_valid": True,
+                "message": "Verification token validated. Submit a POST request with this token or add confirm=true to complete email verification.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def _consume_token(self, token_str):
         from apps.students.serializers import EmailVerificationSerializer
         from django.core.exceptions import ValidationError as DjangoValidationError
 
@@ -408,11 +481,4 @@ class VerifyEmailView(APIView):
             status=status.HTTP_200_OK,
         )
 
-    def get(self, request):
-        token = request.query_params.get("token")
-        return self._verify(token)
-
-    def post(self, request):
-        token = request.data.get("token")
-        return self._verify(token)
 

@@ -33,6 +33,9 @@ LOGGING['root']['level'] = 'CRITICAL'
 LOGGING['loggers']['django']['level'] = 'CRITICAL'
 LOGGING['loggers']['college']['level'] = 'CRITICAL'
 
+# In-memory email backend for automated testing
+EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+
 CORS_ALLOWED_ORIGINS = ['http://localhost:3000']
 CSRF_TRUSTED_ORIGINS = ['http://localhost:3000']
 

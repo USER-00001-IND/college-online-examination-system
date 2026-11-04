@@ -74,6 +74,10 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
             raise DRFPermissionDenied("Students must register through the self-registration workflow.")
         serializer.save()
 
+    def destroy(self, request, *args, **kwargs):
+        """Prohibits deletion of student profiles to preserve academic history."""
+        raise DRFPermissionDenied("Student profiles cannot be deleted. Institutional records must be preserved.")
+
     @action(detail=False, methods=['get', 'patch'], url_path='me')
     def me(self, request):
         """

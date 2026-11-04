@@ -1,16 +1,16 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-04 (Chunk 05 Independent Audit Passed with Warnings — Awaiting Owner Approval)  
+**Last Updated:** 2026-11-04 (Chunk 05 Approved with Warnings by Owner; Chunk 06 Round 2 Corrections In Review)  
 
 ---
 
 ## 1. Overall Status
 
-* **Current Active Chunk:** **CHUNK 05 — FYUGP ACADEMIC MANAGEMENT**
-* **Project Phase:** Academic Structure & FYUGP Hierarchy Foundation
-* **Implementation Permission:** **IN REVIEW — INDEPENDENT AUDIT PASSED WITH WARNINGS, OWNER APPROVAL PENDING** (Implemented all 10 approved Domain B academic models [College, AcademicSession, Programme, Department, Semester, SubjectCategory, Subject, PaperOffering, PaperProgrammeMapping, InstitutionalConfig], initial migration `0001_initial`, complete-state serializer validation eliminating zero-valued PATCH bypasses, exclusive lifecycle sensitive configuration authorization requiring superadministrator privilege, fresh-row locking and persistence in `update_paper_offering` eliminating stale-instance writes, consistent lock hierarchy for institutional configuration mutations [College lock -> InstitutionalConfig lock -> authorization recheck -> mutation] eliminating TOCTOU races, semester-change programme mapping duration coverage revalidation, mandatory user parameter in service layer, common-paper consistency invariant enforced across models, serializers, and viewsets with row-locking discipline, direct mapping concurrency safety via dedicated atomic services [PaperOffering select_for_update -> Programme select_for_update -> authoritative revalidation under lock -> persistence], parent record update integrity services and model clean checks protecting dependent offerings and mappings from duration, credit bound, and cross-college invalidations, unified five-level academic lock hierarchy with Level 1 College coordination row lock [lock_colleges in deterministic ascending PK order], single-table select_for_update queries without joined-table locking, complete serializer create and update delegation to service functions, coordinated locking for subject category credit limits and paper creation/updates, parent-child mutation race protection across programme duration, semester creation, and mapping mutations, authoritative related-record resolution under lock in create and update paper offering with candidate lock coverage verification, strict current academic session reassignment prohibition across CRUD, reloaded session row-locking in set-current action, schema default alignment for programme degree_type, dedicated session-switching action with MySQL InnoDB row-level locking on College, centralized paper-programme mapping validation across all CRUD paths, strict genuine-boolean `replace` validation, sanitized error envelopes without raw exception/SQL disclosure, and 213 dedicated automated unit and integration tests passing alongside all 206 existing authentication/foundation tests with 10 cleanly skipped live-redis integration tests [409 passed, 10 skipped, 419 total discovered as reported by the development environment]; Chunk 06 onward remains strictly gated)
-* **Next Permitted Action:** Project owner review and authorization decision for Chunk 05; Chunk 06 onward remains strictly gated
+* **Current Active Chunk:** **CHUNK 06 — STUDENT AND FACULTY MANAGEMENT**
+* **Project Phase:** Student & Faculty Management (Chunk 06 Round 2 Security, Authorization, Account Onboarding & Academic Integrity Corrections)
+* **Implementation Permission:** **IN REVIEW — ROUND 2 CORRECTIONS, OWNER APPROVAL PENDING** (Chunk 05 explicitly approved with warnings by project owner on 2026-11-04; Chunk 06 Round 2 implementation completed resolving all audit findings: student email verification delivery and safe prefetch handling, secure faculty provisioning with inactive accounts, deletion protection across student and faculty profiles and academic ledgers, faculty data access scoping, complete-state validation on faculty assignment PATCH, and academic parent update integrity protection for student/faculty dependents; Chunk 07 onward remains strictly gated)
+* **Next Permitted Action:** Independent audit review of Chunk 06 Round 2 corrections; Chunk 07 onward remains strictly gated
 
 ---
 
@@ -23,8 +23,8 @@
 | **02** | Database Architecture | **COMPLETED** | [`docs/audits/chunk-02-database-architecture-audit.md`](chunk-02-database-architecture-audit.md) | **APPROVED** (2026-11-03) |
 | **03** | Backend Foundation | **COMPLETED** | [`docs/audits/chunk-03-backend-foundation-audit.md`](chunk-03-backend-foundation-audit.md) | **APPROVED** (2026-11-03) |
 | **04** | Authentication and Roles | **COMPLETED** | [`docs/audits/chunk-04-authentication-roles-audit.md`](chunk-04-authentication-roles-audit.md) | **APPROVED WITH WARNINGS** (2026-11-03, Commit: `78d1c0a5fae07713c3810e7230ef5860b91ccc28`) |
-| **05** | FYUGP Academic Management | **IN REVIEW** | [`docs/audits/chunk-05-fyugp-academic-management-audit.md`](chunk-05-fyugp-academic-management-audit.md) | **IN REVIEW — INDEPENDENT AUDIT PASSED WITH WARNINGS, OWNER APPROVAL PENDING** |
-| **06** | Student and Faculty Management | NOT STARTED | — | **GATED — NOT AUTHORIZED** |
+| **05** | FYUGP Academic Management | **COMPLETED** | [`docs/audits/chunk-05-fyugp-academic-management-audit.md`](chunk-05-fyugp-academic-management-audit.md) | **APPROVED WITH WARNINGS** (2026-11-04) |
+| **06** | Student and Faculty Management | **IN REVIEW** | [`docs/audits/chunk-06-student-faculty-management-audit.md`](chunk-06-student-faculty-management-audit.md) | **IN REVIEW — ROUND 2 CORRECTIONS, OWNER APPROVAL PENDING** |
 | **07** | Subject Registration | NOT STARTED | — | **GATED — NOT AUTHORIZED** |
 | **08** | General Examination Creation | NOT STARTED | — | **GATED — NOT AUTHORIZED** |
 | **09** | Eligibility Engine | NOT STARTED | — | **GATED — NOT AUTHORIZED** |

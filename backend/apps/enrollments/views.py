@@ -39,10 +39,14 @@ class StudentAcademicRecordViewSet(viewsets.ModelViewSet):
         if not user or not user.is_authenticated:
             return qs.none()
 
+        # Faculty accounts have no access to student academic records
+        if user.role == RoleChoices.FACULTY:
+            return qs.none()
+
         if user.role == RoleChoices.STUDENT:
             return qs.filter(student__user=user)
 
-        # Admin and faculty filtering options
+        # Admin filtering options
         student_id = self.request.query_params.get('student')
         if student_id:
             qs = qs.filter(student_id=student_id)
@@ -60,6 +64,14 @@ class StudentAcademicRecordViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status=record_status.upper().strip())
 
         return qs
+
+    def destroy(self, request, *args, **kwargs):
+        """Prohibits deletion of student academic records to preserve historical admission ledger."""
+        from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
+        raise DRFPermissionDenied(
+            "Historical academic admission records cannot be deleted. "
+            "Use status updates (SUSPENDED, ALUMNI, DROPOUT) to manage student enrollment lifecycle."
+        )
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)

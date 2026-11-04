@@ -60,10 +60,10 @@ class FacultyProvisioningSerializer(serializers.Serializer):
     """
     Administrative provisioning serializer for creating faculty user and profile atomically.
     Strictly restricted to institutional administrators.
+    Accounts are created in an inactive state with unusable passwords.
     """
     username = serializers.CharField(max_length=150, required=True)
     email = serializers.EmailField(max_length=254, required=True)
-    password = serializers.CharField(max_length=128, write_only=True, required=True)
     first_name = serializers.CharField(max_length=150, required=True)
     last_name = serializers.CharField(max_length=150, required=True)
     college = serializers.PrimaryKeyRelatedField(queryset=College.objects.filter(is_active=True))

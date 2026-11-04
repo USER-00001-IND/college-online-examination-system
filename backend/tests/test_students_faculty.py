@@ -408,7 +408,6 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
             acting_user=self.admin,
             username="new_faculty",
             email="new_fac@gauhati.ac.in",
-            password="StrongFacultyPassword@2026",
             first_name="New",
             last_name="Faculty",
             college=self.college_a,
@@ -419,7 +418,8 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
             is_examiner=True,
         )
         self.assertIsNotNone(profile.pk)
-        self.assertTrue(profile.user.is_active)
+        self.assertFalse(profile.user.is_active)
+        self.assertFalse(profile.user.has_usable_password())
         self.assertEqual(profile.user.role, RoleChoices.FACULTY)
         self.assertEqual(profile.employee_code, "EMP-NEW-101")
 
@@ -429,7 +429,6 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
                 acting_user=self.student_user,
                 username="unauthorized_fac",
                 email="unauth@gauhati.ac.in",
-                password="StrongFacultyPassword@2026",
                 first_name="Unauthorized",
                 last_name="Fac",
                 college=self.college_a,
@@ -443,7 +442,6 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
                 acting_user=self.admin,
                 username="duplicate_emp_user",
                 email="dup_emp@gauhati.ac.in",
-                password="StrongFacultyPassword@2026",
                 first_name="Dup",
                 last_name="Emp",
                 college=self.college_a,
@@ -805,8 +803,17 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         )
         self.assertFalse(user.is_active)
 
-        # GET verification
-        response = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}")
+        # 1. GET verification inspect without confirm=true (safe against prefetching)
+        inspect_response = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}")
+        self.assertEqual(inspect_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(inspect_response.data["status"], "CONFIRM_REQUIRED")
+        # Token not consumed yet
+        ev = EmailVerification.objects.get(user=user)
+        self.assertFalse(ev.is_used)
+        self.assertIsNone(ev.verified_at)
+
+        # 2. GET verification with confirm=true consumes token
+        response = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data["is_email_verified"])
 
@@ -814,8 +821,8 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         user.refresh_from_db()
         self.assertFalse(user.is_active)
 
-        # Attempting to use the same token again is rejected
-        response_reused = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}")
+        # 3. Attempting to use the same token again is rejected
+        response_reused = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
         self.assertEqual(response_reused.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_email_verification_expired_token_rejected(self):
@@ -1210,3 +1217,340 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
             format="json",
         )
         self.assertEqual(res4.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
+    """
+    Dedicated tests verifying all Chunk 06 Round 2 audit corrections:
+    - Finding A: Email delivery failure rollback, outbox verification, safe prefetch inspect vs confirm.
+    - Finding B: Faculty provisioning creates inactive accounts with unusable passwords.
+    - Finding C: Deletion prevention on StudentProfile, FacultyProfile, and StudentAcademicRecord.
+    - Finding D: Faculty data access scoping (academic records denied; own assignments only).
+    - Finding E: Faculty assignment complete-state validation on PATCH; examiner revocation protection.
+    - Finding F: Academic parent updates invalidate dependent Chunk 06 records.
+    """
+
+    def test_student_registration_email_delivery_and_outbox(self):
+        from django.core import mail
+        mail.outbox = []
+
+        payload = {
+            "username": "email_outbox_student",
+            "email": "outbox_student@gauhati.ac.in",
+            "password": "StrongPassword@2026",
+            "first_name": "Outbox",
+            "last_name": "Student",
+            "college": self.college_a.pk,
+            "programme": self.prog_bca.pk,
+            "enrollment_number": "ENR-2026-OUT01",
+            "registration_year": 2026,
+        }
+        response = self.client.post("/api/v1/auth/register/", payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(len(mail.outbox), 1)
+        sent_email = mail.outbox[0]
+        self.assertIn("Verify Your Student Email Address", sent_email.subject)
+        self.assertEqual(sent_email.to, ["outbox_student@gauhati.ac.in"])
+        self.assertIn("verification token is:", sent_email.body)
+
+    def test_student_registration_email_failure_rolls_back_and_returns_503(self):
+        from unittest.mock import patch
+        from apps.students.services import VerificationEmailDeliveryError
+
+        with patch("apps.students.services.send_student_verification_email", side_effect=VerificationEmailDeliveryError("SMTP unavailable")):
+            payload = {
+                "username": "smtp_fail_student",
+                "email": "smtp_fail@gauhati.ac.in",
+                "password": "StrongPassword@2026",
+                "first_name": "SMTP",
+                "last_name": "Fail",
+                "college": self.college_a.pk,
+                "programme": self.prog_bca.pk,
+                "enrollment_number": "ENR-2026-SMTP01",
+                "registration_year": 2026,
+            }
+            response = self.client.post("/api/v1/auth/register/", payload, format="json")
+            self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+            self.assertEqual(response.data["error"]["code"], "EMAIL_DELIVERY_UNAVAILABLE")
+            # Verify database rollback
+            self.assertFalse(User.objects.filter(username="smtp_fail_student").exists())
+            self.assertFalse(StudentProfile.objects.filter(enrollment_number="ENR-2026-SMTP01").exists())
+
+    def test_student_email_verification_get_inspect_safe_against_prefetch(self):
+        user, profile, raw_token = register_student(
+            username="prefetch_student",
+            email="prefetch@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="Prefetch",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-2026-PRE01",
+            registration_year=2026,
+        )
+        # GET without confirm=true
+        inspect_res = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}")
+        self.assertEqual(inspect_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(inspect_res.data["status"], "CONFIRM_REQUIRED")
+        # Token remains unconsumed
+        ev = EmailVerification.objects.get(user=user)
+        self.assertFalse(ev.is_used)
+        self.assertIsNone(ev.verified_at)
+
+    def test_student_email_verification_get_confirm_consumes_token(self):
+        user, profile, raw_token = register_student(
+            username="get_confirm_student",
+            email="get_confirm@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="GetConfirm",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-2026-GC01",
+            registration_year=2026,
+        )
+        confirm_res = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
+        self.assertEqual(confirm_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(confirm_res.data["is_email_verified"])
+        ev = EmailVerification.objects.get(user=user)
+        self.assertTrue(ev.is_used)
+        self.assertIsNotNone(ev.verified_at)
+
+    def test_student_email_verification_post_consumes_token(self):
+        user, profile, raw_token = register_student(
+            username="post_verify_student",
+            email="post_verify@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="PostVerify",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-2026-PV01",
+            registration_year=2026,
+        )
+        post_res = self.client.post("/api/v1/auth/verify-email/", {"token": raw_token}, format="json")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(post_res.data["is_email_verified"])
+        ev = EmailVerification.objects.get(user=user)
+        self.assertTrue(ev.is_used)
+
+    def test_faculty_provisioning_inactive_account_and_unusable_password(self):
+        self.client.force_authenticate(user=self.admin)
+        payload = {
+            "username": "provisioned_inactive_faculty",
+            "email": "inactive_provision@gauhati.ac.in",
+            "first_name": "Inactive",
+            "last_name": "Provisioned",
+            "college": self.college_a.pk,
+            "department": self.dept_cs.pk,
+            "employee_code": "EMP-INACT-500",
+            "designation": "Assistant Professor",
+            "is_examiner": True,
+        }
+        res = self.client.post("/api/v1/faculty/profiles/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        created_user = User.objects.get(username="provisioned_inactive_faculty")
+        self.assertFalse(created_user.is_active)
+        self.assertFalse(created_user.has_usable_password())
+        self.assertFalse(created_user.is_staff)
+        self.assertFalse(created_user.is_superuser)
+
+    def test_provisioned_faculty_cannot_login(self):
+        self.client.force_authenticate(user=self.admin)
+        payload = {
+            "username": "locked_out_faculty",
+            "email": "locked_out@gauhati.ac.in",
+            "first_name": "Locked",
+            "last_name": "Out",
+            "college": self.college_a.pk,
+            "department": self.dept_cs.pk,
+            "employee_code": "EMP-LOCK-01",
+        }
+        res = self.client.post("/api/v1/faculty/profiles/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        # Attempt login
+        self.client.force_authenticate(user=None)
+        login_res = self.client.post(
+            "/api/v1/auth/login/",
+            {"identifier": "locked_out_faculty", "password": "AnyAttemptedPassword123!"},
+            format="json",
+            REMOTE_ADDR="127.0.0.1",
+        )
+        self.assertEqual(login_res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_student_profile_delete_blocked_with_403(self):
+        self.client.force_authenticate(user=self.superadmin)
+        response = self.client.delete(f"/api/v1/students/profiles/{self.student_profile.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_faculty_profile_delete_blocked_with_403(self):
+        self.client.force_authenticate(user=self.superadmin)
+        response = self.client.delete(f"/api/v1/faculty/profiles/{self.faculty_profile.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_student_academic_record_delete_blocked_with_403(self):
+        from apps.enrollments.services import create_student_academic_record
+        record = create_student_academic_record(
+            acting_user=self.admin,
+            student=self.student_profile,
+            programme=self.prog_bca,
+            academic_session=self.session_a,
+            admission_date=date(2026, 8, 1),
+        )
+        self.client.force_authenticate(user=self.superadmin)
+        response = self.client.delete(f"/api/v1/enrollments/academic-records/{record.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_faculty_user_cannot_access_student_academic_records(self):
+        from apps.enrollments.services import create_student_academic_record
+        record = create_student_academic_record(
+            acting_user=self.admin,
+            student=self.student_profile,
+            programme=self.prog_bca,
+            academic_session=self.session_a,
+            admission_date=date(2026, 8, 1),
+        )
+        self.client.force_authenticate(user=self.faculty_user)
+        # List endpoint: faculty gets empty queryset
+        list_res = self.client.get("/api/v1/enrollments/academic-records/")
+        self.assertIn(list_res.status_code, [status.HTTP_200_OK, status.HTTP_403_FORBIDDEN])
+        if list_res.status_code == status.HTTP_200_OK:
+            self.assertEqual(len(list_res.data), 0)
+        # Detail endpoint: faculty denied access
+        detail_res = self.client.get(f"/api/v1/enrollments/academic-records/{record.pk}/")
+        self.assertIn(detail_res.status_code, [status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN])
+
+    def test_faculty_user_scoped_to_own_faculty_assignments(self):
+        from apps.academics.services import assign_faculty_to_paper
+        # Assign Jane (non-examiner)
+        assign_jane = assign_faculty_to_paper(
+            acting_user=self.admin,
+            faculty=self.faculty_profile_non_examiner,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+        # Authenticate as John (faculty_user)
+        self.client.force_authenticate(user=self.faculty_user)
+        # List: John does not see Jane's assignment
+        list_res = self.client.get("/api/v1/academics/faculty-assignments/")
+        self.assertEqual(list_res.status_code, status.HTTP_200_OK)
+        ids = [item["id"] for item in list_res.data]
+        self.assertNotIn(assign_jane.pk, ids)
+        # Detail: John cannot view Jane's assignment
+        detail_res = self.client.get(f"/api/v1/academics/faculty-assignments/{assign_jane.pk}/")
+        self.assertIn(detail_res.status_code, [status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN])
+
+    def test_faculty_assignment_patch_examiner_validation(self):
+        from apps.academics.services import assign_faculty_to_paper
+        # Assign Jane (non-examiner) as TEACHER
+        assign_jane = assign_faculty_to_paper(
+            acting_user=self.admin,
+            faculty=self.faculty_profile_non_examiner,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+        self.client.force_authenticate(user=self.admin)
+        # Partial PATCH to INTERNAL_EXAMINER fails because Jane is not an examiner
+        patch_res = self.client.patch(
+            f"/api/v1/academics/faculty-assignments/{assign_jane.pk}/",
+            {"role": "INTERNAL_EXAMINER"},
+            format="json",
+        )
+        self.assertEqual(patch_res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Assign John (examiner) as TEACHER
+        assign_john = assign_faculty_to_paper(
+            acting_user=self.admin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+        # Partial PATCH to INTERNAL_EXAMINER succeeds because John is an examiner
+        patch_res_john = self.client.patch(
+            f"/api/v1/academics/faculty-assignments/{assign_john.pk}/",
+            {"role": "INTERNAL_EXAMINER"},
+            format="json",
+        )
+        self.assertEqual(patch_res_john.status_code, status.HTTP_200_OK)
+        assign_john.refresh_from_db()
+        self.assertEqual(assign_john.role, FacultyAssignmentRole.INTERNAL_EXAMINER)
+
+    def test_faculty_cannot_revoke_examiner_flag_with_active_assignments(self):
+        from apps.academics.services import assign_faculty_to_paper
+        assign_faculty_to_paper(
+            acting_user=self.admin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.INTERNAL_EXAMINER,
+        )
+        # Attempt to revoke is_examiner
+        with self.assertRaises(ValidationError) as ctx:
+            update_faculty_profile(
+                profile_id=self.faculty_profile.pk,
+                acting_user=self.admin,
+                validated_data={"is_examiner": False},
+            )
+        self.assertIn("is_examiner", ctx.exception.message_dict)
+
+    def test_programme_duration_reduction_rejected_when_student_in_higher_semester(self):
+        from apps.academics.services import update_programme
+        self.student_profile.current_semester = 6
+        self.student_profile.save(update_fields=["current_semester"])
+
+        with self.assertRaises(ValidationError) as ctx:
+            update_programme(
+                programme_id=self.prog_bca.pk,
+                validated_data={"duration_semesters": 4},
+            )
+        self.assertIn("duration_semesters", ctx.exception.message_dict)
+
+    def test_programme_college_change_rejected_when_student_profiles_exist(self):
+        from apps.academics.services import update_programme
+        with self.assertRaises(ValidationError) as ctx:
+            update_programme(
+                programme_id=self.prog_bca.pk,
+                validated_data={"college": self.college_b},
+            )
+        self.assertIn("college", ctx.exception.message_dict)
+
+    def test_department_college_change_rejected_when_faculty_profiles_exist(self):
+        from apps.academics.services import update_department
+        with self.assertRaises(ValidationError) as ctx:
+            update_department(
+                department_id=self.dept_cs.pk,
+                validated_data={"college": self.college_b},
+            )
+        self.assertIn("college", ctx.exception.message_dict)
+
+    def test_academic_session_college_change_rejected_when_academic_records_exist(self):
+        from apps.academics.services import update_academic_session
+        from apps.enrollments.services import create_student_academic_record
+        create_student_academic_record(
+            acting_user=self.admin,
+            student=self.student_profile,
+            programme=self.prog_bca,
+            academic_session=self.session_a,
+            admission_date=date(2026, 8, 1),
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            update_academic_session(
+                session_id=self.session_a.pk,
+                validated_data={"college": self.college_b},
+            )
+        self.assertIn("college", ctx.exception.message_dict)
+
+    def test_paper_offering_session_cross_college_change_rejected_with_faculty_assignment(self):
+        from apps.academics.services import assign_faculty_to_paper, update_paper_offering
+        assign_faculty_to_paper(
+            acting_user=self.admin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            update_paper_offering(
+                paper_offering_id=self.paper_offering.pk,
+                validated_data={"academic_session": self.session_b},
+            )
+        self.assertIn("academic_session", ctx.exception.message_dict)

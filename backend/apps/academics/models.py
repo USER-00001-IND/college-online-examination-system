@@ -93,6 +93,11 @@ class AcademicSession(models.Model):
                     raise ValidationError({
                         "college": "Cannot change academic session college while dependent paper offerings exist."
                     })
+                from apps.enrollments.models import StudentAcademicRecord
+                if StudentAcademicRecord.objects.filter(academic_session_id=self.pk).exists():
+                    raise ValidationError({
+                        "college": "Cannot change academic session college while dependent student academic records exist."
+                    })
 
     def __str__(self) -> str:
         return f"{self.name} - {self.college.code}"
@@ -156,13 +161,26 @@ class Programme(models.Model):
                         f"Cannot reduce programme duration to {self.duration_semesters}: mapped paper offering exists in semester {max_mapped}."
                     )
                 })
+            from apps.students.models import StudentProfile
+            from apps.enrollments.models import StudentAcademicRecord
+            max_student_sem = StudentProfile.objects.filter(programme_id=self.pk).aggregate(
+                max_sem=models.Max("current_semester")
+            )["max_sem"]
+            if max_student_sem is not None and self.duration_semesters < max_student_sem:
+                raise ValidationError({
+                    "duration_semesters": (
+                        f"Cannot reduce programme duration to {self.duration_semesters}: student profiles exist in semester {max_student_sem}."
+                    )
+                })
             orig = Programme.objects.filter(pk=self.pk).values("college_id").first()
             if orig and orig["college_id"] != self.college_id:
                 has_offerings = self.semesters.filter(paper_offerings__isnull=False).exists()
                 has_mappings = self.paper_mappings.exists()
-                if has_offerings or has_mappings:
+                has_students = StudentProfile.objects.filter(programme_id=self.pk).exists()
+                has_records = StudentAcademicRecord.objects.filter(programme_id=self.pk).exists()
+                if has_offerings or has_mappings or has_students or has_records:
                     raise ValidationError({
-                        "college": "Cannot change programme college while dependent paper offerings or mappings exist."
+                        "college": "Cannot change programme college while dependent paper offerings, mappings, student profiles, or academic records exist."
                     })
 
     def __str__(self) -> str:
@@ -204,6 +222,11 @@ class Department(models.Model):
                 if self.subjects.filter(paper_offerings__isnull=False).exists():
                     raise ValidationError({
                         "college": "Cannot change department college while dependent paper offerings exist."
+                    })
+                from apps.faculty.models import FacultyProfile
+                if FacultyProfile.objects.filter(department_id=self.pk).exists():
+                    raise ValidationError({
+                        "college": "Cannot change department college while dependent faculty profiles exist."
                     })
 
     def __str__(self) -> str:
@@ -524,6 +547,16 @@ class PaperOffering(models.Model):
                         "Remove or update incompatible programme mappings first."
                     )
                     break
+
+        # Same-college consistency check for FacultySubjectAssignment
+        if self.pk and self.academic_session_id:
+            from apps.academics.models import FacultySubjectAssignment
+            if FacultySubjectAssignment.objects.filter(
+                paper_offering_id=self.pk
+            ).exclude(faculty__college_id=self.academic_session.college_id).exists():
+                errors["academic_session"] = (
+                    "Cannot change academic session because assigned faculty belong to a different college."
+                )
 
         if errors:
             raise ValidationError(errors)

@@ -37,6 +37,7 @@ from apps.academics.services import (
     create_subject_category,
     update_academic_session,
     update_department,
+    update_faculty_assignment,
     update_institutional_config,
     update_paper_offering,
     update_paper_programme_mapping,
@@ -811,9 +812,9 @@ class FacultySubjectAssignmentSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "assigned_at"]
 
     def validate(self, attrs):
-        faculty = attrs.get("faculty")
-        paper_offering = attrs.get("paper_offering")
-        role = attrs.get("role", FacultyAssignmentRole.TEACHER)
+        faculty = attrs.get("faculty") or (self.instance.faculty if self.instance else None)
+        paper_offering = attrs.get("paper_offering") or (self.instance.paper_offering if self.instance else None)
+        role = attrs.get("role") or (self.instance.role if self.instance else FacultyAssignmentRole.TEACHER)
 
         if faculty and paper_offering:
             offering_college_id = paper_offering.academic_session.college_id
@@ -824,7 +825,7 @@ class FacultySubjectAssignmentSerializer(serializers.ModelSerializer):
             if role in (FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER):
                 if not faculty.is_examiner:
                     raise serializers.ValidationError({
-                        "faculty": f"Faculty member '{faculty.employee_code}' is not marked as eligible for examiner roles."
+                        "role": f"Faculty member '{faculty.employee_code}' is not marked as eligible for examiner roles."
                     })
         return attrs
 
@@ -836,5 +837,14 @@ class FacultySubjectAssignmentSerializer(serializers.ModelSerializer):
             faculty=validated_data["faculty"],
             paper_offering=validated_data["paper_offering"],
             role=validated_data.get("role", FacultyAssignmentRole.TEACHER),
+        )
+
+    def update(self, instance, validated_data):
+        request = self.context.get("request")
+        acting_user = request.user if request else None
+        return update_faculty_assignment(
+            assignment_id=instance.pk,
+            acting_user=acting_user,
+            validated_data=validated_data,
         )
 

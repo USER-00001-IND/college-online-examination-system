@@ -29,6 +29,7 @@ from apps.academics.permissions import (
     IsFacultyOrAdminAssignmentPermission,
     IsInstitutionalConfigPermission,
 )
+from apps.accounts.models import RoleChoices
 from apps.academics.serializers import (
     AcademicSessionSerializer,
     CollegeSerializer,
@@ -349,6 +350,7 @@ class FacultySubjectAssignmentViewSet(viewsets.ModelViewSet):
     permission_classes = [IsFacultyOrAdminAssignmentPermission]
 
     def get_queryset(self):
+        user = self.request.user
         qs = FacultySubjectAssignment.objects.select_related(
             "faculty",
             "faculty__user",
@@ -356,6 +358,15 @@ class FacultySubjectAssignmentViewSet(viewsets.ModelViewSet):
             "paper_offering__subject",
             "paper_offering__academic_session",
         ).all().order_by("-paper_offering__academic_session__start_date", "paper_offering__paper_code")
+
+        if not user or not user.is_authenticated:
+            return qs.none()
+
+        if user.role == RoleChoices.STUDENT:
+            return qs.none()
+
+        if user.role == RoleChoices.FACULTY:
+            qs = qs.filter(faculty__user=user)
 
         faculty_id = self.request.query_params.get("faculty")
         if faculty_id:
@@ -388,6 +399,22 @@ class FacultySubjectAssignmentViewSet(viewsets.ModelViewSet):
 
         out_serializer = self.get_serializer(assignment)
         return Response(out_serializer.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        try:
+            assignment = serializer.save()
+        except DjangoValidationError as exc:
+            detail = exc.message_dict if hasattr(exc, "message_dict") else str(exc)
+            return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
+        except DRFValidationError as exc:
+            return Response({"error": exc.detail}, status=status.HTTP_400_BAD_REQUEST)
+
+        out_serializer = self.get_serializer(assignment)
+        return Response(out_serializer.data, status=status.HTTP_200_OK)
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()

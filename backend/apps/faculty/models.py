@@ -79,5 +79,17 @@ class FacultyProfile(models.Model):
                     f"which does not match faculty college ID {self.college_id}."
                 )
 
+        # 3. Cannot revoke examiner eligibility if active examiner assignments exist
+        if self.pk and not self.is_examiner:
+            from apps.academics.models import FacultyAssignmentRole, FacultySubjectAssignment
+            if FacultySubjectAssignment.objects.filter(
+                faculty_id=self.pk,
+                role__in=[FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER],
+            ).exists():
+                errors['is_examiner'] = (
+                    f"Cannot revoke examiner eligibility for faculty member '{self.employee_code}' "
+                    f"while active examiner assignments exist."
+                )
+
         if errors:
             raise ValidationError(errors)

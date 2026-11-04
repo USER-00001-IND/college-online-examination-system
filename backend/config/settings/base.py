@@ -4,6 +4,7 @@ Targeting Gauhati University FYUGP Examination System Architecture.
 """
 
 from pathlib import Path
+import os
 import environ
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -182,6 +183,10 @@ REST_FRAMEWORK = {
 EXAM_PIN_DELIVERY_METHOD = None  # UNCONFIGURED ('EMAIL', 'SMS', 'IN_PERSON')
 EXAM_EVIDENCE_KEY_RETENTION_PERIOD = None  # UNCONFIGURED (Days integer)
 INSTITUTIONAL_CONFIG_APPROVED = False
+
+# Email Configuration
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'noreply@college.edu')
 
 # MySQL 8.x Connection Helper
 def get_mysql_db_config(environ_obj):

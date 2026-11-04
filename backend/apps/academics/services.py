@@ -26,6 +26,8 @@ from apps.academics.models import (
 )
 from apps.accounts.models import RoleChoices
 from apps.faculty.models import FacultyProfile
+from apps.students.models import StudentProfile
+from apps.enrollments.models import StudentAcademicRecord
 
 
 def lock_colleges(*college_ids: Optional[int]) -> dict[int, College]:
@@ -683,6 +685,12 @@ def update_paper_offering(
                     )
                 })
 
+    # FacultySubjectAssignment same-college revalidation
+    if FacultySubjectAssignment.objects.filter(paper_offering=locked_offering).exclude(faculty__college_id=locked_session.college_id).exists():
+        raise ValidationError({
+            "academic_session": "Cannot change academic session because assigned faculty belong to a different college."
+        })
+
     # Revalidate complete proposed academic state under lock
     validate_paper_offering_relationships(
         academic_session=locked_session,
@@ -808,13 +816,26 @@ def update_programme(
             )
         })
 
+    # Check 2B: Linked student profiles under lock
+    max_student_sem = StudentProfile.objects.filter(programme=locked_prog).aggregate(
+        max_sem=models.Max("current_semester")
+    )["max_sem"]
+    if max_student_sem is not None and proposed_duration < max_student_sem:
+        raise ValidationError({
+            "duration_semesters": (
+                f"Cannot reduce programme duration to {proposed_duration}: student profiles exist in semester {max_student_sem}."
+            )
+        })
+
     # Check 3: College change
     if proposed_college and proposed_college.pk != locked_prog.college_id:
         has_offerings = PaperOffering.objects.filter(semester__programme=locked_prog).exists()
         has_mappings = PaperProgrammeMapping.objects.filter(programme=locked_prog).exists()
-        if has_offerings or has_mappings:
+        has_students = StudentProfile.objects.filter(programme=locked_prog).exists()
+        has_records = StudentAcademicRecord.objects.filter(programme=locked_prog).exists()
+        if has_offerings or has_mappings or has_students or has_records:
             raise ValidationError({
-                "college": "Cannot change programme college while dependent paper offerings or mappings exist."
+                "college": "Cannot change programme college while dependent paper offerings, mappings, student profiles, or academic records exist."
             })
 
     for field, val in validated_data.items():
@@ -1001,6 +1022,10 @@ def update_department(
         if PaperOffering.objects.filter(subject__department=locked_dept).exists():
             raise ValidationError({
                 "college": "Cannot change department college while dependent paper offerings exist."
+            })
+        if FacultyProfile.objects.filter(department=locked_dept).exists():
+            raise ValidationError({
+                "college": "Cannot change department college while dependent faculty profiles exist."
             })
 
     for field, val in validated_data.items():
@@ -1262,6 +1287,10 @@ def update_academic_session(
         if PaperOffering.objects.filter(academic_session=locked_session).exists():
             raise ValidationError({
                 "college": "Cannot change academic session college while dependent paper offerings exist."
+            })
+        if StudentAcademicRecord.objects.filter(academic_session=locked_session).exists():
+            raise ValidationError({
+                "college": "Cannot change academic session college while dependent student academic records exist."
             })
 
     for field, val in validated_data.items():
@@ -1576,4 +1605,84 @@ def delete_faculty_assignment(
 
     assignment = FacultySubjectAssignment.objects.select_for_update().get(pk=assignment_id)
     assignment.delete()
+
+
+@transaction.atomic
+def update_faculty_assignment(
+    *,
+    assignment_id: int,
+    acting_user,
+    validated_data: dict,
+) -> FacultySubjectAssignment:
+    """
+    Atomically updates a FacultySubjectAssignment (Table 20) under lock.
+    Enforces:
+    1. Administrator authorization.
+    2. Single-table lock on existing assignment.
+    3. Deterministic Level 1 College Coordination Lock.
+    4. Reloading and locking proposed faculty and paper offering under College lock.
+    5. Complete-state resolution (merging existing state with partial PATCH updates).
+    6. Complete-state examiner eligibility check: INTERNAL_EXAMINER / EXTERNAL_EXAMINER
+       strictly requires faculty.is_examiner == True.
+    7. Complete-state same-college boundary check.
+    8. Uniqueness constraint check excluding self.
+    """
+    check_institutional_admin_authority(acting_user)
+
+    assignment = FacultySubjectAssignment.objects.select_for_update().get(pk=assignment_id)
+
+    # Resolve complete proposed references
+    proposed_faculty = validated_data.get("faculty", assignment.faculty)
+    proposed_offering = validated_data.get("paper_offering", assignment.paper_offering)
+    proposed_role = validated_data.get("role", assignment.role)
+
+    faculty_id = proposed_faculty.pk if hasattr(proposed_faculty, "pk") else int(proposed_faculty)
+    offering_id = proposed_offering.pk if hasattr(proposed_offering, "pk") else int(proposed_offering)
+
+    candidate_offering = PaperOffering.objects.select_related("academic_session").get(pk=offering_id)
+    target_college_id = candidate_offering.academic_session.college_id
+
+    # 1. Level 1 College Coordination Lock
+    lock_colleges(target_college_id)
+
+    # 2. Reload related entities under lock
+    locked_faculty = FacultyProfile.objects.select_for_update().get(pk=faculty_id)
+    locked_offering = PaperOffering.objects.select_for_update().get(pk=offering_id)
+
+    # 3. Same-college boundary validation
+    if locked_faculty.college_id != target_college_id:
+        raise ValidationError({
+            "faculty": (
+                f"Faculty college ID {locked_faculty.college_id} does not match "
+                f"paper offering college ID {target_college_id}."
+            )
+        })
+
+    # 4. Examiner eligibility validation against resolved proposed role
+    if proposed_role in (FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER):
+        if not locked_faculty.is_examiner:
+            raise ValidationError({
+                "role": f"Faculty member '{locked_faculty.employee_code}' is not marked as eligible for examiner roles."
+            })
+
+    # 5. Check uniqueness excluding self
+    if FacultySubjectAssignment.objects.filter(
+        faculty=locked_faculty,
+        paper_offering=locked_offering,
+        role=proposed_role,
+    ).exclude(pk=assignment_id).exists():
+        raise ValidationError({
+            "non_field_errors": (
+                f"Faculty '{locked_faculty.employee_code}' is already assigned to paper "
+                f"'{locked_offering.paper_code}' with role '{proposed_role}'."
+            )
+        })
+
+    assignment.faculty = locked_faculty
+    assignment.paper_offering = locked_offering
+    assignment.role = proposed_role
+    assignment.full_clean()
+    assignment.save()
+
+    return assignment
 
