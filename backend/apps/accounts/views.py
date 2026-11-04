@@ -336,3 +336,83 @@ class StudentTestView(APIView):
             {"message": "Student access granted."},
             status=status.HTTP_200_OK,
         )
+
+
+class StudentRegisterView(APIView):
+    """
+    Public student self-registration endpoint.
+    Creates an inactive student user, StudentProfile, RegistrationApproval (PENDING),
+    and cryptographic EmailVerification token.
+    Never exposes plaintext password or raw verification token in the response.
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from apps.students.serializers import StudentRegistrationSerializer
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        serializer = StudentRegistrationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            user = serializer.save()
+        except DjangoValidationError as exc:
+            detail = exc.message_dict if hasattr(exc, "message_dict") else str(exc)
+            return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "message": "Student registration submitted successfully. Please check your email to verify your account.",
+                "user_id": user.pk,
+                "username": user.username,
+                "email": user.email,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class VerifyEmailView(APIView):
+    """
+    Public cryptographic email verification endpoint.
+    Accepts token via GET ?token=... or POST {"token": "..."}.
+    Validates token expiration (24h) and single-use constraint.
+    Does NOT activate account; account remains inactive pending administrator approval.
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def _verify(self, token_str):
+        from apps.students.serializers import EmailVerificationSerializer
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        if not token_str or not str(token_str).strip():
+            return Response(
+                {"error": {"token": "Verification token is required."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = EmailVerificationSerializer(data={"token": str(token_str).strip()})
+        serializer.is_valid(raise_exception=True)
+        try:
+            user = serializer.save()
+        except DjangoValidationError as exc:
+            detail = exc.message_dict if hasattr(exc, "message_dict") else str(exc)
+            return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "message": "Email address verified successfully. Your account is pending administrative approval.",
+                "username": user.username,
+                "is_email_verified": True,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def get(self, request):
+        token = request.query_params.get("token")
+        return self._verify(token)
+
+    def post(self, request):
+        token = request.data.get("token")
+        return self._verify(token)
+

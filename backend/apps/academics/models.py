@@ -23,6 +23,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 
 
 class College(models.Model):
@@ -663,3 +664,76 @@ class InstitutionalConfig(models.Model):
 
     def __str__(self) -> str:
         return f"{self.college.code}: {self.config_key}"
+
+
+class FacultyAssignmentRole(models.TextChoices):
+    """Approved teaching and examination roles for faculty paper assignments."""
+    TEACHER = 'TEACHER', 'Teacher'
+    INTERNAL_EXAMINER = 'INTERNAL_EXAMINER', 'Internal Examiner'
+    EXTERNAL_EXAMINER = 'EXTERNAL_EXAMINER', 'External Examiner'
+    MODERATOR = 'MODERATOR', 'Moderator'
+
+
+class FacultySubjectAssignment(models.Model):
+    """
+    Faculty teaching and examination assignments for paper offerings (Table 20: academics_faculty_subject_assignment).
+    Enforces institutional same-college boundaries and examiner eligibility constraints.
+    """
+    id = models.BigAutoField(primary_key=True)
+    faculty = models.ForeignKey(
+        'faculty.FacultyProfile',
+        on_delete=models.RESTRICT,
+        related_name='paper_assignments',
+        db_column='faculty_id',
+    )
+    paper_offering = models.ForeignKey(
+        'academics.PaperOffering',
+        on_delete=models.RESTRICT,
+        related_name='faculty_assignments',
+        db_column='paper_offering_id',
+    )
+    role = models.CharField(
+        max_length=30,
+        choices=FacultyAssignmentRole.choices,
+        default=FacultyAssignmentRole.TEACHER,
+        help_text="Assigned academic role for this paper offering.",
+    )
+    assigned_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = 'academics_faculty_subject_assignment'
+        verbose_name = 'Faculty Subject Assignment'
+        verbose_name_plural = 'Faculty Subject Assignments'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['faculty', 'paper_offering', 'role'],
+                name='uk_faculty_paper_role',
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.faculty.employee_code} -> {self.paper_offering.paper_code} [{self.role}]"
+
+    def clean(self):
+        super().clean()
+        errors = {}
+
+        if hasattr(self, 'faculty') and self.faculty and hasattr(self, 'paper_offering') and self.paper_offering:
+            # 1. Cross-college boundary verification
+            offering_college_id = self.paper_offering.academic_session.college_id
+            if self.faculty.college_id != offering_college_id:
+                errors['faculty'] = (
+                    f"Faculty college ID {self.faculty.college_id} does not match paper offering's "
+                    f"college ID {offering_college_id}."
+                )
+
+            # 2. Examiner eligibility constraint
+            if self.role in (FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER):
+                if not getattr(self.faculty, 'is_examiner', False):
+                    errors['faculty'] = (
+                        f"Faculty member '{self.faculty.employee_code}' is not marked as eligible for examiner roles."
+                    )
+
+        if errors:
+            raise ValidationError(errors)
+

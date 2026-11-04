@@ -22,15 +22,18 @@ from apps.academics.models import (
     Semester,
     Subject,
     SubjectCategory,
+    FacultySubjectAssignment,
 )
 from apps.academics.permissions import (
     IsAcademicAdminOrReadOnly,
+    IsFacultyOrAdminAssignmentPermission,
     IsInstitutionalConfigPermission,
 )
 from apps.academics.serializers import (
     AcademicSessionSerializer,
     CollegeSerializer,
     DepartmentSerializer,
+    FacultySubjectAssignmentSerializer,
     InstitutionalConfigSerializer,
     MapProgrammesPayloadSerializer,
     PaperOfferingSerializer,
@@ -41,6 +44,7 @@ from apps.academics.serializers import (
     SubjectSerializer,
 )
 from apps.academics.services import (
+    delete_faculty_assignment,
     delete_institutional_config,
     delete_paper_programme_mapping,
     map_paper_to_programmes,
@@ -333,3 +337,63 @@ class InstitutionalConfigViewSet(BaseAcademicViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+
+
+class FacultySubjectAssignmentViewSet(viewsets.ModelViewSet):
+    """
+    CRUD ViewSet for FacultySubjectAssignment (Table 20).
+    - Faculty and administrators can query assignments. Students are denied.
+    - Creation and deletion strictly restricted to administrators.
+    """
+    serializer_class = FacultySubjectAssignmentSerializer
+    permission_classes = [IsFacultyOrAdminAssignmentPermission]
+
+    def get_queryset(self):
+        qs = FacultySubjectAssignment.objects.select_related(
+            "faculty",
+            "faculty__user",
+            "paper_offering",
+            "paper_offering__subject",
+            "paper_offering__academic_session",
+        ).all().order_by("-paper_offering__academic_session__start_date", "paper_offering__paper_code")
+
+        faculty_id = self.request.query_params.get("faculty")
+        if faculty_id:
+            qs = qs.filter(faculty_id=faculty_id)
+
+        paper_offering_id = self.request.query_params.get("paper_offering")
+        if paper_offering_id:
+            qs = qs.filter(paper_offering_id=paper_offering_id)
+
+        role = self.request.query_params.get("role")
+        if role:
+            qs = qs.filter(role=role.upper().strip())
+
+        session_id = self.request.query_params.get("academic_session")
+        if session_id:
+            qs = qs.filter(paper_offering__academic_session_id=session_id)
+
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            assignment = serializer.save()
+        except DjangoValidationError as exc:
+            detail = exc.message_dict if hasattr(exc, "message_dict") else str(exc)
+            return Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
+        except DRFValidationError as exc:
+            return Response({"error": exc.detail}, status=status.HTTP_400_BAD_REQUEST)
+
+        out_serializer = self.get_serializer(assignment)
+        return Response(out_serializer.data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        delete_faculty_assignment(
+            acting_user=request.user,
+            assignment_id=instance.pk,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+

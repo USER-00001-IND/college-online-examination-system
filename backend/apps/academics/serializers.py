@@ -21,8 +21,11 @@ from apps.academics.models import (
     Semester,
     Subject,
     SubjectCategory,
+    FacultyAssignmentRole,
+    FacultySubjectAssignment,
 )
 from apps.academics.services import (
+    assign_faculty_to_paper,
     create_academic_session,
     create_department,
     create_institutional_config,
@@ -774,3 +777,64 @@ class MapProgrammesPayloadSerializer(serializers.Serializer):
                     "replace must be a genuine JSON boolean (true or false), not a string or number."
                 )
         return value
+
+
+class FacultySubjectAssignmentSerializer(serializers.ModelSerializer):
+    """
+    Serializer for FacultySubjectAssignment (Table 20).
+    Represents teaching and examination assignments for paper offerings.
+    """
+    faculty_employee_code = serializers.CharField(source="faculty.employee_code", read_only=True)
+    faculty_name = serializers.CharField(source="faculty.user.get_full_name", read_only=True)
+    faculty_designation = serializers.CharField(source="faculty.designation", read_only=True)
+    paper_code = serializers.CharField(source="paper_offering.paper_code", read_only=True)
+    paper_name = serializers.CharField(source="paper_offering.subject.name", read_only=True)
+    academic_session_name = serializers.CharField(
+        source="paper_offering.academic_session.name", read_only=True
+    )
+
+    class Meta:
+        model = FacultySubjectAssignment
+        fields = [
+            "id",
+            "faculty",
+            "faculty_employee_code",
+            "faculty_name",
+            "faculty_designation",
+            "paper_offering",
+            "paper_code",
+            "paper_name",
+            "academic_session_name",
+            "role",
+            "assigned_at",
+        ]
+        read_only_fields = ["id", "assigned_at"]
+
+    def validate(self, attrs):
+        faculty = attrs.get("faculty")
+        paper_offering = attrs.get("paper_offering")
+        role = attrs.get("role", FacultyAssignmentRole.TEACHER)
+
+        if faculty and paper_offering:
+            offering_college_id = paper_offering.academic_session.college_id
+            if faculty.college_id != offering_college_id:
+                raise serializers.ValidationError({
+                    "faculty": f"Faculty college ID {faculty.college_id} does not match offering college ID {offering_college_id}."
+                })
+            if role in (FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER):
+                if not faculty.is_examiner:
+                    raise serializers.ValidationError({
+                        "faculty": f"Faculty member '{faculty.employee_code}' is not marked as eligible for examiner roles."
+                    })
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        acting_user = request.user if request else None
+        return assign_faculty_to_paper(
+            acting_user=acting_user,
+            faculty=validated_data["faculty"],
+            paper_offering=validated_data["paper_offering"],
+            role=validated_data.get("role", FacultyAssignmentRole.TEACHER),
+        )
+

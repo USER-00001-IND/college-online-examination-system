@@ -21,8 +21,11 @@ from apps.academics.models import (
     Semester,
     Subject,
     SubjectCategory,
+    FacultyAssignmentRole,
+    FacultySubjectAssignment,
 )
 from apps.accounts.models import RoleChoices
+from apps.faculty.models import FacultyProfile
 
 
 def lock_colleges(*college_ids: Optional[int]) -> dict[int, College]:
@@ -1488,3 +1491,89 @@ def delete_institutional_config(
         )
 
     locked_config.delete()
+
+
+@transaction.atomic
+def assign_faculty_to_paper(
+    *,
+    acting_user,
+    faculty,
+    paper_offering,
+    role: str = FacultyAssignmentRole.TEACHER,
+) -> FacultySubjectAssignment:
+    """
+    Atomically creates a FacultySubjectAssignment (Table 20).
+    Enforces:
+    1. Administrator authorization.
+    2. College row lock coordination.
+    3. Same-college boundary between faculty and paper offering session.
+    4. Examiner eligibility if internal or external examiner role is selected.
+    5. Assignment uniqueness.
+    """
+    check_institutional_admin_authority(acting_user)
+
+    faculty_id = faculty.pk if hasattr(faculty, "pk") else int(faculty)
+    offering_id = paper_offering.pk if hasattr(paper_offering, "pk") else int(paper_offering)
+
+    candidate_offering = PaperOffering.objects.select_related("academic_session").get(pk=offering_id)
+    target_college_id = candidate_offering.academic_session.college_id
+
+    # 1. Level 1 College Coordination Lock
+    lock_colleges(target_college_id)
+
+    # 2. Reload entities under lock
+    locked_faculty = FacultyProfile.objects.select_for_update().get(pk=faculty_id)
+    locked_offering = PaperOffering.objects.select_for_update().get(pk=offering_id)
+
+    # 3. Same-college boundary validation
+    if locked_faculty.college_id != target_college_id:
+        raise ValidationError({
+            "faculty": (
+                f"Faculty college ID {locked_faculty.college_id} does not match "
+                f"paper offering college ID {target_college_id}."
+            )
+        })
+
+    # 4. Examiner eligibility validation
+    if role in (FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER):
+        if not locked_faculty.is_examiner:
+            raise ValidationError({
+                "faculty": f"Faculty member '{locked_faculty.employee_code}' is not marked as eligible for examiner roles."
+            })
+
+    # 5. Check uniqueness
+    if FacultySubjectAssignment.objects.filter(
+        faculty=locked_faculty,
+        paper_offering=locked_offering,
+        role=role,
+    ).exists():
+        raise ValidationError({
+            "non_field_errors": (
+                f"Faculty '{locked_faculty.employee_code}' is already assigned to paper "
+                f"'{locked_offering.paper_code}' with role '{role}'."
+            )
+        })
+
+    assignment = FacultySubjectAssignment(
+        faculty=locked_faculty,
+        paper_offering=locked_offering,
+        role=role,
+    )
+    assignment.full_clean()
+    assignment.save()
+
+    return assignment
+
+
+@transaction.atomic
+def delete_faculty_assignment(
+    *,
+    acting_user,
+    assignment_id: int,
+) -> None:
+    """Atomically deletes a FacultySubjectAssignment under lock."""
+    check_institutional_admin_authority(acting_user)
+
+    assignment = FacultySubjectAssignment.objects.select_for_update().get(pk=assignment_id)
+    assignment.delete()
+

@@ -10,6 +10,7 @@ from apps.academics.views import (
     AcademicSessionViewSet,
     CollegeViewSet,
     DepartmentViewSet,
+    FacultySubjectAssignmentViewSet,
     InstitutionalConfigViewSet,
     PaperOfferingViewSet,
     PaperProgrammeMappingViewSet,
@@ -31,6 +32,7 @@ router.register(r"subject-categories", SubjectCategoryViewSet, basename="subject
 router.register(r"subjects", SubjectViewSet, basename="subject")
 router.register(r"paper-offerings", PaperOfferingViewSet, basename="paper-offering")
 router.register(r"paper-mappings", PaperProgrammeMappingViewSet, basename="paper-mapping")
+router.register(r"faculty-assignments", FacultySubjectAssignmentViewSet, basename="faculty-assignment")
 router.register(r"institutional-configs", InstitutionalConfigViewSet, basename="institutional-config")
 
 urlpatterns = [

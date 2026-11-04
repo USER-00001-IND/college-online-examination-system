@@ -12,7 +12,9 @@ from apps.accounts.views import (
     FacultyTestView,
     LoginView,
     LogoutView,
+    StudentRegisterView,
     StudentTestView,
+    VerifyEmailView,
 )
 
 app_name = 'accounts'
@@ -21,6 +23,8 @@ urlpatterns = [
     path('csrf/', CsrfBootstrapView.as_view(), name='csrf-bootstrap'),
     path('login/', LoginView.as_view(), name='login'),
     path('logout/', LogoutView.as_view(), name='logout'),
+    path('register/', StudentRegisterView.as_view(), name='student-register'),
+    path('verify-email/', VerifyEmailView.as_view(), name='verify-email'),
     path('user/', CurrentUserView.as_view(), name='current-user'),
     # RBAC verification endpoints
     path('test/admin-only/', AdminTestView.as_view(), name='test-admin-only'),
