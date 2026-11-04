@@ -3560,3 +3560,500 @@ class SubjectCategoryCreditRangeConcurrencyRegressionTests(TestCase):
         self.cat.refresh_from_db()
         self.assertEqual(self.cat.min_credits, Decimal("2.0"))
         self.assertEqual(self.cat.max_credits, Decimal("6.0"))
+
+
+class AuthoritativeRelationshipValidationRegressionTests(TestCase):
+    """
+    Round 7 Regression Tests for High Finding A:
+    Stale Related-Record Validation During Paper Creation.
+    Guarantees:
+    - Authoritative relationship resolution under College row locks.
+    - Explicit assignment of locked related instances prevents stale relation lookups.
+    - All parent entities are verified against candidate locks and locked College PKs.
+    - Concurrent cross-college mutation causes deterministic validation rejection.
+    """
+
+    def setUp(self):
+        self.college_a = College.objects.create(name="College A", code="COL-A", contact_email="admin@a.edu")
+        self.college_b = College.objects.create(name="College B", code="COL-B", contact_email="admin@b.edu")
+
+        self.session_a = AcademicSession.objects.create(
+            college=self.college_a, name="2026-2027-A", start_date=date(2026, 7, 1), end_date=date(2027, 6, 30)
+        )
+        self.session_b = AcademicSession.objects.create(
+            college=self.college_b, name="2026-2027-B", start_date=date(2026, 7, 1), end_date=date(2027, 6, 30)
+        )
+
+        self.prog_a = Programme.objects.create(
+            college=self.college_a, name="BA A", code="BA-A", duration_semesters=6, degree_type="UNDERGRADUATE"
+        )
+        self.prog_b = Programme.objects.create(
+            college=self.college_b, name="BA B", code="BA-B", duration_semesters=6, degree_type="UNDERGRADUATE"
+        )
+
+        self.sem_a = Semester.objects.create(programme=self.prog_a, semester_number=2, name="Sem 2 A")
+        self.sem_b = Semester.objects.create(programme=self.prog_b, semester_number=2, name="Sem 2 B")
+
+        self.dept_a = Department.objects.create(college=self.college_a, name="Dept A", code="D-A")
+        self.dept_b = Department.objects.create(college=self.college_b, name="Dept B", code="D-B")
+
+        self.sub_a = Subject.objects.create(department=self.dept_a, name="Sub A", code="SUB-A")
+        self.sub_b = Subject.objects.create(department=self.dept_b, name="Sub B", code="SUB-B")
+
+        self.cat_a = SubjectCategory.objects.create(
+            college=self.college_a, code="MAJ-A", name="Major A", min_credits=Decimal("2.0"), max_credits=Decimal("6.0")
+        )
+        self.cat_b = SubjectCategory.objects.create(
+            college=self.college_b, code="MAJ-B", name="Major B", min_credits=Decimal("2.0"), max_credits=Decimal("6.0")
+        )
+
+        self.admin = User.objects.create_user(
+            username="admin_auth_val",
+            email="admin@col-a.edu",
+            password="Password123!",
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.admin)
+
+    def test_valid_paper_creation_within_one_college_succeeds(self):
+        url = reverse("academics:paper-offering-list")
+        res = self.client.post(url, {
+            "academic_session": self.session_a.id,
+            "semester": self.sem_a.id,
+            "subject": self.sub_a.id,
+            "subject_category": self.cat_a.id,
+            "paper_code": "PAPER-OK",
+            "title": "Valid Single College Paper",
+            "credits": "4.0",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(PaperOffering.objects.filter(paper_code="PAPER-OK").exists())
+
+    def test_cross_college_academic_session_and_semester_rejected(self):
+        url = reverse("academics:paper-offering-list")
+        res = self.client.post(url, {
+            "academic_session": self.session_a.id,
+            "semester": self.sem_b.id,
+            "subject": self.sub_a.id,
+            "subject_category": self.cat_a.id,
+            "paper_code": "PAPER-X1",
+            "title": "Cross College Session/Sem",
+            "credits": "4.0",
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        content_str = str(res.content)
+        self.assertIn("semester", content_str)
+        self.assertFalse(PaperOffering.objects.filter(paper_code="PAPER-X1").exists())
+
+    def test_cross_college_subject_department_rejected(self):
+        url = reverse("academics:paper-offering-list")
+        res = self.client.post(url, {
+            "academic_session": self.session_a.id,
+            "semester": self.sem_a.id,
+            "subject": self.sub_b.id,
+            "subject_category": self.cat_a.id,
+            "paper_code": "PAPER-X2",
+            "title": "Cross College Sub/Dept",
+            "credits": "4.0",
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        content_str = str(res.content)
+        self.assertIn("subject", content_str)
+        self.assertFalse(PaperOffering.objects.filter(paper_code="PAPER-X2").exists())
+
+    def test_cross_college_subject_category_rejected(self):
+        url = reverse("academics:paper-offering-list")
+        res = self.client.post(url, {
+            "academic_session": self.session_a.id,
+            "semester": self.sem_a.id,
+            "subject": self.sub_a.id,
+            "subject_category": self.cat_b.id,
+            "paper_code": "PAPER-X3",
+            "title": "Cross College Cat",
+            "credits": "4.0",
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        content_str = str(res.content)
+        self.assertIn("subject_category", content_str)
+        self.assertFalse(PaperOffering.objects.filter(paper_code="PAPER-X3").exists())
+
+    def test_stale_state_serializer_validated_before_semester_reassignment_rejected(self):
+        from apps.academics.serializers import PaperOfferingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        serializer = PaperOfferingSerializer(data={
+            "academic_session": self.session_a.id,
+            "semester": self.sem_a.id,
+            "subject": self.sub_a.id,
+            "subject_category": self.cat_a.id,
+            "paper_code": "STALE-SEM",
+            "title": "Stale Semester Mutation",
+            "credits": "4.0",
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent mutation reassigns semester's programme to College B
+        prog_b_empty = Programme.objects.create(
+            college=self.college_b, name="BA B Empty", code="BA-B-EMP", duration_semesters=6, degree_type="UNDERGRADUATE"
+        )
+        self.sem_a.programme = prog_b_empty
+        self.sem_a.save(update_fields=["programme"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.assertFalse(PaperOffering.objects.filter(paper_code="STALE-SEM").exists())
+
+    def test_stale_state_serializer_validated_before_department_reassignment_rejected(self):
+        from apps.academics.serializers import PaperOfferingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        serializer = PaperOfferingSerializer(data={
+            "academic_session": self.session_a.id,
+            "semester": self.sem_a.id,
+            "subject": self.sub_a.id,
+            "subject_category": self.cat_a.id,
+            "paper_code": "STALE-SUB",
+            "title": "Stale Subject Mutation",
+            "credits": "4.0",
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent mutation reassigns subject's department to College B
+        self.sub_a.department = self.dept_b
+        self.sub_a.save(update_fields=["department"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.assertFalse(PaperOffering.objects.filter(paper_code="STALE-SUB").exists())
+
+    def test_paper_creation_rechecks_semester_programme_duration_under_lock(self):
+        from apps.academics.serializers import PaperOfferingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        sem_high = Semester.objects.create(programme=self.prog_a, semester_number=6, name="Sem 6 A")
+
+        serializer = PaperOfferingSerializer(data={
+            "academic_session": self.session_a.id,
+            "semester": sem_high.id,
+            "subject": self.sub_a.id,
+            "subject_category": self.cat_a.id,
+            "paper_code": "DUR-CHECK",
+            "title": "Duration Check",
+            "credits": "4.0",
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent update reduces programme duration below semester number
+        self.prog_a.duration_semesters = 4
+        self.prog_a.save(update_fields=["duration_semesters"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.assertFalse(PaperOffering.objects.filter(paper_code="DUR-CHECK").exists())
+
+    def test_paper_creation_rechecks_category_credit_bounds_under_lock(self):
+        from apps.academics.serializers import PaperOfferingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        serializer = PaperOfferingSerializer(data={
+            "academic_session": self.session_a.id,
+            "semester": self.sem_a.id,
+            "subject": self.sub_a.id,
+            "subject_category": self.cat_a.id,
+            "paper_code": "CRED-CHECK",
+            "title": "Credit Check",
+            "credits": "5.0",
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent update reduces category max_credits
+        self.cat_a.max_credits = Decimal("4.0")
+        self.cat_a.save(update_fields=["max_credits"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.assertFalse(PaperOffering.objects.filter(paper_code="CRED-CHECK").exists())
+
+    def test_direct_service_create_paper_offering_enforces_authoritative_relationship_validation(self):
+        with self.assertRaises(ValidationError) as cm:
+            create_paper_offering(
+                academic_session=self.session_a,
+                semester=self.sem_b,  # College B
+                subject=self.sub_a,
+                subject_category=self.cat_a,
+                paper_code="DIR-SRV",
+                title="Direct Service Call",
+                credits=Decimal("4.0"),
+                max_marks_internal=Decimal("20.00"),
+                max_marks_external=Decimal("80.00"),
+                pass_marks_external=Decimal("32.00"),
+            )
+        self.assertIn("semester", cm.exception.message_dict)
+
+
+class CurrentAcademicSessionTransferIntegrityRegressionTests(TestCase):
+    """
+    Round 7 Regression Tests for High Finding B:
+    Academic Session Transfer Violates Current-Session Integrity.
+    Guarantees:
+    - A current academic session cannot be reassigned to another college through ordinary CRUD.
+    - Noncurrent sessions without dependent paper offerings can be safely reassigned.
+    - Noncurrent sessions with dependent paper offerings cannot be reassigned.
+    - Dedicated set-current action reloads under lock and guarantees exactly one current session.
+    - Stale session activation fails safely.
+    """
+
+    def setUp(self):
+        self.college_a = College.objects.create(name="College A", code="COL-A", contact_email="admin@col-a.edu")
+        self.college_b = College.objects.create(name="College B", code="COL-B", contact_email="admin@col-b.edu")
+
+        self.curr_session_a = AcademicSession.objects.create(
+            college=self.college_a, name="Session A Current", start_date=date(2026, 7, 1), end_date=date(2027, 6, 30), is_current=True
+        )
+        self.noncurr_session_a = AcademicSession.objects.create(
+            college=self.college_a, name="Session A NonCurrent", start_date=date(2025, 7, 1), end_date=date(2026, 6, 30), is_current=False
+        )
+
+        self.curr_session_b = AcademicSession.objects.create(
+            college=self.college_b, name="Session B Current", start_date=date(2026, 7, 1), end_date=date(2027, 6, 30), is_current=True
+        )
+
+        self.admin = User.objects.create_user(
+            username="admin_sess_trans",
+            email="admin@col-a.edu",
+            password="Password123!",
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        self.student = User.objects.create_user(
+            username="student_sess",
+            email="student@col-a.edu",
+            password="Password123!",
+            role=RoleChoices.STUDENT,
+            is_active=True,
+        )
+        self.faculty = User.objects.create_user(
+            username="faculty_sess",
+            email="faculty@col-a.edu",
+            password="Password123!",
+            role=RoleChoices.FACULTY,
+            is_active=True,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.admin)
+
+    def test_current_session_cannot_be_reassigned_to_another_college_via_patch(self):
+        url = reverse("academics:session-detail", kwargs={"pk": self.curr_session_a.id})
+        res = self.client.patch(url, {"college": self.college_b.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        content_str = str(res.content)
+        self.assertIn("A current academic session cannot be reassigned to another college.", content_str)
+
+        self.curr_session_a.refresh_from_db()
+        self.assertEqual(self.curr_session_a.college, self.college_a)
+        self.assertTrue(self.curr_session_a.is_current)
+
+    def test_noncurrent_session_without_offerings_can_be_reassigned(self):
+        url = reverse("academics:session-detail", kwargs={"pk": self.noncurr_session_a.id})
+        res = self.client.patch(url, {"college": self.college_b.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        self.noncurr_session_a.refresh_from_db()
+        self.assertEqual(self.noncurr_session_a.college, self.college_b)
+        self.assertFalse(self.noncurr_session_a.is_current)
+
+    def test_noncurrent_session_with_offerings_cannot_be_reassigned(self):
+        prog = Programme.objects.create(college=self.college_a, name="BA", code="BA-S", duration_semesters=6)
+        sem = Semester.objects.create(programme=prog, semester_number=1, name="Sem 1")
+        dept = Department.objects.create(college=self.college_a, name="Dept", code="DEPT-S")
+        sub = Subject.objects.create(department=dept, name="Sub", code="SUB-S")
+        cat = SubjectCategory.objects.create(college=self.college_a, code="CAT-S", name="Cat", min_credits=Decimal("2.0"), max_credits=Decimal("6.0"))
+
+        PaperOffering.objects.create(
+            academic_session=self.noncurr_session_a,
+            semester=sem,
+            subject=sub,
+            subject_category=cat,
+            paper_code="OFF-DEP",
+            title="Dependent Offering",
+            credits=Decimal("4.0"),
+        )
+
+        url = reverse("academics:session-detail", kwargs={"pk": self.noncurr_session_a.id})
+        res = self.client.patch(url, {"college": self.college_b.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        content_str = str(res.content)
+        self.assertIn("Cannot change academic session college while dependent paper offerings exist.", content_str)
+
+        self.noncurr_session_a.refresh_from_db()
+        self.assertEqual(self.noncurr_session_a.college, self.college_a)
+
+    def test_rejected_transfer_preserves_original_college_and_current_flag(self):
+        url = reverse("academics:session-detail", kwargs={"pk": self.curr_session_a.id})
+        res = self.client.patch(url, {"college": self.college_b.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.curr_session_a.refresh_from_db()
+        self.assertEqual(self.curr_session_a.college_id, self.college_a.id)
+        self.assertTrue(self.curr_session_a.is_current)
+
+    def test_rejected_transfer_does_not_alter_target_college_current_session(self):
+        url = reverse("academics:session-detail", kwargs={"pk": self.curr_session_a.id})
+        res = self.client.patch(url, {"college": self.college_b.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.curr_session_b.refresh_from_db()
+        self.assertTrue(self.curr_session_b.is_current)
+        self.assertEqual(AcademicSession.objects.filter(college=self.college_b, is_current=True).count(), 1)
+
+    def test_direct_service_update_academic_session_rejects_transferring_current_session(self):
+        from apps.academics.services import update_academic_session
+        with self.assertRaises(ValidationError) as cm:
+            update_academic_session(
+                session_id=self.curr_session_a.id,
+                validated_data={"college": self.college_b},
+            )
+        self.assertIn("college", cm.exception.message_dict)
+        self.assertIn("A current academic session cannot be reassigned to another college.", cm.exception.message_dict["college"])
+
+    def test_direct_model_session_clean_rejects_transferring_current_session(self):
+        self.curr_session_a.college = self.college_b
+        with self.assertRaises(ValidationError) as cm:
+            self.curr_session_a.clean()
+        self.assertIn("college", cm.exception.message_dict)
+        self.assertIn("A current academic session cannot be reassigned to another college.", cm.exception.message_dict["college"])
+
+    def test_dedicated_set_current_action_reloads_under_lock_and_leaves_exactly_one_current(self):
+        url = reverse("academics:session-set-current", kwargs={"pk": self.noncurr_session_a.id})
+        res = self.client.post(url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        self.curr_session_a.refresh_from_db()
+        self.noncurr_session_a.refresh_from_db()
+
+        self.assertFalse(self.curr_session_a.is_current)
+        self.assertTrue(self.noncurr_session_a.is_current)
+        self.assertEqual(AcademicSession.objects.filter(college=self.college_a, is_current=True).count(), 1)
+
+    def test_stale_session_activation_rejected(self):
+        # Trying to activate session_a under college_b must fail
+        with self.assertRaises(ValidationError) as cm:
+            set_current_academic_session(college=self.college_b, session=self.noncurr_session_a)
+        self.assertIn("session", cm.exception.message_dict)
+        self.assertIn("Session does not belong to the specified college.", cm.exception.message_dict["session"])
+
+    def test_student_and_faculty_cannot_invoke_set_current(self):
+        url = reverse("academics:session-set-current", kwargs={"pk": self.noncurr_session_a.id})
+
+        self.client.force_authenticate(user=self.student)
+        res_stu = self.client.post(url)
+        self.assertEqual(res_stu.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=self.faculty)
+        res_fac = self.client.post(url)
+        self.assertEqual(res_fac.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ProgrammeDegreeTypeDefaultRegressionTests(TestCase):
+    """
+    Round 7 Regression Tests for Medium Finding C:
+    Programme Degree Type Default Schema Mismatch.
+    Guarantees:
+    - Creating a Programme without degree_type defaults to "UNDERGRADUATE" (per schema).
+    - Creating a Programme with explicit degree_type preserves the provided value.
+    - Model default and service default agree on "UNDERGRADUATE".
+    - makemigrations --check --dry-run reports no unmigrated schema changes.
+    """
+
+    def setUp(self):
+        self.college = College.objects.create(name="College C", code="COL-C", contact_email="admin@c.edu")
+        self.admin = User.objects.create_user(
+            username="admin_deg_type",
+            email="admin@col-c.edu",
+            password="Password123!",
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.admin)
+
+    def test_creating_programme_without_degree_type_defaults_to_undergraduate_via_api(self):
+        url = reverse("academics:programme-list")
+        res = self.client.post(url, {
+            "name": "Bachelor of Arts",
+            "code": "BA-DEF",
+            "duration_semesters": 6,
+            "college": self.college.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        prog = Programme.objects.get(code="BA-DEF", college=self.college)
+        self.assertEqual(prog.degree_type, "UNDERGRADUATE")
+
+    def test_creating_programme_without_degree_type_defaults_to_undergraduate_via_service(self):
+        from apps.academics.services import create_programme
+        prog = create_programme(
+            college_id=self.college.id,
+            validated_data={
+                "name": "Bachelor of Science",
+                "code": "BSC-DEF",
+                "duration_semesters": 6,
+            },
+        )
+        self.assertEqual(prog.degree_type, "UNDERGRADUATE")
+
+    def test_creating_programme_with_explicit_degree_type_preserves_value(self):
+        url = reverse("academics:programme-list")
+        res = self.client.post(url, {
+            "name": "Diploma in IT",
+            "code": "DIP-IT",
+            "duration_semesters": 2,
+            "degree_type": "DIPLOMA",
+            "college": self.college.id,
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        prog = Programme.objects.get(code="DIP-IT", college=self.college)
+        self.assertEqual(prog.degree_type, "DIPLOMA")
+
+        from apps.academics.services import create_programme
+        prog2 = create_programme(
+            college_id=self.college.id,
+            validated_data={
+                "name": "Master of Arts",
+                "code": "MA-POL",
+                "duration_semesters": 4,
+                "degree_type": "POSTGRADUATE",
+            },
+        )
+        self.assertEqual(prog2.degree_type, "POSTGRADUATE")
+
+    def test_model_default_and_service_default_agree(self):
+        from apps.academics.services import create_programme
+        model_default = Programme._meta.get_field("degree_type").default
+        self.assertEqual(model_default, "UNDERGRADUATE")
+
+        prog = create_programme(
+            college_id=self.college.id,
+            validated_data={
+                "name": "Model Default Match",
+                "code": "MOD-DEF",
+                "duration_semesters": 6,
+            },
+        )
+        self.assertEqual(prog.degree_type, model_default)
+
+    def test_no_database_migration_required(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        out = StringIO()
+        err = StringIO()
+        try:
+            call_command("makemigrations", "--check", "--dry-run", stdout=out, stderr=err)
+        except SystemExit as exc:
+            self.fail(f"makemigrations --check --dry-run failed with exit code {exc.code}: {out.getvalue()} {err.getvalue()}")

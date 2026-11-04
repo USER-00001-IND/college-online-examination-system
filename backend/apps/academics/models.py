@@ -82,8 +82,12 @@ class AcademicSession(models.Model):
         if self.start_date and self.end_date and self.start_date >= self.end_date:
             raise ValidationError({"end_date": "Academic session start_date must precede end_date."})
         if self.pk:
-            orig = AcademicSession.objects.filter(pk=self.pk).values("college_id").first()
+            orig = AcademicSession.objects.filter(pk=self.pk).values("college_id", "is_current").first()
             if orig and orig["college_id"] != self.college_id:
+                if orig["is_current"] or self.is_current:
+                    raise ValidationError({
+                        "college": "A current academic session cannot be reassigned to another college."
+                    })
                 if self.paper_offerings.exists():
                     raise ValidationError({
                         "college": "Cannot change academic session college while dependent paper offerings exist."
@@ -491,6 +495,13 @@ class PaperOffering(models.Model):
                 errors["subject"] = "Subject department does not belong to the same college as the academic session."
             if cat_college_id != session_college_id:
                 errors["subject_category"] = "Subject category does not belong to the same college as the academic session."
+
+            if hasattr(self.semester, "programme") and self.semester.programme:
+                if self.semester.semester_number > self.semester.programme.duration_semesters:
+                    errors["semester"] = (
+                        f"Semester number ({self.semester.semester_number}) exceeds programme duration "
+                        f"({self.semester.programme.duration_semesters})."
+                    )
 
         # Common-paper invariant: cannot set is_common_paper=False while programme mappings exist
         if self.pk and not self.is_common_paper:

@@ -106,6 +106,13 @@ class AcademicSessionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "end_date": "Academic session start_date must precede end_date."
             })
+
+        proposed_college = attrs.get("college")
+        if self.instance and proposed_college and proposed_college.pk != self.instance.college_id:
+            if getattr(self.instance, "is_current", False):
+                raise serializers.ValidationError({
+                    "college": "A current academic session cannot be reassigned to another college."
+                })
         return attrs
 
     def create(self, validated_data):
