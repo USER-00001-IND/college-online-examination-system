@@ -1,15 +1,15 @@
 # Architectural Decision Proposal: Administrator-to-College Membership Architecture
-## Final Architecture Reconciliation — Lock Hierarchy, Academic Visibility and Audit Guarantees
+## Final Service-Layer Implementation Reconciliation — Security, Trust Boundaries and Concurrency
 
 **Project:** College Online Examination System  
 **Academic Context:** Gauhati University FYUGP Context (College Level)  
 **Target Domain:** Domain A: Identity, Authentication & Role-Based Access Control  
-**Document ID:** `PROP-CHUNK-06-ADMIN-MEMBERSHIP-FINAL-RECONCILED`  
-**Status:** **FINAL RECONCILIATION — PENDING INDEPENDENT ARCHITECTURE AUDIT AND PROJECT-OWNER APPROVAL**  
+**Document ID:** `PROP-CHUNK-06-ADMIN-MEMBERSHIP-FINAL-RECONCILED-R2`  
+**Status:** **FINAL SERVICE-LAYER RECONCILIATION — PENDING INDEPENDENT AUDIT AND PROJECT-OWNER APPROVAL**  
 **Author:** Antigravity Engineering Team  
 **Date:** 2026-11-04  
-**Last Independently Audited Commit:** `c3a24c0a488390e3f40259a1ddcc78d0ac1dbf89`  
-**Impacted Stage:** Chunk 06 (Student and Faculty Management) / Chunk 04 RBAC Integration  
+**Last Independently Audited Commit:** `97e745b94ea1075ed91a091353addb4869eaf14a`  
+**Impacted Stages:** Chunk 06 (Student & Faculty Management) / Chunk 05 (FYUGP Academic Architecture) / Chunk 04 (RBAC)  
 
 ---
 
@@ -32,7 +32,8 @@ During the Chunk 06 technical audits, ephemeral caller-injected Python attribute
 | **Round 2 (`PROP-...-002`)** | CONDITIONAL PASS | Preferred Option B retained; identified 3 remaining specification gaps: Read-operation scoping, in-flight transaction synchronization, durable audit retention. |
 | **Final Addendum (`PROP-...-FINAL-ADDENDUM`)** | CONDITIONAL PASS | Delivered 2D read/write RBAC, service locking matrix, audit retention policy analysis; identified 4 targeted refinement findings (P4-A through P4-D). |
 | **Round 4 Revision (`PROP-...-FINAL`)** | CONDITIONAL PASS | Addressed P4-A through P4-D. Audited commit `74862dd18724524915be8c997cfb9374c33b9eff`. Identified 3 reconciliation gaps (P5-A, P5-B, P5-C). |
-| **Final Reconciliation (Current)** | **PENDING REVIEW** | Resolves Findings P5-A, P5-B, and P5-C. Authoritative 34-service lock inventory; compatibility strategy evaluation; Strategy C lock family recommendation; catalogue browsing baseline retention; dual audit durability mechanics. Audited commit `c3a24c0a488390e3f40259a1ddcc78d0ac1dbf89`. |
+| **Round 5 Reconciliation (`PROP-...-FINAL-RECONCILED`)** | REVISION REQUIRED | Addressed P5-A through P5-C. Audited commit `c3a24c0a488390e3f40259a1ddcc78d0ac1dbf89`. Identified 4 implementation and trust-boundary findings (P6-A, P6-B, P6-C, P6-D). |
+| **Round 6 Service-Layer Reconciliation (Current)** | **PENDING REVIEW** | Resolves Findings P6-A, P6-B, P6-C, and P6-D. Rigorous 5-category service implementation taxonomy (Categories A–E); mandatory transaction-level revocation serialization protocol; Chunk 05 service-layer trust-boundary analysis (Option 1 Retrofit vs Option 2 API Contract); source-verified PaperOffering read visibility baseline; and unified `academic.config.read` operation identifier consistency. Audited commit `97e745b94ea1075ed91a091353addb4869eaf14a`. |
 
 ### 1.3 Resolution Summary of Targeted Findings (P4-A through P4-D)
 
@@ -43,7 +44,7 @@ During the Chunk 06 technical audits, ephemeral caller-injected Python attribute
 | **P4-C** | **MEDIUM** | The institutional helper returning `set()` for student/faculty accounts conflated administrative authority with legitimate student/faculty self-service and general academic reference data visibility. | Established four independent authorization domains: Domain A (Institutional Admin), Domain B (Student Self-Service), Domain C (Faculty Self-Service), and Domain D (General Academic Read Access). Proved self-service never depends on administrative membership. *(Section 14.6, 14.7, 14.8)* |
 | **P4-D** | **MEDIUM** | Single atomic audit transaction model fails for rejected security attempts (rollback erases the rejection event); append-only database table was loosely described as tamper-evident non-repudiation. | Formulated dual audit transaction semantics: atomic commit for successful mutations; separate structured security logging sink for rejected authorization attempts. Accurately disclaimed cryptographic tamper-evidence and mapped Table 51 columns. *(Section 12, Section 14.9, 14.10, 14.11)* |
 
-### 1.4 Resolution Summary of Final Reconciliation Findings (P5-A through P5-C)
+### 1.4 Resolution Summary of Lock Hierarchy Findings (P5-A through P5-C)
 
 | Finding | Severity | Defect Analysis & Root Cause | Reconciled Resolution & Document Section |
 | :---: | :---: | :--- | :--- |
@@ -51,8 +52,17 @@ During the Chunk 06 technical audits, ephemeral caller-injected Python attribute
 | **P5-B** | **MEDIUM** | Section 14.8 declared that `PaperOffering` records should be restricted to enrolled students and assigned faculty, introducing an unapproved policy change that broke student pre-enrolment syllabus browsing and curriculum planning under NEP 2020 / Gauhati University FYUGP. | Preserved Visibility Option 1 (Academic Catalogue Browsing Baseline) as approved in Chunk 05 (`IsAcademicAdminOrReadOnly`). Formulated Visibility Option 2 (Restricted Visibility) as an explicit open decision on the Project-Owner Checklist. *(Section 14.8, Section 15.7, 15.8)* |
 | **P5-C** | **LOW** | The relationship between atomic database transactions and rejected security event durability was ambiguous, and append-only database permissions required rigorous tamper-evidence boundary clarification. | Explicitly codified dual-persistence mechanics: successful mutations commit atomically with Table 51 (`SystemAuditLog`) in the same `@transaction.atomic` block; rejected security attempts (which trigger transaction rollback) are durably recorded via sanitized structured logging (`college.accounts.security`) or an out-of-band sink. Honestly disclaimed cryptographic proofs and root/DBA tamper resistance. Retained Policy A vs Policy B as an owner choice. *(Section 12, Section 15.9–15.11)* |
 
+### 1.5 Resolution Summary of Service-Layer Implementation Findings (P6-A through P6-D)
+
+| Finding | Severity | Defect Analysis & Root Cause | Reconciled Resolution & Document Section |
+| :---: | :---: | :--- | :--- |
+| **P6-A** | **HIGH** | Section 15.5 previously stated that several administrative services require "only authorization check updates", but an unlocked permission lookup before a transaction cannot prevent an ordinary administrator from mutating data after their revocation has committed. | Reclassified every affected service into an authoritative 5-category taxonomy (Categories A–E). Codified mandatory transaction-level revocation serialization protocol: Level 1 College coordination locks must be acquired prior to or in conjunction with membership re-validation under lock. Documented exact locking, user parameters, and deadlock safety for all affected services. *(Section 16.1, 16.2)* |
+| **P6-B** | **HIGH** | The proposal promised that all Chunk 05 services would remain completely untouched, while simultaneously declaring that all institutional mutations must enforce service-layer operation authorization. In reality, approved Chunk 05 services do not receive an acting User. | Formulated an explicit architectural decision: Option 1 (Coordinated Minimal Service-Layer Retrofit — Recommended, subject to owner approval) vs. Option 2 (API-Layer Authorization Contract). Built a comprehensive 12-entity ViewSet/Serializer/Service call-path inventory. Explicitly documented that Option 1 requires formal project-owner approval to reopen Chunk 05 for signature updates and regression re-audit. *(Section 16.3–16.6)* |
+| **P6-C** | **MEDIUM** | Section 14.8 and 15.7 stated that the catalogue allows browsing active PaperOffering records within the user's college. In source code, `PaperOfferingViewSet` performs an unfiltered `select_related(...).prefetch_related(...).all()` with no default `is_active=True` or `college` filter. | Corrected the baseline description to match verified source reality. Formulated four distinct policy options: Option 1 (Preserve current implementation baseline), Option 2 (Active-only catalogue), Option 3 (Institution-scoped catalogue), and Option 4 (Programme/assignment restricted). Retained Option 1 as baseline and submitted Options 2–4 to the owner. *(Section 14.8, Section 16.7, 16.8)* |
+| **P6-D** | **LOW** | The proposal inconsistently used `academic.config.view` in some sections and `academic.config.read` in the operation registry. | Standardized exclusively on `academic.config.read` throughout the proposal, matrices, and service mappings. Reconfirmed that all 25 operations match the registered registry and unknown operations fail closed. *(Section 8.1, 8.2, 14.8, 16.9)* |
+
 > [!IMPORTANT]
-> **Governance Boundary:** This document is an **architecture proposal only**. Implementation authorization is **NOT GRANTED**. No Django models, migrations, serializers, or services have been modified. Protected architecture documents ([`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md), [`docs/development-progress.md`](file:///home/zero/Documents/college/docs/development-progress.md)) remain 100% untouched.
+> **Governance Boundary:** This document is an **architecture proposal only**. Implementation authorization is **NOT GRANTED**. No Django models, migrations, serializers, views, or services have been modified. Protected architecture documents ([`design.md`](file:///home/zero/Documents/college/design.md), [`handover.txt`](file:///home/zero/Documents/college/handover.txt), [`docs/architecture.md`](file:///home/zero/Documents/college/docs/architecture.md), [`docs/database-architecture.md`](file:///home/zero/Documents/college/docs/database-architecture.md), [`docs/development-progress.md`](file:///home/zero/Documents/college/docs/development-progress.md)) remain 100% untouched.
 
 ---
 
@@ -88,7 +98,7 @@ In the approved 52-table schema ([`docs/database-architecture.md`](file:///home/
 * **Evaluation:**
   - *Advantages:* Zero-join resolution (`request.user.college_id`); minimal query latency.
   - *Deficiencies:*
-    1. *Rigid 1:1 Cardinality:* Gauhati University affiliated colleges frequently share administrative personnel (e.g., regional university examination observers, roving nodal officers, cluster college administrators). Option A mechanically prohibits multi-college administration without creating duplicate user accounts (two separate emails and logins), violating single-identity principles.
+    1. *Rigid 1:1 Cardinality:* Affiliated colleges frequently share administrative personnel (e.g., regional university examination observers, roving nodal officers, cluster college administrators). Option A mechanically prohibits multi-college administration without creating duplicate user accounts (two separate emails and logins), violating single-identity principles.
     2. *Schema Redundancy & Data Inconsistency:* Both `StudentProfile` (Table 6) and `FacultyProfile` (Table 7) already maintain authoritative `college_id` foreign keys. If `accounts_user.college_id` is added, it creates duplicate sources of truth. If a student's `accounts_user.college_id` differs from `student_profile.college_id`, an irreconcilable data conflict arises. If left `NULL` for students and faculty, Table 1 permanently stores a sparse, role-polluted column.
     3. *High Migration & Table Lock Risk:* Table 1 (`accounts_user`) is the central, highest-traffic table in the system, referenced by 14 foreign keys across 9 domains. Executing an `ALTER TABLE` on production MySQL requires metadata locks and risks table locking.
     4. *Lack of Lifecycle & Audit Metadata:* Cannot track appointment dates, granting superadministrators, or revocation justifications.
@@ -120,7 +130,7 @@ In the approved 52-table schema ([`docs/database-architecture.md`](file:///home/
 
 ## 4. Recommended Architecture Overview (Option B)
 
-The proposed architecture adopts **Option B** enhanced with a **Two-Dimensional Institutional Authorization System** (resolving Findings P2-A, P3-A, P4-A, and P5-A).
+The proposed architecture adopts **Option B** enhanced with a **Two-Dimensional Institutional Authorization System** (resolving Findings P2-A, P3-A, P4-A, P5-A, and P6-A).
 
 Administrative authority requires satisfying two distinct dimensions simultaneously:
 $$\text{Authorized Operation} \iff \text{Dimension 1 (Institution Scope)} \land \text{Dimension 2 (Role Permission)}$$
@@ -345,10 +355,10 @@ class AdministrativeMembership(models.Model):
 
 ---
 
-## 8. Two-Dimensional Read & Write Authorization System (Finding P3-A, P4-A)
+## 8. Two-Dimensional Read & Write Authorization System (Finding P3-A, P4-A, P6-D)
 
 ### 8.1 Explicit Operation Identifiers (Read & Write)
-The institutional authorization system registers **25 operations** across 6 domains:
+The institutional authorization system registers **25 operations** across 6 domains, using consistent identifier `academic.config.read` (Finding P6-D):
 
 ```python
 VALID_INSTITUTIONAL_OPERATIONS = {
@@ -384,7 +394,7 @@ VALID_INSTITUTIONAL_OPERATIONS = {
     "enrollment.record.manage",
     
     # Domain F: Configuration & Administration
-    "academic.config.view",
+    "academic.config.read",     # Standardized identifier (Finding P6-D)
     "academic.config.manage",
     "admin.membership.view",
     "admin.membership.manage",
@@ -416,12 +426,12 @@ VALID_INSTITUTIONAL_OPERATIONS = {
 | `academic.faculty_assignment.manage` | ALLOW (All) | ALLOW (Assigned) | ALLOW (Assigned) | DENY | DENY | DENY |
 | `enrollment.record.view` | ALLOW (All) | ALLOW (Assigned) | ALLOW (Assigned) | DENY | DENY | DENY |
 | `enrollment.record.manage` | ALLOW (All) | ALLOW (Assigned) | ALLOW (Assigned) | DENY | DENY | DENY |
-| `academic.config.view` | ALLOW (All) | ALLOW (Assigned) | DENY | DENY | DENY | DENY |
+| `academic.config.read` | ALLOW (All) | ALLOW (Assigned) | DENY | DENY | DENY | DENY |
 | `academic.config.manage` | ALLOW (All) | ALLOW (Assigned) | DENY | DENY | DENY | DENY |
 | `admin.membership.view` | ALLOW (All) | ALLOW (Assigned) | DENY | DENY | DENY | DENY |
 | `admin.membership.manage` | ALLOW (All) | DENY | DENY | DENY | DENY | DENY |
 
-*(Note: Student and Faculty self-service access is formally decoupled into Domain B and Domain C; see Section 14.6 and 14.7. Academic offering catalogue browsing baseline is detailed in Section 14.8 and Section 15.7).*
+*(Note: Student and Faculty self-service access is formally decoupled into Domain B and Domain C; see Section 14.6 and 14.7. Academic offering catalogue browsing baseline is detailed in Section 14.8 and Section 16.7).*
 
 ### 8.3 Multi-College Administrator Role Differences Scenario Analysis
 Consider an administrator user ($U_1$) holding active memberships across two institutions:
@@ -523,12 +533,12 @@ def get_authorized_college_ids_for_operation(
 
 ## 9. Comprehensive Service Transaction Lock Hierarchy
 
-To eliminate cross-workflow lock conflicts while preserving existing approved Chunk 05 services, the architecture establishes **Strategy C: Outer Coordination Protocol with Preserved Internal Academic Lock Families** (Finding P5-A):
+To eliminate cross-workflow lock conflicts while reconciling existing approved Chunk 05 services, the architecture establishes **Strategy C: Outer Coordination Protocol with Preserved Internal Academic Lock Families** (Finding P5-A, P6-A):
 
 $$\text{Outer Coordination Tier: } \text{Level 1: College Coordination Lock} \longrightarrow \text{Level 2: All Users Lock} \longrightarrow \text{Level 3: Membership Lock}$$
 $$\text{Inner Domain Tier: Executed strictly under Level 1 College Coordination Lock}$$
 
-Because Level 1 College Coordination Lock (`lock_colleges(*sorted_ids)`) is acquired in strictly ascending primary-key order at the start of every write transaction, concurrent transactions within the same college are serialized, and multi-college transactions acquire locks in identical global order. This guarantees acyclic execution and zero deadlocks.
+Because Level 1 College Coordination Lock (`lock_colleges(*sorted_ids)`) is acquired in strictly ascending primary-key order at the start of every write transaction, concurrent transactions within the same college are serialized, and multi-college transactions acquire locks in identical global order. This guarantees acyclic execution and zero deadlocks across all participating transactions.
 
 ---
 
@@ -553,7 +563,7 @@ Because Level 1 College Coordination Lock (`lock_colleges(*sorted_ids)`) is acqu
 
 ---
 
-## 11. Multi-Connection MySQL Concurrency Test Design
+## 11. Multi-Connection MySQL Concurrency Test Design & Limitations
 
 The following 11 real multi-connection integration tests are specified for post-approval implementation, using `TransactionTestCase` with multiple independent database connections:
 
@@ -574,6 +584,9 @@ The following 11 real multi-connection integration tests are specified for post-
 | test_deadlock_detection_and_recovery | Intentional cross-operation lock contention verifies retry. |
 +----------------------------------------------------------------------------------------------------+
 ```
+
+> [!NOTE]
+> **Testing Status Boundary:** These tests are **specifications for post-approval implementation**. No tests have been executed or claimed to pass during this documentation-only revision. Actual MySQL 8 InnoDB multi-connection execution will occur during Chunk 06 Round 6 implementation.
 
 ---
 
@@ -652,7 +665,7 @@ def authorize_institutional_operation(
 ### 14.3 Unified Global Transaction Lock Hierarchy (Historical Context & Finding P4-B)
 To eliminate cross-workflow lock conflicts, Round 4 defined a global hierarchy:
 Level 1 College $\rightarrow$ Level 2 All Users (Ascending PK) $\rightarrow$ Level 3 Membership (Ascending PK) $\rightarrow$ Level 4 Academic Parents $\rightarrow$ Level 5 Academic Children.
-As reconciled under Finding P5-A in Section 15, Level 4 and Level 5 are formally structured as **Domain Lock Families** executed under Level 1 College Coordination Lock.
+As reconciled under Finding P5-A in Section 15 and Finding P6-A in Section 16, Level 4 and Level 5 are formally structured as **Domain Lock Families** executed under Level 1 College Coordination Lock.
 
 ### 14.4 Membership Mutation Lock Sequences
 1. **Grant Membership:** Level 1 College $\rightarrow$ Level 2 `sorted([superadmin.pk, target_user.pk])` $\rightarrow$ Level 3 (New row created under lock).
@@ -688,11 +701,11 @@ Faculty self-service is formally isolated from administrative RBAC:
 - **Prohibited:** Faculty cannot modify institutional fields (designation, department, examiner eligibility).
 - **Isolation Guarantee:** A faculty profile never confers administrative review or mutation privileges.
 
-### 14.8 General Academic Read-Access Treatment (Domain D) (Findings P4-C & P5-B)
+### 14.8 General Academic Read-Access Treatment (Domain D) (Findings P4-C, P5-B & P6-C, P6-D)
 Academic reference data visibility is governed by its own reference policy:
 - **Public Reference Data (All Authenticated Users):** `Programme`, `Semester`, `Subject`, `AcademicSession` are readable across colleges to facilitate syllabus inquiries and curriculum browsing.
-- **Academic Offering Catalogue Browsing Baseline (Finding P5-B):** In accordance with approved Chunk 05 baseline ([`BaseAcademicViewSet`](file:///home/zero/Documents/college/backend/apps/academics/views.py#L59) and [`IsAcademicAdminOrReadOnly`](file:///home/zero/Documents/college/backend/apps/academics/permissions.py#L16)), active authenticated students and faculty can list and view all `PaperOffering` records within their college/deployment. This enables student course planning and elective discovery before enrolment under FYUGP regulations. Restricted visibility (Option 2) is submitted to the owner for formal policy decision (see Section 15.7 and Section 15.8).
-- **Protected Configuration:** `InstitutionalConfig` is barred from general read access; restricted strictly to institutional administrators holding `academic.config.view`.
+- **Academic Offering Catalogue Browsing Baseline (Finding P5-B, P6-C):** In the verified Chunk 05 implementation ([`BaseAcademicViewSet`](file:///home/zero/Documents/college/backend/apps/academics/views.py#L59) and [`IsAcademicAdminOrReadOnly`](file:///home/zero/Documents/college/backend/apps/academics/permissions.py#L16)), active authenticated users can query `PaperOfferingViewSet` across the deployment without default `is_active=True` or `college` filtering unless explicitly provided by query parameters. Policy options for scoping this catalogue are detailed in Section 16.7 and Section 16.8.
+- **Protected Configuration:** `InstitutionalConfig` is barred from general read access; restricted strictly to institutional administrators holding `academic.config.read` (Finding P6-D).
 
 ### 14.9 Audit Transaction Semantics (Finding P4-D & P5-C)
 Under Policy A, successful administrative mutations and audit events commit atomically:
@@ -750,42 +763,42 @@ The following authoritative inventory was constructed via exhaustive line-by-lin
 
 | Function Name | Source Location | Transaction Boundary | Initial Unlocked Candidate Reads | Actual Lock Acquisition Sequence | Parent Records Locked | Child Records Locked | Candidate College Checks | Potential Lock Inversion | Adjustment Needed? | Separate Owner Auth Required? |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `update_paper_offering` | [`academics/services.py:549-728`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L549-L728) | `@transaction.atomic` | `po_rels = PaperOffering.values(...)` | 1. College(s) (Ascending PK)<br>2. PaperOffering<br>3. PaperProgrammeMapping (`order_by('pk')`)<br>4. SubjectCategory<br>5. Semester & Programme<br>6. Subject & Department<br>7. AcademicSession | College, SubjectCategory, Programme, Department, AcademicSession | PaperOffering, PaperProgrammeMapping, Semester, Subject | Locked parent colleges matched against acquired College locks | Inverts flat order (PaperOffering locked before Programme, Dept, Session) | **None.** Internal order is internally consistent and serialized by College lock | No (Chunk 05 approved code preserved) |
-| `create_paper_programme_mapping` | [`academics/services.py:374-435`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L374-L435) | `@transaction.atomic` | Offering college ID & Programme college ID | 1. College(s) (Ascending PK)<br>2. PaperOffering<br>3. Programme<br>4. Semester | College, Programme | PaperOffering, Semester, Mapping (New) | Cross-college check under lock (`prog.cid == off.cid`) | PaperOffering locked before Programme | **None.** Preserved as Family 1 | No |
-| `update_paper_programme_mapping` | [`academics/services.py:438-527`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L438-L527) | `@transaction.atomic` | Mapping, Offering & Programme college IDs | 1. College(s) (Ascending PK)<br>2. PaperOffering(s) (`order_by('pk')`)<br>3. PaperProgrammeMapping<br>4. Target Programme<br>5. Target Semester | College, Programme | PaperOffering, PaperProgrammeMapping, Semester | Cross-college check under lock | PaperOffering locked before Programme | **None.** Preserved as Family 1 | No |
-| `delete_paper_programme_mapping` | [`academics/services.py:530-547`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L530-L547) | `@transaction.atomic` | Mapping offering & college ID | 1. College<br>2. PaperOffering<br>3. PaperProgrammeMapping | College | PaperOffering, PaperProgrammeMapping | College ownership revalidated | None | **None.** Preserved as Family 1 | No |
-| `create_paper_offering` | [`academics/services.py:157-263`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L157-L263) | `@transaction.atomic` | Session, Semester, Subject, Category college IDs | 1. College(s) (Ascending PK)<br>2. AcademicSession, Semester, Programme, Subject, Department, SubjectCategory<br>3. PaperOffering (New) | College, AcademicSession, Programme, Department, SubjectCategory | Semester, Subject, PaperOffering (New) | Cross-college validation under lock | None | **None.** Preserved | No |
-| `map_paper_to_programmes` | [`academics/services.py:291-371`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L291-L371) | `@transaction.atomic` | Candidate college IDs of offering & programmes | 1. College(s) (Ascending PK)<br>2. PaperOffering<br>3. Semester<br>4. Existing Mappings (`order_by('pk')`)<br>5. Target Programmes (`order_by('pk')`) | College, Programme | PaperOffering, Semester, PaperProgrammeMapping | Cross-college validation under lock | PaperOffering locked before Programme | **None.** Preserved as Family 1 | No |
-| `create_programme` | [`academics/services.py:731-770`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L731-L770) | `@transaction.atomic` | None | 1. College<br>2. Programme (New) | College | Programme (New) | Direct college ID check | None | **None.** Preserved as Family 2 | No |
-| `update_programme` | [`academics/services.py:773-848`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L773-L848) | `@transaction.atomic` | Initial programme `college_id` | 1. College(s) (Ascending PK)<br>2. Programme | College | Programme | Checked college change against dependent records | None | **None.** Preserved as Family 2 | No |
-| `create_semester` | [`academics/services.py:851-891`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L851-L891) | `@transaction.atomic` | Programme `college_id` | 1. College<br>2. Programme<br>3. Semester (New) | College, Programme | Semester (New) | Programme ownership verified | None | **None.** Preserved as Family 2 | No |
-| `update_semester` | [`academics/services.py:894-971`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L894-L971) | `@transaction.atomic` | Current/target programme & college IDs | 1. College(s) (Ascending PK)<br>2. Programme(s) (Ascending PK)<br>3. Semester | College, Programme | Semester | Programme reassignment college check | None | **None.** Preserved as Family 2 | No |
-| `create_department` | [`academics/services.py:974-1000`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L974-L1000) | `@transaction.atomic` | None | 1. College<br>2. Department (New) | College | Department (New) | Direct college check | None | **None.** Preserved as Family 2 | No |
-| `update_department` | [`academics/services.py:1004-1038`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1004-L1038) | `@transaction.atomic` | Current/proposed `college_id` | 1. College(s) (Ascending PK)<br>2. Department | College | Department | Reassignment blocked if offerings/faculty exist | None | **None.** Preserved as Family 2 | No |
-| `create_subject` | [`academics/services.py:1041-1071`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1041-L1071) | `@transaction.atomic` | Department `college_id` | 1. College<br>2. Department<br>3. Subject (New) | College, Department | Subject (New) | Department college verified | None | **None.** Preserved as Family 2 | No |
-| `update_subject` | [`academics/services.py:1074-1116`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1074-L1116) | `@transaction.atomic` | Current/proposed dept & college IDs | 1. College(s) (Ascending PK)<br>2. Department(s) (Ascending PK)<br>3. Subject | College, Department | Subject | Reassignment blocked if offerings exist | None | **None.** Preserved as Family 2 | No |
-| `create_subject_category` | [`academics/services.py:1119-1158`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1119-L1158) | `@transaction.atomic` | None | 1. College<br>2. SubjectCategory (New) | College | SubjectCategory (New) | Direct college check | None | **None.** Preserved as Family 2 | No |
-| `update_subject_category` | [`academics/services.py:1161-1221`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1161-L1221) | `@transaction.atomic` | Current/proposed `college_id` | 1. College(s) (Ascending PK)<br>2. SubjectCategory | College | SubjectCategory | Reassignment blocked if offerings exist | None | **None.** Preserved as Family 2 | No |
-| `create_academic_session` | [`academics/services.py:1224-1257`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1224-L1257) | `@transaction.atomic` | None | 1. College<br>2. AcademicSession (New) | College | AcademicSession (New) | Direct college check | None | **None.** Preserved as Family 2 | No |
-| `update_academic_session` | [`academics/services.py:1260-1304`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1260-L1304) | `@transaction.atomic` | Current/proposed `college_id` | 1. College(s) (Ascending PK)<br>2. AcademicSession | College | AcademicSession | Reassignment blocked if offerings exist | None | **None.** Preserved as Family 2 | No |
-| `set_current_academic_session` | [`academics/services.py:62-85`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L62-L85) | `@transaction.atomic` | None | 1. College<br>2. AcademicSession | College | AcademicSession | Verified session belongs to college | None | **None.** Preserved as Family 2 | No |
-| `set_institutional_config` | [`academics/services.py:1340-1410`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1340-L1410) | `@transaction.atomic` | None | 1. College<br>2. InstitutionalConfig | College | InstitutionalConfig | Verified college match | None | **None.** Preserved as Family 6 | No |
-| `delete_institutional_config` | [`academics/services.py:1490-1525`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1490-L1525) | `@transaction.atomic` | Config `college_id` | 1. College<br>2. InstitutionalConfig | College | InstitutionalConfig | Verified college match | None | **None.** Preserved as Family 6 | No |
-| `assign_faculty_to_paper` | [`academics/services.py:1527-1600`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1527-L1600) | `@transaction.atomic` | Candidate offering & college ID | 1. College<br>2. PaperOffering<br>3. FacultyProfile<br>4. FacultySubjectAssignment (New) | College, FacultyProfile | PaperOffering, Assignment (New) | Verified faculty & offering match college | Locks PaperOffering before FacultyProfile | Update auth check to `academic.faculty_assignment.manage` | No (Chunk 06 service) |
-| `update_faculty_assignment` | [`academics/services.py:1663-1790`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1663-L1790) | `@transaction.atomic` | Initial assignment, faculty, offering IDs | 1. College(s) (Ascending PK)<br>2. PaperOffering(s) (Ascending PK)<br>3. FacultyProfile(s) (Ascending PK)<br>4. FacultySubjectAssignment | College, FacultyProfile | PaperOffering, Assignment | Reconcile candidate vs locked snapshot | Locks PaperOffering before FacultyProfile | Update auth check to `academic.faculty_assignment.manage` | No (Chunk 06 service) |
-| `delete_faculty_assignment` | [`academics/services.py:1603-1660`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1603-L1660) | `@transaction.atomic` | Initial assignment & offering IDs | 1. College<br>2. PaperOffering<br>3. FacultySubjectAssignment | College | PaperOffering, Assignment | Reconcile candidate vs locked snapshot | None | Update auth check to `academic.faculty_assignment.manage` | No (Chunk 06 service) |
-| `create_faculty_profile` | [`faculty/services.py:22-97`](file:///home/zero/Documents/college/backend/apps/faculty/services.py#L22-L97) | `@transaction.atomic` | None | 1. College<br>2. Department (Read under lock)<br>3. User & FacultyProfile (New) | College, Department | User, FacultyProfile (New) | Department college verified | None | Update auth check to `faculty.account.provision` | No (Chunk 06 service) |
-| `update_faculty_profile` | [`faculty/services.py:100-212`](file:///home/zero/Documents/college/backend/apps/faculty/services.py#L100-L212) | `@transaction.atomic` | Initial profile `college_id`, `dept_id`, `user_id` | 1. College(s) (Ascending PK)<br>2. Department(s) (Ascending PK)<br>3. FacultyProfile | College, Department | FacultyProfile | Profile college verified covered by lock | None | Update auth check to `faculty.profile.manage` | No (Chunk 06 service) |
-| `register_student` | [`students/services.py:143-244`](file:///home/zero/Documents/college/backend/apps/students/services.py#L143-L244) | `@transaction.atomic` | None (Public onboarding) | 1. College<br>2. Programme (Read)<br>3. User, StudentProfile, Approval, Verification (New) | College, Programme | User, StudentProfile, Approval, Verification | Programme college verified | None | **None.** Public onboarding preserved | No |
-| `verify_email_token` | [`students/services.py:247-276`](file:///home/zero/Documents/college/backend/apps/students/services.py#L247-L276) | `@transaction.atomic` | Token hash lookup | 1. User<br>2. EmailVerification | User | EmailVerification | None (Token based) | None | **None.** Preserved as Family 4 | No |
-| `cleanup_unverified_registration` | [`students/services.py:83-140`](file:///home/zero/Documents/college/backend/apps/students/services.py#L83-L140) | `@transaction.atomic` | None | 1. User<br>2. RegistrationApproval<br>3. EmailVerification<br>4. StudentProfile | User | Approval, Verification, StudentProfile | Verified pending status under lock | None | **None.** Preserved as Family 4 | No |
-| `review_student_registration` | [`students/services.py:279-402`](file:///home/zero/Documents/college/backend/apps/students/services.py#L279-L402) | `@transaction.atomic` | Approval ID, user ID, status | 1. User<br>2. RegistrationApproval<br>3. EmailVerification<br>4. StudentProfile | User | Approval, Verification, StudentProfile | Authority check on student college under lock | User locked before College lock | Add initial candidate read for College, lock College first; update auth check | No (Chunk 06 service) |
-| `update_student_profile` | [`students/services.py:405-462`](file:///home/zero/Documents/college/backend/apps/students/services.py#L405-L462) | `@transaction.atomic` | Profile `college_id` & `programme_id` | 1. College<br>2. Programme<br>3. StudentProfile | College, Programme | StudentProfile | Authority check on student college | None | Update auth check to `student.profile.manage` | No (Chunk 06 service) |
-| `create_student_academic_record` | [`enrollments/services.py:23-99`](file:///home/zero/Documents/college/backend/apps/enrollments/services.py#L23-L99) | `@transaction.atomic` | Candidate student college ID | 1. College<br>2. StudentProfile<br>3. Programme<br>4. AcademicSession<br>5. StudentAcademicRecord (New) | College, StudentProfile, Programme, AcademicSession | StudentAcademicRecord (New) | Verified programme & session belong to college | Locks StudentProfile before Programme & Session | Update auth check to `enrollment.record.manage` | No (Chunk 06 service) |
-| `update_student_academic_record` | [`enrollments/services.py:102-132`](file:///home/zero/Documents/college/backend/apps/enrollments/services.py#L102-L132) | `@transaction.atomic` | Record PK | 1. StudentAcademicRecord | StudentProfile (via record) | StudentAcademicRecord | Authority check on student college | Does not call `lock_colleges` | Add Level 1 College Coordination Lock via candidate read; update auth check | No (Chunk 06 service) |
-| `grant_administrative_membership` | Proposed `accounts/services.py` | `@transaction.atomic` | College PK, Target User PK | 1. College<br>2. All Users in ascending PK (`sorted([superadmin.pk, target.pk])`)<br>3. AdministrativeMembership (New) | College, User | AdministrativeMembership (New) | Verified Superadmin authority | None | Implement proposed service | No (Pending Chunk 06 Round 6) |
-| `update_administrative_membership` | Proposed `accounts/services.py` | `@transaction.atomic` | Membership PK, College PK | 1. College<br>2. All Users in ascending PK<br>3. AdministrativeMembership | College, User | AdministrativeMembership | Verified Superadmin authority | None | Implement proposed service | No (Pending Chunk 06 Round 6) |
-| `revoke_administrative_membership` | Proposed `accounts/services.py` | `@transaction.atomic` | Membership PK, College PK | 1. College<br>2. All Users in ascending PK<br>3. AdministrativeMembership | College, User | AdministrativeMembership | Verified Superadmin authority | None | Implement proposed service | No (Pending Chunk 06 Round 6) |
+| `update_paper_offering` | [`academics/services.py:549-728`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L549-L728) | `@transaction.atomic` | `po_rels = PaperOffering.values(...)` | 1. College(s) (Ascending PK)<br>2. PaperOffering<br>3. PaperProgrammeMapping (`order_by('pk')`)<br>4. SubjectCategory<br>5. Semester & Programme<br>6. Subject & Department<br>7. AcademicSession | College, SubjectCategory, Programme, Department, AcademicSession | PaperOffering, PaperProgrammeMapping, Semester, Subject | Locked parent colleges matched against acquired College locks | Inverts flat order (PaperOffering locked before Programme, Dept, Session) | **Category C & B.** Service signature addition (`acting_user`) under Option 1 | Yes (Chunk 05 approved code re-audit) |
+| `create_paper_programme_mapping` | [`academics/services.py:374-435`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L374-L435) | `@transaction.atomic` | Offering college ID & Programme college ID | 1. College(s) (Ascending PK)<br>2. PaperOffering<br>3. Programme<br>4. Semester | College, Programme | PaperOffering, Semester, Mapping (New) | Cross-college check under lock (`prog.cid == off.cid`) | PaperOffering locked before Programme | **Category C & B.** Service signature addition (`acting_user`) under Option 1 | Yes (Chunk 05 re-audit) |
+| `update_paper_programme_mapping` | [`academics/services.py:438-527`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L438-L527) | `@transaction.atomic` | Mapping, Offering & Programme college IDs | 1. College(s) (Ascending PK)<br>2. PaperOffering(s) (`order_by('pk')`)<br>3. PaperProgrammeMapping<br>4. Target Programme<br>5. Target Semester | College, Programme | PaperOffering, PaperProgrammeMapping, Semester | Cross-college check under lock | PaperOffering locked before Programme | **Category C & B.** Service signature addition (`acting_user`) under Option 1 | Yes (Chunk 05 re-audit) |
+| `delete_paper_programme_mapping` | [`academics/services.py:530-547`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L530-L547) | `@transaction.atomic` | Mapping offering & college ID | 1. College<br>2. PaperOffering<br>3. PaperProgrammeMapping | College | PaperOffering, PaperProgrammeMapping | College ownership revalidated | None | **Category C & B.** Service signature addition (`acting_user`) under Option 1 | Yes (Chunk 05 re-audit) |
+| `create_paper_offering` | [`academics/services.py:157-263`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L157-L263) | `@transaction.atomic` | Session, Semester, Subject, Category college IDs | 1. College(s) (Ascending PK)<br>2. AcademicSession, Semester, Programme, Subject, Department, SubjectCategory<br>3. PaperOffering (New) | College, AcademicSession, Programme, Department, SubjectCategory | Semester, Subject, PaperOffering (New) | Cross-college validation under lock | None | **Category C & B.** Service signature addition (`acting_user`) under Option 1 | Yes (Chunk 05 re-audit) |
+| `map_paper_to_programmes` | [`academics/services.py:291-371`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L291-L371) | `@transaction.atomic` | Candidate college IDs of offering & programmes | 1. College(s) (Ascending PK)<br>2. PaperOffering<br>3. Semester<br>4. Existing Mappings (`order_by('pk')`)<br>5. Target Programmes (`order_by('pk')`) | College, Programme | PaperOffering, Semester, PaperProgrammeMapping | Cross-college validation under lock | PaperOffering locked before Programme | **Category C & B.** Service signature addition (`acting_user`) under Option 1 | Yes (Chunk 05 re-audit) |
+| `create_programme` | [`academics/services.py:731-770`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L731-L770) | `@transaction.atomic` | None | 1. College<br>2. Programme (New) | College | Programme (New) | Direct college ID check | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `update_programme` | [`academics/services.py:773-848`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L773-L848) | `@transaction.atomic` | Initial programme `college_id` | 1. College(s) (Ascending PK)<br>2. Programme | College | Programme | Checked college change against dependent records | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `create_semester` | [`academics/services.py:851-891`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L851-L891) | `@transaction.atomic` | Programme `college_id` | 1. College<br>2. Programme<br>3. Semester (New) | College, Programme | Semester (New) | Programme ownership verified | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `update_semester` | [`academics/services.py:894-971`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L894-L971) | `@transaction.atomic` | Current/target programme & college IDs | 1. College(s) (Ascending PK)<br>2. Programme(s) (Ascending PK)<br>3. Semester | College, Programme | Semester | Programme reassignment college check | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `create_department` | [`academics/services.py:974-1000`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L974-L1000) | `@transaction.atomic` | None | 1. College<br>2. Department (New) | College | Department (New) | Direct college check | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `update_department` | [`academics/services.py:1004-1038`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1004-L1038) | `@transaction.atomic` | Current/proposed `college_id` | 1. College(s) (Ascending PK)<br>2. Department | College | Department | Reassignment blocked if offerings/faculty exist | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `create_subject` | [`academics/services.py:1041-1071`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1041-L1071) | `@transaction.atomic` | Department `college_id` | 1. College<br>2. Department<br>3. Subject (New) | College, Department | Subject (New) | Department college verified | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `update_subject` | [`academics/services.py:1074-1116`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1074-L1116) | `@transaction.atomic` | Current/proposed dept & college IDs | 1. College(s) (Ascending PK)<br>2. Department(s) (Ascending PK)<br>3. Subject | College, Department | Subject | Reassignment blocked if offerings exist | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `create_subject_category` | [`academics/services.py:1119-1158`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1119-L1158) | `@transaction.atomic` | None | 1. College<br>2. SubjectCategory (New) | College | SubjectCategory (New) | Direct college check | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `update_subject_category` | [`academics/services.py:1161-1221`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1161-L1221) | `@transaction.atomic` | Current/proposed `college_id` | 1. College(s) (Ascending PK)<br>2. SubjectCategory | College | SubjectCategory | Reassignment blocked if offerings exist | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `create_academic_session` | [`academics/services.py:1224-1257`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1224-L1257) | `@transaction.atomic` | None | 1. College<br>2. AcademicSession (New) | College | AcademicSession (New) | Direct college check | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `update_academic_session` | [`academics/services.py:1260-1304`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1260-L1304) | `@transaction.atomic` | Current/proposed `college_id` | 1. College(s) (Ascending PK)<br>2. AcademicSession | College | AcademicSession | Reassignment blocked if offerings exist | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `set_current_academic_session` | [`academics/services.py:62-85`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L62-L85) | `@transaction.atomic` | None | 1. College<br>2. AcademicSession | College | AcademicSession | Verified session belongs to college | None | **Category C & B.** Signature change under Option 1 | Yes (Chunk 05 re-audit) |
+| `set_institutional_config` | [`academics/services.py:1340-1410`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1340-L1410) | `@transaction.atomic` | None | 1. College<br>2. InstitutionalConfig | College | InstitutionalConfig | Verified college match | None | **Category B.** Replace static authority with dynamic operation check under lock | No (Chunk 05 config service) |
+| `delete_institutional_config` | [`academics/services.py:1490-1525`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1490-L1525) | `@transaction.atomic` | Config `college_id` | 1. College<br>2. InstitutionalConfig | College | InstitutionalConfig | Verified college match | None | **Category B.** Dynamic operation check under lock | No (Chunk 05 config service) |
+| `assign_faculty_to_paper` | [`academics/services.py:1527-1600`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1527-L1600) | `@transaction.atomic` | Candidate offering & college ID | 1. College<br>2. PaperOffering<br>3. FacultyProfile<br>4. FacultySubjectAssignment (New) | College, FacultyProfile | PaperOffering, Assignment (New) | Verified faculty & offering match college | Locks PaperOffering before FacultyProfile | **Category B.** Move auth check after `lock_colleges` under lock | No (Chunk 06 service) |
+| `update_faculty_assignment` | [`academics/services.py:1663-1790`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1663-L1790) | `@transaction.atomic` | Initial assignment, faculty, offering IDs | 1. College(s) (Ascending PK)<br>2. PaperOffering(s) (Ascending PK)<br>3. FacultyProfile(s) (Ascending PK)<br>4. FacultySubjectAssignment | College, FacultyProfile | PaperOffering, Assignment | Reconcile candidate vs locked snapshot | Locks PaperOffering before FacultyProfile | **Category B.** Wire `authorize_institutional_operation` under lock | No (Chunk 06 service) |
+| `delete_faculty_assignment` | [`academics/services.py:1603-1660`](file:///home/zero/Documents/college/backend/apps/academics/services.py#L1603-L1660) | `@transaction.atomic` | Initial assignment & offering IDs | 1. College<br>2. PaperOffering<br>3. FacultySubjectAssignment | College | PaperOffering, Assignment | Reconcile candidate vs locked snapshot | None | **Category B.** Wire `authorize_institutional_operation` under lock | No (Chunk 06 service) |
+| `create_faculty_profile` | [`faculty/services.py:22-97`](file:///home/zero/Documents/college/backend/apps/faculty/services.py#L22-L97) | `@transaction.atomic` | None | 1. College<br>2. Department (Read under lock)<br>3. User & FacultyProfile (New) | College, Department | User, FacultyProfile (New) | Department college verified | None | **Category B.** Move auth check under Level 1 College lock | No (Chunk 06 service) |
+| `update_faculty_profile` | [`faculty/services.py:100-212`](file:///home/zero/Documents/college/backend/apps/faculty/services.py#L100-L212) | `@transaction.atomic` | Initial profile `college_id`, `dept_id`, `user_id` | 1. College(s) (Ascending PK)<br>2. Department(s) (Ascending PK)<br>3. FacultyProfile | College, Department | FacultyProfile | Profile college verified covered by lock | None | **Category B.** Wire operation check under lock (Category E for self-update) | No (Chunk 06 service) |
+| `register_student` | [`students/services.py:143-244`](file:///home/zero/Documents/college/backend/apps/students/services.py#L143-L244) | `@transaction.atomic` | None (Public onboarding) | 1. College<br>2. Programme (Read)<br>3. User, StudentProfile, Approval, Verification (New) | College, Programme | User, StudentProfile, Approval, Verification | Programme college verified | None | **Category E.** Public onboarding path | No |
+| `verify_email_token` | [`students/services.py:247-276`](file:///home/zero/Documents/college/backend/apps/students/services.py#L247-L276) | `@transaction.atomic` | Token hash lookup | 1. User<br>2. EmailVerification | User | EmailVerification | None (Token based) | None | **Category E.** Public email token verification | No |
+| `cleanup_unverified_registration` | [`students/services.py:83-140`](file:///home/zero/Documents/college/backend/apps/students/services.py#L83-L140) | `@transaction.atomic` | None | 1. User<br>2. RegistrationApproval<br>3. EmailVerification<br>4. StudentProfile | User | Approval, Verification, StudentProfile | Verified pending status under lock | None | **Category E.** System cleanup workflow | No |
+| `review_student_registration` | [`students/services.py:279-402`](file:///home/zero/Documents/college/backend/apps/students/services.py#L279-L402) | `@transaction.atomic` | Approval ID, user ID, status | 1. User<br>2. RegistrationApproval<br>3. EmailVerification<br>4. StudentProfile | User | Approval, Verification, StudentProfile | Authority check on student college under lock | User locked before College lock | **Category B & D.** Resolve student college, acquire College lock first, sort user locks, check under lock | No (Chunk 06 service) |
+| `update_student_profile` | [`students/services.py:405-462`](file:///home/zero/Documents/college/backend/apps/students/services.py#L405-L462) | `@transaction.atomic` | Profile `college_id` & `programme_id` | 1. College<br>2. Programme<br>3. StudentProfile | College, Programme | StudentProfile | Authority check on student college | None | **Category B.** Wire `authorize_institutional_operation` under lock (Category E for self-update) | No (Chunk 06 service) |
+| `create_student_academic_record` | [`enrollments/services.py:23-99`](file:///home/zero/Documents/college/backend/apps/enrollments/services.py#L23-L99) | `@transaction.atomic` | Candidate student college ID | 1. College<br>2. StudentProfile<br>3. Programme<br>4. AcademicSession<br>5. StudentAcademicRecord (New) | College, StudentProfile, Programme, AcademicSession | StudentAcademicRecord (New) | Verified programme & session belong to college | Locks StudentProfile before Programme & Session | **Category B.** Move auth check after `lock_colleges` under lock | No (Chunk 06 service) |
+| `update_student_academic_record` | [`enrollments/services.py:102-132`](file:///home/zero/Documents/college/backend/apps/enrollments/services.py#L102-L132) | `@transaction.atomic` | Record PK | 1. StudentAcademicRecord | StudentProfile (via record) | StudentAcademicRecord | Authority check on student college | Does not call `lock_colleges` | **Category B.** Add Level 1 `lock_colleges` via candidate read, wire auth check under lock | No (Chunk 06 service) |
+| `grant_administrative_membership` | Proposed `accounts/services.py` | `@transaction.atomic` | College PK, Target User PK | 1. College<br>2. All Users in ascending PK (`sorted([superadmin.pk, target.pk])`)<br>3. AdministrativeMembership (New) | College, User | AdministrativeMembership (New) | Verified Superadmin authority | None | **Category B.** New service under Strategy C | No (Chunk 06 Round 6) |
+| `update_administrative_membership` | Proposed `accounts/services.py` | `@transaction.atomic` | Membership PK, College PK | 1. College<br>2. All Users in ascending PK<br>3. AdministrativeMembership | College, User | AdministrativeMembership | Verified Superadmin authority | None | **Category B.** New service under Strategy C | No (Chunk 06 Round 6) |
+| `revoke_administrative_membership` | Proposed `accounts/services.py` | `@transaction.atomic` | Membership PK, College PK | 1. College<br>2. All Users in ascending PK<br>3. AdministrativeMembership | College, User | AdministrativeMembership | Verified Superadmin authority | None | **Category B.** New service under Strategy C | No (Chunk 06 Round 6) |
 
 ---
 
@@ -870,154 +883,60 @@ flowchart TD
 
 **Formal Recommendation: Strategy C — Outer Coordination Protocol with Preserved Internal Academic Lock Families.**
 
-#### Formal Proof of Deadlock Freedom
+#### Formal Analysis of Concurrency and Limitations
 1. **Intra-College Mutations:**
    Let $T_1$ and $T_2$ be two concurrent write transactions modifying entities belonging to the same college $C_1$.
    Both $T_1$ and $T_2$ MUST invoke `lock_colleges(C_1)` before acquiring any internal entity locks.
    Because InnoDB row-level locks on `academics_college` are exclusive (`FOR UPDATE`), exactly one transaction (e.g. $T_1$) acquires the lock on row $C_1$, while $T_2$ blocks at the college lock boundary.
    $T_1$ executes its complete internal lock sequence (whether Family 1, Family 2, Family 3, or Family 5) to completion and commits, releasing the lock on $C_1$.
    $T_2$ unblocks and executes.
-   Because $T_1$ and $T_2$ cannot hold locks on internal entities simultaneously within $C_1$, the wait-for graph contains **zero edges between internal entities of the same college**. Thus, cyclic lock wait is mathematically impossible.
+   Because $T_1$ and $T_2$ cannot hold locks on internal entities simultaneously within $C_1$, the wait-for graph contains **zero edges between internal entities of the same college**. Thus, cyclic lock wait is prevented.
 
 2. **Inter-College Mutations:**
    Let $T_A$ and $T_B$ be transactions involving multiple colleges (e.g. multi-college membership updates or inter-institutional coordination).
    All services invoke `lock_colleges(*college_ids)`, which strictly sorts candidate college IDs in ascending numeric order:
    $$\text{valid\_ids} = \text{sorted}(\{c_1, c_2, \dots, c_n\})$$
    Both $T_A$ and $T_B$ acquire college locks in identical ascending primary key order ($c_{min} \to c_{max}$).
-   By Dijkstra's Resource Hierarchy theorem, a strictly ordered resource acquisition sequence guarantees an **acyclic resource-allocation graph**. Therefore, cross-college deadlocks are mathematically impossible.
+   By Dijkstra's Resource Hierarchy theorem, a strictly ordered resource acquisition sequence guarantees an **acyclic resource-allocation graph**. Therefore, cross-college deadlocks are mathematically eliminated.
 
 3. **User Account and Membership Coordination:**
    Where operations involve actor and target users (e.g., membership grant, registration review), Level 2 User locks are acquired strictly in sorted ascending primary key order:
    $$\text{sorted\_user\_ids} = \text{sorted}(\{\text{actor.pk}, \text{target.pk}\})$$
    This completely prevents deadlocks between concurrent cross-review or cross-appointment transactions.
 
+4. **Explicit Concurrency Limitations:**
+   Deadlock-freedom guarantees are strictly conditional upon:
+   - All participating write mutations invoking `lock_colleges()` prior to internal entity locks.
+   - Any raw SQL or direct ORM writes outside approved service layers being prohibited.
+   - Transaction retry middleware handling unavoidable transient lock wait timeouts (MySQL Error 1205).
+
 ---
 
-### 15.5 Finding P5-A: Post-Approval Implementation Impact Classification
+### 15.5 Finding P5-A: Post-Approval Implementation Impact Classification (Historical Summary)
 
-Following explicit project governance instructions, implementation impact is partitioned into three strict categories:
-
-#### Category 1: Services Requiring ONLY Authorization Check Updates (Chunk 06)
-These services require zero changes to their existing lock ordering. They simply replace the placeholder `check_college_operation_authority` call with `authorize_institutional_operation(acting_user, college_id, operation)`:
-1. `assign_faculty_to_paper` (`apps/academics/services.py`): Wire operation `"academic.faculty_assignment.manage"`.
-2. `update_faculty_assignment` (`apps/academics/services.py`): Wire operation `"academic.faculty_assignment.manage"`.
-3. `delete_faculty_assignment` (`apps/academics/services.py`): Wire operation `"academic.faculty_assignment.manage"`.
-4. `create_faculty_profile` (`apps/faculty/services.py`): Wire operation `"faculty.account.provision"`.
-5. `update_faculty_profile` (`apps/faculty/services.py`): Wire operation `"faculty.profile.manage"`.
-6. `update_student_profile` (`apps/students/services.py`): Wire operation `"student.profile.manage"`.
-7. `create_student_academic_record` (`apps/enrollments/services.py`): Wire operation `"enrollment.record.manage"`.
-
-#### Category 2: Services Requiring Targeted Lock Adjustments (Chunk 06)
-1. `review_student_registration` (`apps/students/services.py`):
-   - *Current State:* Locks User $\to$ Approval $\to$ Verification $\to$ StudentProfile, then rechecks authority against student's `college_id`.
-   - *Adjustment:* Read candidate `college_id` via initial candidate query `StudentProfile.objects.filter(user_id=target_user_id).values_list('college_id', flat=True).first()`; acquire Level 1 College lock via `lock_colleges(candidate_cid)`; acquire Level 2 Users in ascending PK order (`sorted([reviewer.pk, target_user.pk])`); then lock child records under lock.
-   - *Governance Boundary:* Part of Chunk 06 scope; authorized upon Chunk 06 Round 6 approval.
-2. `update_student_academic_record` (`apps/enrollments/services.py`):
-   - *Current State:* Locks `StudentAcademicRecord` directly without `lock_colleges`.
-   - *Adjustment:* Read candidate `college_id` from candidate record; acquire Level 1 `lock_colleges(candidate_cid)` prior to locking `StudentAcademicRecord`.
-   - *Governance Boundary:* Part of Chunk 06 scope; authorized upon Chunk 06 Round 6 approval.
-
-#### Category 3: Services Requiring ZERO Changes (Chunk 05 Approved Baseline)
-The following 22 services remain 100% untouched, ensuring Chunk 05 stage gate remains closed and protected:
-- `update_paper_offering`
-- `create_paper_offering`
-- `create_paper_programme_mapping`
-- `update_paper_programme_mapping`
-- `delete_paper_programme_mapping`
-- `map_paper_to_programmes`
-- `create_programme`
-- `update_programme`
-- `create_semester`
-- `update_semester`
-- `create_department`
-- `update_department`
-- `create_subject`
-- `update_subject`
-- `create_subject_category`
-- `update_subject_category`
-- `create_academic_session`
-- `update_academic_session`
-- `set_current_academic_session`
-- `set_institutional_config`
-- `delete_institutional_config`
-- `register_student`, `verify_email_token`, `cleanup_unverified_registration` (Public student onboarding workflows)
+Historical Section 15.5 grouped services into preliminary categories. As superseded by Finding P6-A in Section 16.1, services are now authoritatively partitioned across the rigorous 5-category taxonomy (Categories A–E).
 
 ---
 
 ### 15.6 Finding P5-A: MySQL InnoDB Multi-Connection Concurrency Test Suite
 
-The following 11 integration tests are specified for post-approval implementation under `backend/apps/accounts/tests/test_membership_concurrency.py`, using `django.test.TransactionTestCase` with two distinct database connections (`connection1 = connections['default']`, `connection2 = connections['connection2']`):
-
-```
-+-----------------------------------------------------------------------------------------------------------------------------------------+
-| Test Scenario Identifier                     | Transaction 1 (Connection 1)               | Transaction 2 (Connection 2)                | Expected Concurrency Outcome           |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_revocation_vs_registration   | Superadmin executes revoke membership on   | Admin attempts registration approval on     | T2 blocks on College/User lock; upon   |
-|                                              | College 1.                                 | College 1.                                  | unblocking, detects revocation & 403.  |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_revocation_vs_faculty_prov   | Superadmin revokes membership on College 1.| Admin attempts to provision faculty profile | T2 blocks on College lock; unblocks    |
-|                                              |                                            | on College 1.                               | and fails closed with PermissionDenied.|
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_revocation_vs_record_update  | Superadmin revokes membership on College 1.| Admin attempts update on student academic   | T2 blocks on College lock; upon        |
-|                                              |                                            | record ledger.                              | unblocking, fails closed with 403.     |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_revocation_vs_assignment     | Superadmin revokes membership on College 1.| Admin attempts update on faculty subject    | T2 blocks on College lock; upon        |
-|                                              |                                            | assignment.                                 | unblocking, fails closed with 403.     |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_suspension_vs_structure      | Superadmin suspends membership on College 1| Admin attempts to update programme duration | T2 blocks on College lock; unblocks,   |
-|                                              | (`status = 'SUSPENDED'`).                  | on College 1.                               | rejects mutation with PermissionDenied.|
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_demote_vs_offering_update    | Superadmin demotes admin user primary role | Admin attempts to update paper offering on  | T2 blocks on College lock; unblocks,   |
-|                                              | from ADMIN to FACULTY.                     | College 1.                                  | fails closed due to primary role check.|
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_grant_vs_revoke_race         | Superadmin 1 grants membership for Admin A | Superadmin 2 revokes membership for Admin A | Both acquire College lock; T2 waits for|
-|                                              | on College 1.                              | on College 1.                               | T1 commit, then executes cleanly.      |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_multi_college_update         | Admin updates entities on College 1 and    | Admin updates entities on College 2 and     | Both acquire College locks in ascending|
-|                                              | College 2 (Sorts: C1, C2).                 | College 1 (Sorts: C1, C2).                  | order; zero deadlock, sequential exec. |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_college_deactivation         | Superadmin deactivates College 1           | Admin attempts mutation on College 1.       | T2 blocks on College lock; unblocks,   |
-|                                              | (`is_active = False`).                     |                                             | rejects mutation as inactive college.  |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_concurrent_stale_assignment_race        | Admin 1 updates faculty on assignment #1   | Admin 2 deletes faculty assignment #1.      | T2 blocks on Level 2 offering lock;    |
-|                                              | under Level 1 College lock.                |                                             | unblocks, detects stale snapshot & 400.|
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-| test_deadlock_detection_and_recovery         | Synthetic reverse-order lock acquisition   | Concurrent opposing lock acquisition.       | MySQL InnoDB detects deadlock (1213);  |
-|                                              | across two tables.                         |                                             | transaction rolls back cleanly.        |
-+----------------------------------------------+--------------------------------------------+---------------------------------------------+----------------------------------------+
-```
+The 11 multi-connection integration test scenarios are specified in Section 11 and Section 16.10.
 
 ---
 
-### 15.7 Finding P5-B: PaperOffering Read Visibility Policy Comparison
+### 15.7 Finding P5-B & P6-C: PaperOffering Read Visibility Baseline (Superseded Summary)
 
-The latest proposal inadvertently proposed restricting `PaperOffering` records to students enrolled in mapped programmes and faculty assigned to teaching sessions. This contradicted the approved Chunk 05 baseline, where `BaseAcademicViewSet` and `IsAcademicAdminOrReadOnly` permit active, authenticated students and faculty to browse the academic catalogue.
-
-The following comparative analysis evaluates the two visibility models:
-
-| Dimension | Visibility Option 1: Academic Catalogue Browsing Baseline (Chunk 05 Baseline) | Visibility Option 2: Restricted PaperOffering Visibility (Proposed Alternative) |
-| :--- | :--- | :--- |
-| **Architectural Status** | **Existing Approved Baseline** in [`apps/academics/permissions.py`](file:///home/zero/Documents/college/backend/apps/academics/permissions.py#L16-L37). | **Unapproved Policy Change** requiring explicit project-owner authorization. |
-| **Student Access Scope** | All active, authenticated students can list and view all active `PaperOffering` records within their college/deployment. | Students can ONLY view `PaperOffering` records that have an active `PaperProgrammeMapping` matching their currently enrolled programme. |
-| **Faculty Access Scope** | All active, authenticated faculty can browse the catalogue of paper offerings across departments and programmes. | Faculty can ONLY view `PaperOffering` records to which they are explicitly assigned via `FacultySubjectAssignment` for that session. |
-| **Academic Justification (NEP 2020 / FYUGP)** | **Strongly Supported.** Under Gauhati University FYUGP regulations, students must select Multidisciplinary Courses (MDC), Value Added Courses (VAC), Skill Enhancement Courses (SEC), and Minor electives across disciplines. Open catalogue browsing is essential for students to review course syllabi, prerequisites, and credit values prior to formal enrollment. | **Severely Restrictive.** Mechanically prevents students from discovering courses outside their current programme mapping, obstructing interdisciplinary elective selection prior to admission/mapping. |
-| **Implementation Complexity** | **Zero.** Built into existing `BaseAcademicViewSet.get_queryset()`. | **High.** Requires overriding `get_queryset()` in `PaperOfferingViewSet`, joining `StudentProfile` and `FacultySubjectAssignment`, introducing query latency and edge cases for dual-role users. |
-| **Administrative Control** | Ordinary administrators view and filter offerings across their authorized institutions. | Identical administrative behavior. |
-| **Recommendation** | **Retain as approved baseline.** Zero code changes required. | Reserve on Project-Owner Checklist for explicit business decision. |
+Section 15.7 previously described catalogue browsing as active-only and college-scoped. As reconciled under Finding P6-C in Section 16.7, verified source inspection reveals that `PaperOfferingViewSet` performs an unfiltered scan across all active and inactive offerings deployment-wide. The complete analysis and 4 policy options are specified in Section 16.7 and 16.8.
 
 ---
 
 ### 15.8 Finding P5-B: Policy Recommendation & Owner Decision Gate
 
-**Architectural Decision:**
-1. **Option 1 (Academic Catalogue Browsing Baseline) remains the operational baseline of the system.** All active authenticated students, faculty, and administrators retain read permissions for `PaperOffering` records via `IsAcademicAdminOrReadOnly`.
-2. **Option 2 (Restricted PaperOffering Visibility) is formally submitted to the project owner as an explicit decision gate.** The development team will not implement Option 2 without written project-owner approval.
+Detailed in Section 16.8.
 
 ---
 
 ### 15.9 Finding P5-C: Atomic Commit vs. Rollback Durability Semantics
-
-To eliminate ambiguity regarding audit record retention across transaction aborts, the architecture codifies exact dual-persistence mechanics:
 
 1. **Successful Administrative Mutations (Atomic Relational Commit):**
    - For all successful mutations (e.g. `grant_administrative_membership`, `review_student_registration`), the business entity changes and the Table 51 (`SystemAuditLog`) audit row are inserted **within the same database transaction** (`@transaction.atomic`).
@@ -1054,18 +973,250 @@ The choice between Policy A and Policy B is maintained as an unselected, formal 
 
 ### 15.12 Comprehensive Summary of Unresolved Architectural Issues
 
-A comprehensive audit of the reconciled architecture confirms:
-1. **Zero Contradictions in Lock Ordering:** Strategy C harmonizes all 34 services across 5 domains under Level 1 College Coordination Locks.
-2. **Zero Incompatibilities with Chunk 05:** All 22 Chunk 05 academic services remain untouched and protected.
-3. **Zero Security Bypasses:** Operation registry validation occurs strictly prior to Superadmin bypass; unknown operations fail closed for all actors.
-4. **Zero Impact on Student/Faculty Self-Service:** Independent Domain B and Domain C isolate student and faculty endpoints from administrative membership constraints.
-5. **Zero Undocumented Blockers:** All technical requirements are fully specified and ready for formal project-owner decision.
+Detailed in Section 16.10 and Section 17.
 
 ---
 
-## 16. Explicit Project-Owner Approval Checklist
+# Final Service-Layer Implementation Reconciliation — P6-A Through P6-D
 
-Before any code implementation begins, the project owner must review this reconciled proposal and explicitly decide on the following **10 architectural decisions**:
+---
+
+## 16. Final Service-Layer Implementation Reconciliation Specification
+
+### 16.1 Finding P6-A: Corrected Service Implementation Classification (Categories A–E)
+
+Section 15.5 previously asserted that several administrative services require "only authorization check updates." This statement is technically defective because an unlocked authorization check outside or before a transaction boundary cannot prevent race conditions with concurrent membership revocations. 
+
+In accordance with Finding P6-A, all services across all domains are reclassified into a rigorous **Five-Category Taxonomy**:
+
+```
++-----------------------------------------------------------------------------------------------------------------------------+
+| Category Code | Classification Name                                | Definition and Implementation Requirement              |
++---------------+----------------------------------------------------+--------------------------------------------------------+
+| Category A    | Authorization Integration Only                     | Existing transaction and lock protocol ALREADY satisfy |
+|               |                                                    | revocation serialization. Requires verified proof.     |
++---------------+----------------------------------------------------+--------------------------------------------------------+
+| Category B    | Authorization and Transaction Integration          | Requires adding or repositioning: College locks,       |
+|               |                                                    | acting User locks, Membership locking reads, or        |
+|               |                                                    | authoritative state revalidation UNDER lock.           |
++---------------+----------------------------------------------------+--------------------------------------------------------+
+| Category C    | Service Signature / Dependency Changes             | Requires adding an acting User or authorization context|
+|               |                                                    | to services currently lacking actor identification.    |
++---------------+----------------------------------------------------+--------------------------------------------------------+
+| Category D    | Coordinated Lock-Order Refactor                    | Requires changing a previously approved row-lock       |
+|               |                                                    | sequence to eliminate deadlocks or inversions.         |
++---------------+----------------------------------------------------+--------------------------------------------------------+
+| Category E    | No Administrative Authorization Change             | Genuine student/faculty self-service or public         |
+|               |                                                    | onboarding workflows; exempt from admin membership.    |
++---------------+----------------------------------------------------+--------------------------------------------------------+
+```
+
+#### Detailed Verification of Affected Services (10 Mandatory Points)
+
+The following table provides the exhaustive 10-point analysis required for every affected service:
+
+| Function Name | Existing Auth Point | Existing Tx Boundary | Existing College Lock | Existing User Locks | Membership Lock Req? | Proposed Operation | Required Source Changes | Deadlock Impact | Regression Tests Req. | Owner Auth Required? | Category |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `assign_faculty_to_paper` | Line 1543 (`check_inst_admin`), Line 1552 (`check_college_op`) | `@transaction.atomic` (Line 1526) | `lock_colleges` (Line 1555) | None | Yes (re-check under College lock) | `academic.faculty_assignment.manage` | Reposition auth check AFTER `lock_colleges` under lock | None (Level 1 College lock acquired first) | Revocation vs assignment race test | No (Chunk 06 service) | **Category B** |
+| `update_faculty_assignment` | Line 1686, Line 1752 (under lock) | `@transaction.atomic` (Line 1662) | `lock_colleges` (Line 1716) | None | Yes (re-check under College lock) | `academic.faculty_assignment.manage` | Replace line 1752 with `authorize_institutional_operation` | None (Level 1 College lock acquired first) | Stale assignment update race test | No (Chunk 06 service) | **Category B** |
+| `delete_faculty_assignment` | Line 1615, Line 1626, Line 1653 (under lock) | `@transaction.atomic` (Line 1602) | `lock_colleges` (Line 1633) | None | Yes (re-check under College lock) | `academic.faculty_assignment.manage` | Replace line 1653 with `authorize_institutional_operation` | None (Level 1 College lock acquired first) | Revocation vs delete race test | No (Chunk 06 service) | **Category B** |
+| `create_faculty_profile` | Line 41, Line 49 (before lock) | `@transaction.atomic` (Line 21) | `lock_colleges` (Line 50) | None | Yes (re-check under College lock) | `faculty.account.provision` | Move auth check AFTER `lock_colleges` (Line 50) | None (Level 1 College lock acquired first) | Revocation vs faculty provisioning test | No (Chunk 06 service) | **Category B** |
+| `update_faculty_profile` | Line 124 (RBAC check), Line 167 (under lock) | `@transaction.atomic` (Line 99) | `lock_colleges` (Line 150) | None | Yes (re-check under College lock) | `faculty.profile.manage` | Replace line 167 with `authorize_institutional_operation` | None (Level 1 College lock acquired first) | Admin update vs faculty self-update test | No (Chunk 06 service) | **Category B** |
+| `update_student_profile` | Line 426 (RBAC check), Line 442 (under lock) | `@transaction.atomic` (Line 404) | `lock_colleges` (Line 419) | None | Yes (re-check under College lock) | `student.profile.manage` | Replace line 442 with `authorize_institutional_operation` | None (Level 1 College lock acquired first) | Admin semester update vs student update test | No (Chunk 06 service) | **Category B** |
+| `create_student_academic_record` | Line 37, Line 48 (before lock) | `@transaction.atomic` (Line 22) | `lock_colleges` (Line 51) | None | Yes (re-check under College lock) | `enrollment.record.manage` | Move auth check AFTER `lock_colleges` (Line 51) | None (Level 1 College lock acquired first) | Revocation vs record creation test | No (Chunk 06 service) | **Category B** |
+| `update_student_academic_record` | Line 114, Line 117 (unlocked) | `@transaction.atomic` (Line 101) | None | None | Yes (acquire College lock) | `enrollment.record.manage` | Add candidate college read; acquire `lock_colleges` prior to record lock | None (Level 1 College lock acquired first) | Revocation vs record update test | No (Chunk 06 service) | **Category B** |
+| `review_student_registration` | Line 300, Line 363 (under lock) | `@transaction.atomic` (Line 278) | None (missing!) | User locked (Line 319) | Yes (acquire College & User locks) | `student.registration.review` | Resolve candidate college, acquire `lock_colleges` FIRST, sort User locks ascending, check auth under lock | Eliminates deadlock with membership grant/revoke | Revocation vs registration review test | No (Chunk 06 service) | **Category B & D** |
+| `set_institutional_config` | Line 1306 (check admin), Line 1324 | `@transaction.atomic` (Line 1339) | `lock_colleges` (Line 1354) | None | Yes (re-check under College lock) | `academic.config.manage` | Replace line 1306 with `authorize_institutional_operation` under lock | None (Level 1 College lock acquired first) | Revocation vs config update test | Yes (Chunk 05 service) | **Category B & C** |
+| `delete_institutional_config` | Line 1495 (check admin), Line 1515 | `@transaction.atomic` (Line 1490) | `lock_colleges` (Line 1502) | None | Yes (re-check under College lock) | `academic.config.manage` | Replace static check with `authorize_institutional_operation` under lock | None (Level 1 College lock acquired first) | Revocation vs config delete test | Yes (Chunk 05 service) | **Category B & C** |
+| `update_paper_offering` | ViewSet `IsAcademicAdminOrReadOnly` | `@transaction.atomic` (Line 548) | `lock_colleges` (Line 602) | None | None (Option 2) / Yes (Option 1) | `academic.offering.manage` | Add `acting_user` parameter; wire auth under lock (Option 1) | None if Level 1 College lock precedes | Chunk 05 offering regression suite | **YES (Chunk 05 Re-Audit)** | **Category C & B** |
+| `create_paper_offering` | ViewSet `IsAcademicAdminOrReadOnly` | `@transaction.atomic` (Line 156) | `lock_colleges` (Line 201) | None | None (Option 2) / Yes (Option 1) | `academic.offering.manage` | Add `acting_user` parameter; wire auth under lock (Option 1) | None if Level 1 College lock precedes | Chunk 05 creation regression suite | **YES (Chunk 05 Re-Audit)** | **Category C & B** |
+| `create_paper_programme_mapping` | ViewSet `IsAcademicAdminOrReadOnly` | `@transaction.atomic` (Line 373) | `lock_colleges` (Line 393) | None | None (Option 2) / Yes (Option 1) | `academic.offering.manage` | Add `acting_user` parameter; wire auth under lock (Option 1) | None if Level 1 College lock precedes | Chunk 05 mapping regression suite | **YES (Chunk 05 Re-Audit)** | **Category C & B** |
+| `update_paper_programme_mapping` | ViewSet `IsAcademicAdminOrReadOnly` | `@transaction.atomic` (Line 437) | `lock_colleges` (Line 471) | None | None (Option 2) / Yes (Option 1) | `academic.offering.manage` | Add `acting_user` parameter; wire auth under lock (Option 1) | None if Level 1 College lock precedes | Chunk 05 mapping update regression | **YES (Chunk 05 Re-Audit)** | **Category C & B** |
+| `delete_paper_programme_mapping` | ViewSet `IsAcademicAdminOrReadOnly` | `@transaction.atomic` (Line 529) | `lock_colleges` (Line 542) | None | None (Option 2) / Yes (Option 1) | `academic.offering.manage` | Add `acting_user` parameter; wire auth under lock (Option 1) | None if Level 1 College lock precedes | Chunk 05 mapping delete regression | **YES (Chunk 05 Re-Audit)** | **Category C & B** |
+| `set_current_academic_session` | ViewSet `IsAcademicAdminOrReadOnly` | `@transaction.atomic` (Line 61) | `lock_colleges` (Line 70) | None | None (Option 2) / Yes (Option 1) | `academic.session.manage` | Add `acting_user` parameter; wire auth under lock (Option 1) | None if Level 1 College lock precedes | Chunk 05 session switch regression | **YES (Chunk 05 Re-Audit)** | **Category C & B** |
+| `register_student` | None (Public endpoint) | `@transaction.atomic` (Line 142) | `lock_colleges` (Line 170) | None | None (Public) | None | None (Public self-registration) | None | Registration onboarding test | No | **Category E** |
+| `verify_email_token` | None (Token based) | `@transaction.atomic` (Line 246) | None | User lock (Line 262) | None (Public) | None | None (Token consumption) | None | Token verification test | No | **Category E** |
+| `cleanup_unverified_registration` | Internal cleanup | `@transaction.atomic` (Line 82) | None | User lock (Line 103) | None (Internal) | None | None (Internal cleanup) | None | Cleanup safety test | No | **Category E** |
+| `grant_administrative_membership`| Superadmin required | `@transaction.atomic` | `lock_colleges` (Level 1) | Sorted Users (Level 2) | New row lock | `admin.membership.manage` | New implementation | None (Dijkstra ordered) | Membership grant concurrency | No (Chunk 06 Round 6) | **Category B** |
+| `revoke_administrative_membership`| Superadmin required | `@transaction.atomic` | `lock_colleges` (Level 1) | Sorted Users (Level 2) | Row lock (Level 3) | `admin.membership.manage` | New implementation | None (Dijkstra ordered) | Revocation vs write races | No (Chunk 06 Round 6) | **Category B** |
+
+---
+
+### 16.2 Finding P6-A: Revocation Race Conditions & Mandatory Transaction Serialization Protocol
+
+#### The Critical Revocation Race Anomaly
+If an administrative service performs an unlocked permission check before entering its transaction, a critical security race condition arises:
+1. **Time $T_0$:** Administrator $A_1$ submits mutation request on College $C_1$.
+2. **Time $T_1$:** API layer verifies $A_1$ holds active membership on $C_1$. Access permitted.
+3. **Time $T_2$:** Superadmin $S_1$ initiates `revoke_administrative_membership` for $A_1$ on $C_1$.
+4. **Time $T_3$:** $S_1$ acquires `lock_colleges(C_1)`, exclusively locks $A_1$'s membership, sets `is_active = False, status = 'REVOKED'`, and **commits**.
+5. **Time $T_4$:** $A_1$'s transaction enters service execution, acquires `lock_colleges(C_1)`, executes mutation, and **commits**.
+6. **Vulnerability Materialized:** Administrator $A_1$ mutated institutional data **after their membership revocation had committed**.
+
+#### Mandatory Transaction-Level Revocation Serialization Protocol
+To mathematically prevent this anomaly, the architecture mandates:
+$$\text{Mandatory Rule: Administrative Authorization Revalidation MUST occur UNDER the Level 1 College Coordination Lock.}$$
+
+Because `revoke_administrative_membership` holds an exclusive row-level lock on `College` ($C_1$), the race is serialized:
+- **Case 1 (Revocation First):** $S_1$ acquires $C_1$ lock first. $A_1$'s mutation blocks at `lock_colleges(C_1)`. When $S_1$ commits, $A_1$ unblocks. $A_1$ executes `authorize_institutional_operation` *under lock*, reads the freshly committed `status = 'REVOKED'`, and **fails closed with HTTP 403 Forbidden**.
+- **Case 2 (Mutation First):** $A_1$ acquires $C_1$ lock first. $S_1$'s revocation blocks at `lock_colleges(C_1)`. $A_1$ re-validates active membership under lock, executes mutation, and commits. $S_1$ unblocks and executes revocation cleanly.
+
+This protocol guarantees that no ordinary administrator can mutate institutional data after their revocation has committed.
+
+---
+
+### 16.3 Finding P6-B: Chunk 05 Service-Layer Trust Boundary Analysis
+
+Source-code inspection of Chunk 05 academic services reveals an architectural trust-boundary tension:
+1. **The Policy Premise:** The proposal declared that "all institutional mutations independently enforce operation-level authorization at the service layer."
+2. **The Source Reality:** Approved Chunk 05 services (`create_paper_offering`, `update_paper_offering`, `create_programme`, `update_programme`, `set_current_academic_session`, `create_semester`, etc.) **do not accept an acting User argument**.
+3. **The Current Enforcement Point:** Authorization for these entities is currently enforced **exclusively at the API layer** via `BaseAcademicViewSet` using `IsAcademicAdminOrReadOnly` and `IsInstitutionalConfigPermission`.
+4. **The Direct Persistence Bypass:** Certain entities (such as `CollegeViewSet`) have no dedicated service function at all; `CollegeViewSet.perform_create` directly executes `serializer.save()`, delegating to DRF default `ModelSerializer.create()`.
+
+Claiming that Chunk 05 services can simultaneously "remain completely untouched" and "independently enforce service-layer institutional authorization" is contradictory.
+
+---
+
+### 16.4 Finding P6-B: Option 1 (Minimal Service-Layer Retrofit) vs. Option 2 (API-Layer Contract)
+
+The project owner must decide between two architectural boundaries:
+
+#### Option 1: Coordinated Minimal Service-Layer Authorization Retrofit (Recommended, Subject to Owner Approval)
+- **Concept:** Extend the signatures of approved Chunk 05 services to accept `acting_user: User`. Wire `authorize_institutional_operation(acting_user, college_id, operation)` inside their transaction boundaries under Level 1 College lock. Update ViewSets and serializers to pass `request.user`.
+- **Advantages:**
+  - True defense-in-depth: Prevents unauthorized execution from management commands, Celery background tasks, internal Python imports, and future API endpoints.
+  - Uniform security model across all chunks (Chunks 05, 06, and future Chunks 07–16).
+- **Governance & Stage-Gate Cost:**
+  - **Reopens Chunk 05:** Modifies 19 approved Chunk 05 service functions.
+  - **Re-Audit Required:** Requires targeted regression testing and independent technical re-audit of Chunk 05.
+
+#### Option 2: API-Layer Authorization Contract (Preserve Chunk 05 Stage Gate)
+- **Concept:** Retain Chunk 05 services 100% unchanged. Enforce institutional administrator authorization strictly at the API layer in `BaseAcademicViewSet` (e.g. via an enhanced `IsInstitutionalAcademicAdmin` permission class and `get_queryset()` scoping).
+- **Advantages:**
+  - **Chunk 05 Remains 100% Closed:** Zero modifications to approved Chunk 05 services.
+  - Zero regression risk to previously audited academic management code.
+- **Disclosed Risks & Weaker Trust Boundary:**
+  - Internal Python callers, management commands, and background tasks bypass institutional authorization.
+  - Future developers could accidentally expose un-scoped endpoints.
+
+---
+
+### 16.5 Finding P6-B: Comprehensive ViewSet / Serializer / Service Call-Path Inventory
+
+The following table documents the exact call paths across all academic entities, establishing where authorization is currently enforced and what changes each option entails:
+
+| Entity Domain | Operation | ViewSet Involved | Serializer Save Path | Service Function Called | Existing Actor In Service? | Option 1 Retrofit Change | Option 2 API-Layer Change |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **College** | Create / Update | `CollegeViewSet` | Direct `ModelSerializer.save()` | None (Direct ORM) | No service exists | Create `create_college` service with `acting_user` | Add `IsCollegeSuperAdmin` to `CollegeViewSet` |
+| **AcademicSession**| Create / Update | `AcademicSessionViewSet` | `AcademicSessionSerializer.create/update` | `create_academic_session`, `update_academic_session` | No | Add `acting_user: User` to service signatures | Enforce college scope in `AcademicSessionViewSet` |
+| **AcademicSession**| Set Current | `AcademicSessionViewSet` | `@action set_current` | `set_current_academic_session` | No | Add `acting_user: User` to service signature | Check `academic.session.manage` in `@action` |
+| **Programme** | Create / Update | `ProgrammeViewSet` | `ProgrammeSerializer.create/update` | `create_programme`, `update_programme` | No | Add `acting_user: User` to service signatures | Enforce college scope in `ProgrammeViewSet` |
+| **Department** | Create / Update | `DepartmentViewSet` | `DepartmentSerializer.create/update` | `create_department`, `update_department` | No | Add `acting_user: User` to service signatures | Enforce college scope in `DepartmentViewSet` |
+| **Semester** | Create / Update | `SemesterViewSet` | `SemesterSerializer.create/update` | `create_semester`, `update_semester` | No | Add `acting_user: User` to service signatures | Enforce programme college scope in ViewSet |
+| **SubjectCategory**| Create / Update | `SubjectCategoryViewSet` | `SubjectCategorySerializer.create/update` | `create_subject_category`, `update_subject_category` | No | Add `acting_user: User` to service signatures | Enforce college scope in ViewSet |
+| **Subject** | Create / Update | `SubjectViewSet` | `SubjectSerializer.create/update` | `create_subject`, `update_subject` | No | Add `acting_user: User` to service signatures | Enforce dept college scope in ViewSet |
+| **PaperOffering** | Create / Update | `PaperOfferingViewSet` | `PaperOfferingSerializer.create/update` | `create_paper_offering`, `update_paper_offering` | No | Add `acting_user: User` to service signatures | Enforce session college scope in ViewSet |
+| **PaperOffering** | Map Programmes | `PaperOfferingViewSet` | `@action map_programmes` | `map_paper_to_programmes` | No | Add `acting_user: User` to service signature | Check `academic.offering.manage` in `@action` |
+| **PaperProgrammeMapping** | Create / Update / Delete | `PaperProgrammeMappingViewSet` | `PaperProgrammeMappingSerializer.create/update`, `destroy` | `create_paper_programme_mapping`, `update_paper_programme_mapping`, `delete_paper_programme_mapping` | No | Add `acting_user: User` to all 3 service signatures | Enforce offering college scope in ViewSet |
+| **InstitutionalConfig** | Create / Update / Delete | `InstitutionalConfigViewSet` | `InstitutionalConfigSerializer.create/update`, `destroy` | `create_institutional_config`, `update_institutional_config`, `delete_institutional_config` | **YES** (`user=user`) | Replace static check with `academic.config.manage` | Update ViewSet permission class |
+| **FacultySubjectAssignment** | Create / Update / Delete | `FacultySubjectAssignmentViewSet` | `FacultySubjectAssignmentSerializer.create/update`, `destroy` | `assign_faculty_to_paper`, `update_faculty_assignment`, `delete_faculty_assignment` | **YES** (`acting_user`) | Move auth check under lock (Category B) | Ensure ViewSet queryset scoping |
+
+---
+
+### 16.6 Finding P6-B: Prospective Implementation Matrix & Stage-Gate Governance Impact
+
+| Function / Component | Current Authorization Point | Proposed Retrofit (Option 1) | Stage Impact | Regression & Audit Scope |
+| :--- | :--- | :--- | :--- | :--- |
+| `academics/services.py` (19 functions) | ViewSet DRF permissions only | Add `acting_user: User`, wire `authorize_institutional_operation` under lock | **Chunk 05 Reopened** | Re-run all 43 Chunk 05 tests; independent re-audit of Chunk 05 gate |
+| `academics/serializers.py` (9 serializers) | Serializer validation only | Extract `request.user` from context, pass `acting_user` to service calls | **Chunk 05 Reopened** | Serializer validation tests |
+| `academics/views.py` (8 ViewSets) | `IsAcademicAdminOrReadOnly` | Pass `request.user` to actions; enforce operation queryset scoping | **Chunk 05 Reopened** | ViewSet integration tests |
+| `apps/faculty/services.py` (2 functions) | Static role checks & placeholder | Wire `authorize_institutional_operation` under lock (Category B) | **Chunk 06 Scope** | Chunk 06 faculty tests |
+| `apps/students/services.py` (2 functions) | Static role checks & placeholder | Reorder locks (Category D), wire `authorize_institutional_operation` under lock | **Chunk 06 Scope** | Chunk 06 student registration tests |
+| `apps/enrollments/services.py` (2 functions)| Static role checks & placeholder | Add College lock, wire `authorize_institutional_operation` under lock | **Chunk 06 Scope** | Chunk 06 enrollment tests |
+
+> [!IMPORTANT]
+> **Stage-Gate Governance Rule:** If the project owner selects **Option 1**, Chunk 05 will be formally marked as "REOPENED FOR AUTHORIZATION RETROFIT" and will require independent re-audit upon completion. If the project owner selects **Option 2**, Chunk 05 remains "APPROVED WITH WARNINGS", and changes are confined strictly to Chunk 06 ViewSets and services.
+
+---
+
+### 16.7 Finding P6-C: Accurate Source-Verified PaperOffering Read-Visibility Baseline
+
+Line-by-line inspection of [`backend/apps/academics/views.py`](file:///home/zero/Documents/college/backend/apps/academics/views.py#L171-L190) establishes the true source reality:
+```python
+class PaperOfferingViewSet(BaseAcademicViewSet):
+    queryset = PaperOffering.objects.select_related(
+        "academic_session",
+        "semester",
+        "semester__programme",
+        "subject",
+        "subject__department",
+        "subject_category",
+        "academic_session__college",
+    ).prefetch_related("programme_mappings", "programme_mappings__programme").all()
+    serializer_class = PaperOfferingSerializer
+    filterset_fields = [
+        "academic_session",
+        "semester",
+        "subject",
+        "subject_category",
+        "is_common_paper",
+        "is_active",
+    ]
+    search_fields = ["paper_code", "title"]
+```
+
+#### Verified Operational Facts:
+1. `PaperOfferingViewSet` inherits `BaseAcademicViewSet`, which enforces `IsAcademicAdminOrReadOnly`.
+2. For read operations (`GET`, `HEAD`, `OPTIONS`), any active, authenticated user (Student, Faculty, Admin, Superadmin) receives access.
+3. The queryset evaluates `.all()` without applying a default `is_active=True` filter.
+4. The queryset evaluates `.all()` without applying a default `college` filter.
+5. Inactive paper offerings and offerings from other colleges are visible to any authenticated student or faculty member unless explicitly filtered via query parameters (e.g. `?is_active=true&academic_session=...`).
+
+---
+
+### 16.8 Finding P6-C: PaperOffering Visibility Decision Options
+
+The architecture defines four explicit policy options for project-owner selection:
+
+| Option | Visibility Policy | Implementation Mechanism | Academic & Usability Impact | Security & Privacy Impact | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Option 1** | **Preserve Current Implementation (Baseline — Recommended)** | Retain `queryset = ...all()`. Reliance on client query parameters (`?is_active=true`). | **Optimal for FYUGP Course Discovery:** Students can explore multidisciplinary, minor, and skill enhancement papers across institutions before admission. | Inactive/draft papers are readable by authenticated users if ID is known or listed. | **Approved Baseline** in Chunk 05 |
+| **Option 2** | **Active-Only Academic Catalogue** | Override `get_queryset()` to append `.filter(is_active=True)` for non-administrators. | Hides unapproved, draft, or retired offerings from students and faculty. | Prevents exposure of unpublished syllabi. | Policy Change (Requires Owner Approval) |
+| **Option 3** | **Institution-Scoped Academic Catalogue** | Override `get_queryset()` to filter by user's associated `college_id`. | Scopes students and faculty to their enrolled/employed institution; cross-college discovery requires Superadmin. | Enforces strict institutional boundaries for catalogue data. | Policy Change (Requires Owner Approval) |
+| **Option 4** | **Programme / Assignment Restricted Catalogue** | Override `get_queryset()` to filter by student's mapped programme and faculty's assigned papers. | **Severely Restrictive:** Blocks students from reviewing multidisciplinary electives outside their enrolled programme. | Maximally restrictive data-minimization model. | Policy Change (Requires Owner Approval) |
+
+**Recommendation:** Retain **Option 1** as the approved baseline. Submit Options 2, 3, and 4 to the project owner for decision.
+
+---
+
+### 16.9 Finding P6-D: Operation Registry Consistency Enforcement (`academic.config.read`)
+
+To prevent default-deny authorization failures caused by identifier mismatches:
+1. All occurrences of `academic.config.view` in earlier proposal drafts are replaced with `academic.config.read`.
+2. The 25-operation registry in Section 8.1 is authoritative.
+3. Any request referencing an unregistered operation (including legacy `academic.config.view`) fails closed (`return set()` or `PermissionDenied`) for all roles, including Superadmin.
+
+---
+
+### 16.10 Lock-Order Security Validation & Concurrency Limitations
+
+In accordance with Section 7 of the governance instructions, the following ten concurrency principles are formally affirmed:
+1. **Coordination Lock Precedence:** All relevant Level 1 College coordination locks must precede dependent entity locks in all write transactions.
+2. **Deterministic College Ordering:** Multi-college coordination locks strictly follow ascending numeric primary-key order (`sorted([cid_1, cid_2])`).
+3. **Deterministic User Ordering:** Multi-user coordination locks strictly follow ascending numeric primary-key order (`sorted([actor.pk, target.pk])`).
+4. **Deterministic Membership Locks:** Membership locks follow the approved actor/target protocol under Level 1 College locks.
+5. **Preserved Invariant Locks:** Domain-specific child and parent record locks preserve all previously reviewed Chunk 05 invariants.
+6. **Self-Service & Public Independence:** Student self-registration, email verification, and token cleanup execute safely without requiring administrator membership locks.
+7. **Decoupled Self-Service:** Student and faculty profile self-service (`/me/` endpoints) is decoupled from administrative authorization.
+8. **Stale Ownership Rejection:** Concurrent changes to institutional ownership trigger controlled `ValidationError` rejections rather than unhandled exceptions.
+9. **No Lock on ORM Construction:** Evaluation of querysets (e.g. `list(qs)`) acquires locks only when `.select_for_update()` is explicitly evaluated inside an active transaction.
+10. **Conditional Concurrency Guarantee:** Concurrency safety guarantees are conditional upon all participating transactions strictly adhering to Strategy C. Uncontrolled raw SQL or external database transactions are outside this guarantee.
+
+---
+
+## 17. Explicit Project-Owner Approval Checklist
+
+Before any code implementation begins, the project owner must review this reconciled proposal and explicitly decide on the following **12 architectural decisions**:
 
 - [ ] **1. Architecture Selection:** Formally approve **Option B (Dedicated Administrative Membership Mapping Table)** with **Two-Dimensional Institutional Authorization**.
 - [ ] **2. Schema Baseline Expansion:** Formally approve expanding the relational database architecture from **52 tables to 53 tables** to accommodate Table 53 (`accounts_administrative_membership`).
@@ -1073,18 +1224,24 @@ Before any code implementation begins, the project owner must review this reconc
 - [ ] **4. Mandatory Institutional Role:** Formally approve making `role_id` mandatory (`NOT NULL`) on Table 53, requiring a defined institutional role for every college assignment.
 - [ ] **5. Authorization Model:** Formally approve the **Two-Dimensional (College + Operation RBAC)** model and the 25-operation institutional registry defined in Section 8.
 - [ ] **6. Membership Lifecycle:** Formally approve the **Single Mutable Current-State Record Lifecycle** (`ACTIVE`, `SUSPENDED`, `REVOKED`), with tenure metadata retained on the row.
-- [ ] **7. Lock Integration Strategy:** Formally approve **Strategy C (Outer Coordination Protocol with Preserved Internal Academic Lock Families)**, serializing transactions under Level 1 College Coordination Locks and leaving Chunk 05 services untouched.
-- [ ] **8. PaperOffering Visibility Policy Selection:**
-  - [ ] **Option 1 (Catalogue Browsing Baseline - Recommended):** Retain approved Chunk 05 baseline permitting all active authenticated students and faculty to browse the academic catalogue for FYUGP elective planning.
-  - [ ] **Option 2 (Restricted Visibility):** Restrict `PaperOffering` records strictly to enrolled students and assigned faculty.
-- [ ] **9. Audit Retention Policy Selection:**
-  - [ ] **Policy A (Audit Prerequisite - Recommended for Production):** Authorize bringing forward Table 51 (`audit_system_audit_log`) for durable relational auditing prior to production deployment.
+- [ ] **7. Lock Integration Strategy:** Formally approve **Strategy C (Outer Coordination Protocol with Preserved Internal Academic Lock Families)**, serializing transactions under Level 1 College Coordination Locks.
+- [ ] **8. Chunk 05 Service-Layer Trust Boundary Selection:**
+  - [ ] **Option 1 (Coordinated Minimal Service-Layer Retrofit — Recommended):** Authorize extending Chunk 05 academic services to accept `acting_user` and wire `authorize_institutional_operation` under lock. Reopen Chunk 05 for targeted regression re-audit.
+  - [ ] **Option 2 (API-Layer Authorization Contract):** Retain Chunk 05 services 100% unchanged; enforce institutional authorization strictly in ViewSets and permissions, accepting the weaker internal trust boundary.
+- [ ] **9. PaperOffering Visibility Policy Selection:**
+  - [ ] **Option 1 (Catalogue Browsing Baseline — Recommended):** Retain approved Chunk 05 baseline permitting all active authenticated students and faculty to browse the academic catalogue for FYUGP elective planning.
+  - [ ] **Option 2 (Active-Only Catalogue):** Filter catalogue to `is_active=True` by default.
+  - [ ] **Option 3 (Institution-Scoped Catalogue):** Filter catalogue to the requesting user's college.
+  - [ ] **Option 4 (Programme / Assignment Restricted):** Restrict catalogue strictly to enrolled programmes and assigned papers.
+- [ ] **10. Audit Retention Policy Selection:**
+  - [ ] **Policy A (Audit Prerequisite — Recommended for Production):** Authorize bringing forward Table 51 (`audit_system_audit_log`) for durable relational auditing prior to production deployment.
   - [ ] **Policy B (Interim Application Logging):** Authorize temporary structured application logging for development environments with documented limitations.
-- [ ] **10. Chunk 06 Round 6 Implementation Authorization:** Formally authorize the engineering team to implement Table 53, generate migration `0002_administrative_membership`, and wire `authorize_institutional_operation` across Chunk 06 services.
+- [ ] **11. Chunk 06 Round 6 Implementation Authorization:** Formally authorize the engineering team to implement Table 53, generate migration `0002_administrative_membership`, and wire `authorize_institutional_operation` across Chunk 06 services.
+- [ ] **12. Narrow Table 51 Early Implementation:** If Policy A is selected, authorize generating migration `0002_system_audit_log` for Table 51 in Domain I ahead of Chunk 15.
 
 ---
 
-## 17. Stop Condition & Governance Attestation
+## 18. Stop Condition & Governance Attestation
 
 In accordance with explicit governance instructions:
 - **Zero code changes** have been made to Django models, services, serializers, permissions, or views.
@@ -1096,7 +1253,7 @@ In accordance with explicit governance instructions:
 
 ```
 ===================================================================================================
-STOP CONDITION MET: FINAL ARCHITECTURE RECONCILIATION COMPLETED.
+STOP CONDITION MET: FINAL SERVICE-LAYER IMPLEMENTATION RECONCILIATION COMPLETED.
 AWAITING INDEPENDENT ARCHITECTURE AUDIT AND FORMAL PROJECT-OWNER APPROVAL.
 DO NOT BEGIN IMPLEMENTATION UNTIL OWNER EXPLICITLY APPROVES.
 ===================================================================================================
