@@ -45,7 +45,6 @@ from apps.academics.services import (
     delete_paper_programme_mapping,
     map_paper_to_programmes,
     set_current_academic_session,
-    update_paper_offering,
 )
 
 logger = logging.getLogger("college.academics")
@@ -183,20 +182,6 @@ class PaperOfferingViewSet(BaseAcademicViewSet):
         "is_active",
     ]
     search_fields = ["paper_code", "title"]
-
-    @transaction.atomic
-    def perform_update(self, serializer):
-        instance = serializer.instance
-        try:
-            updated_offering = update_paper_offering(
-                paper_offering_id=instance.pk,
-                validated_data=serializer.validated_data,
-            )
-            serializer.instance = updated_offering
-        except DjangoValidationError as exc:
-            raise DRFValidationError(
-                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
-            )
 
     @action(detail=True, methods=["post"], url_path="map-programmes")
     def map_programmes(self, request, pk=None):

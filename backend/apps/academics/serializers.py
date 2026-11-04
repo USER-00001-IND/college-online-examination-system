@@ -23,8 +23,15 @@ from apps.academics.models import (
     SubjectCategory,
 )
 from apps.academics.services import (
+    create_academic_session,
+    create_department,
     create_institutional_config,
+    create_paper_offering,
     create_paper_programme_mapping,
+    create_programme,
+    create_semester,
+    create_subject,
+    create_subject_category,
     update_academic_session,
     update_department,
     update_institutional_config,
@@ -101,6 +108,17 @@ class AcademicSessionSerializer(serializers.ModelSerializer):
             })
         return attrs
 
+    def create(self, validated_data):
+        try:
+            return create_academic_session(
+                college_id=validated_data["college"].pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
     def update(self, instance, validated_data):
         try:
             return update_academic_session(
@@ -136,6 +154,17 @@ class ProgrammeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Duration in semesters must be at least 1.")
         return value
 
+    def create(self, validated_data):
+        try:
+            return create_programme(
+                college_id=validated_data["college"].pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
     def update(self, instance, validated_data):
         try:
             return update_programme(
@@ -162,6 +191,17 @@ class DepartmentSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def create(self, validated_data):
+        try:
+            return create_department(
+                college_id=validated_data["college"].pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
     def update(self, instance, validated_data):
         try:
@@ -216,6 +256,17 @@ class SemesterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return attrs
 
+    def create(self, validated_data):
+        try:
+            return create_semester(
+                programme_id=validated_data["programme"].pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
     def update(self, instance, validated_data):
         try:
             return update_semester(
@@ -268,6 +319,17 @@ class SubjectCategorySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return attrs
 
+    def create(self, validated_data):
+        try:
+            return create_subject_category(
+                college_id=validated_data["college"].pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
+
     def update(self, instance, validated_data):
         try:
             return update_subject_category(
@@ -296,6 +358,17 @@ class SubjectSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def create(self, validated_data):
+        try:
+            return create_subject(
+                department_id=validated_data["department"].pk,
+                validated_data=validated_data,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
     def update(self, instance, validated_data):
         try:
@@ -437,6 +510,27 @@ class PaperOfferingSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(exc.messages if hasattr(exc, "messages") else [str(exc)])
 
         return attrs
+
+    def create(self, validated_data):
+        try:
+            return create_paper_offering(
+                academic_session=validated_data["academic_session"],
+                semester=validated_data["semester"],
+                subject=validated_data["subject"],
+                subject_category=validated_data["subject_category"],
+                paper_code=validated_data["paper_code"],
+                title=validated_data["title"],
+                credits=validated_data.get("credits", Decimal("4.0")),
+                is_common_paper=validated_data.get("is_common_paper", False),
+                max_marks_internal=validated_data.get("max_marks_internal", Decimal("20.00")),
+                max_marks_external=validated_data.get("max_marks_external", Decimal("80.00")),
+                pass_marks_external=validated_data.get("pass_marks_external", Decimal("28.00")),
+                is_active=validated_data.get("is_active", True),
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else (exc.messages if hasattr(exc, "messages") else [str(exc)])
+            )
 
     def update(self, instance, validated_data):
         try:

@@ -25,6 +25,25 @@ from apps.academics.models import (
 from apps.accounts.models import RoleChoices
 
 
+def lock_colleges(*college_ids: Optional[int]) -> dict[int, College]:
+    """
+    Acquires exclusive row locks on College records in deterministic ascending PK order.
+    Serves as Level 1 coordination lock across all academic mutations within an institution.
+    Eliminates cross-college deadlocks and serializes concurrent academic structure mutations.
+    """
+    valid_ids = sorted({cid for cid in college_ids if cid is not None})
+    if not valid_ids:
+        return {}
+    locked = {
+        c.pk: c
+        for c in College.objects.select_for_update().filter(pk__in=valid_ids).order_by("pk")
+    }
+    for cid in valid_ids:
+        if cid not in locked:
+            raise ValidationError({"college": f"College ID {cid} not found."})
+    return locked
+
+
 def validate_academic_session_dates(start_date, end_date) -> None:
     """Validates that academic session start date strictly precedes end date."""
     if not start_date or not end_date:
@@ -41,7 +60,8 @@ def set_current_academic_session(college: College, session: AcademicSession) -> 
     Acquires an exclusive row lock on the College record to serialize concurrent switches.
     """
     # Exclusively lock the College record to coordinate concurrent session activation under MySQL InnoDB
-    locked_college = College.objects.select_for_update().get(pk=college.pk)
+    locked_colleges = lock_colleges(college.pk)
+    locked_college = locked_colleges[college.pk]
 
     if session.college_id != locked_college.pk:
         raise ValidationError({"session": "Session does not belong to the specified college."})
@@ -127,24 +147,52 @@ def create_paper_offering(
 ) -> PaperOffering:
     """
     Creates a new PaperOffering after comprehensive relational integrity validation.
+    Lock hierarchy:
+    1. College (select_for_update)
+    2. Parent academic records (AcademicSession, Semester, Programme, Subject, Department, SubjectCategory)
+    3. Authoritative validation
+    4. Persistence
     """
+    session_college_id = academic_session.college_id
+    sem_college_id = semester.programme.college_id if hasattr(semester, "programme") else None
+    sub_college_id = subject.department.college_id if hasattr(subject, "department") else None
+    cat_college_id = subject_category.college_id
+
+    # 1. Lock all referenced colleges in ascending PK order
+    lock_colleges(session_college_id, sem_college_id, sub_college_id, cat_college_id)
+
+    # 2. Lock parent records under the college lock
+    locked_session = AcademicSession.objects.select_for_update().get(pk=academic_session.pk)
+    locked_sem = Semester.objects.select_for_update().get(pk=semester.pk)
+    locked_prog = Programme.objects.select_for_update().get(pk=locked_sem.programme_id)
+    locked_sub = Subject.objects.select_for_update().get(pk=subject.pk)
+    locked_dept = Department.objects.select_for_update().get(pk=locked_sub.department_id)
+    locked_cat = SubjectCategory.objects.select_for_update().get(pk=subject_category.pk)
+
+    # 3. Authoritative validation against locked parent state
     validate_paper_offering_relationships(
-        academic_session=academic_session,
-        semester=semester,
-        subject=subject,
-        subject_category=subject_category,
+        academic_session=locked_session,
+        semester=locked_sem,
+        subject=locked_sub,
+        subject_category=locked_cat,
         credits=credits,
         max_marks_internal=max_marks_internal,
         max_marks_external=max_marks_external,
         pass_marks_external=pass_marks_external,
     )
 
+    clean_code = paper_code.strip()
+    if PaperOffering.objects.filter(academic_session=locked_session, paper_code=clean_code).exists():
+        raise ValidationError({
+            "paper_code": f"Paper offering with code '{clean_code}' already exists for this academic session."
+        })
+
     offering = PaperOffering(
-        academic_session=academic_session,
-        semester=semester,
-        subject=subject,
-        subject_category=subject_category,
-        paper_code=paper_code.strip(),
+        academic_session=locked_session,
+        semester=locked_sem,
+        subject=locked_sub,
+        subject_category=locked_cat,
+        paper_code=clean_code,
         title=title.strip(),
         credits=credits,
         is_common_paper=is_common_paper,
@@ -192,41 +240,73 @@ def map_paper_to_programmes(
 ) -> List[PaperProgrammeMapping]:
     """
     Maps a common paper offering to multiple eligible degree programmes.
-    Lock order: PaperOffering -> associated programme mappings -> validation -> persistence.
-    Ensures:
-    1. Lock-order discipline: acquires select_for_update() on PaperOffering row first.
-    2. Acquires select_for_update() on existing PaperProgrammeMapping rows in deterministic PK order.
-    3. All programmes pre-validated BEFORE modifying any database records.
-    4. Cross-college isolation and duration coverage verified via validate_paper_programme_mapping.
-    5. Transaction atomicity: failed replacement preserves existing mappings.
-    6. Invariant: is_common_paper flag is maintained and persisted atomically.
+    Lock hierarchy:
+    1. College(s) in ascending PK order
+    2. PaperOffering (select_for_update)
+    3. Semester (select_for_update)
+    4. Existing PaperProgrammeMapping rows (select_for_update, order_by('pk'))
+    5. Target Programme rows (select_for_update, order_by('pk'))
+    6. Authoritative validation
+    7. Persistence
     """
-    # Exclusively lock the PaperOffering row first to prevent race conditions with concurrent updates
+    prog_list = list(programmes)
+    college_ids = {paper_offering.academic_session.college_id}
+    for p in prog_list:
+        college_ids.add(p.college_id)
+
+    # 1. Lock College(s) in ascending PK order
+    lock_colleges(*college_ids)
+
+    # 2. Lock PaperOffering
     locked_offering = PaperOffering.objects.select_for_update().get(pk=paper_offering.pk)
-    # Lock existing programme mappings in deterministic PK order
+
+    # 3. Lock Semester
+    locked_sem = Semester.objects.select_for_update().get(pk=locked_offering.semester_id)
+
+    # 4. Lock existing mappings in deterministic PK order
     existing_mappings = list(
         PaperProgrammeMapping.objects.select_for_update()
         .filter(paper_offering=locked_offering)
         .order_by("pk")
     )
-    prog_list = list(programmes)
 
-    # Pre-validate all programmes before performing any deletions or mutations
-    for prog in prog_list:
-        validate_paper_programme_mapping(locked_offering, prog)
+    # 5. Lock all target Programme rows in deterministic ascending PK order
+    prog_ids = sorted({p.pk for p in prog_list})
+    locked_programmes = {
+        p.pk: p
+        for p in Programme.objects.select_for_update().filter(pk__in=prog_ids).order_by("pk")
+    }
+
+    # 6. Authoritative validation of every target programme against the locked offering and semester
+    for p in prog_list:
+        locked_p = locked_programmes[p.pk]
+        if locked_p.college_id != locked_offering.academic_session.college_id:
+            raise ValidationError({
+                "programme": (
+                    f"Programme '{locked_p.code}' (College ID {locked_p.college_id}) belongs to a "
+                    f"different college than PaperOffering '{locked_offering.paper_code}' (College ID {locked_offering.academic_session.college_id})."
+                )
+            })
+        if locked_p.duration_semesters < locked_sem.semester_number:
+            raise ValidationError({
+                "programme": (
+                    f"Programme '{locked_p.code}' duration ({locked_p.duration_semesters} sem) does not "
+                    f"cover offering semester ({locked_sem.semester_number})."
+                )
+            })
 
     if replace:
         PaperProgrammeMapping.objects.filter(paper_offering=locked_offering).delete()
 
     mappings = []
-    for prog in prog_list:
+    for p in prog_list:
+        locked_p = locked_programmes[p.pk]
         mapping, _ = PaperProgrammeMapping.objects.get_or_create(
             paper_offering=locked_offering,
-            programme=prog,
+            programme=locked_p,
         )
         mappings.append(mapping)
 
-    # Invariant: If mappings exist, offering must be marked as common paper
     if mappings and not locked_offering.is_common_paper:
         locked_offering.is_common_paper = True
         locked_offering.save(update_fields=["is_common_paper"])
@@ -242,32 +322,55 @@ def create_paper_programme_mapping(
 ) -> PaperProgrammeMapping:
     """
     Safely creates a new PaperProgrammeMapping under strict concurrency control.
-    Lock order: PaperOffering (select_for_update) -> Programme (select_for_update) -> validation -> persistence.
+    Lock hierarchy:
+    1. College(s) in ascending PK order
+    2. PaperOffering (select_for_update)
+    3. Programme (select_for_update)
+    4. Semester (select_for_update)
+    5. Authoritative validation
+    6. Persistence
     """
-    # 1. Exclusively lock the PaperOffering row first
-    locked_offering = (
-        PaperOffering.objects.select_for_update()
-        .select_related("academic_session", "semester")
-        .get(pk=paper_offering_id)
-    )
+    offering_college_id = PaperOffering.objects.values_list("academic_session__college_id", flat=True).get(pk=paper_offering_id)
+    prog_college_id = Programme.objects.values_list("college_id", flat=True).get(pk=programme_id)
 
-    # 2. Exclusively lock the target Programme row
+    # 1. Lock College(s) in deterministic ascending PK order
+    lock_colleges(offering_college_id, prog_college_id)
+
+    # 2. Exclusively lock the PaperOffering row
+    locked_offering = PaperOffering.objects.select_for_update().get(pk=paper_offering_id)
+
+    # 3. Exclusively lock the target Programme row
     locked_programme = Programme.objects.select_for_update().get(pk=programme_id)
 
-    # 3. Authoritative validation under lock
-    validate_paper_programme_mapping(locked_offering, locked_programme)
+    # 4. Exclusively lock the Semester row
+    locked_sem = Semester.objects.select_for_update().get(pk=locked_offering.semester_id)
 
-    # 4. Check uniqueness under lock
+    # 5. Authoritative validation under lock
+    if locked_programme.college_id != locked_offering.academic_session.college_id:
+        raise ValidationError({
+            "programme": (
+                f"Programme '{locked_programme.code}' (College ID {locked_programme.college_id}) belongs to a "
+                f"different college than PaperOffering '{locked_offering.paper_code}' (College ID {locked_offering.academic_session.college_id})."
+            )
+        })
+
+    if locked_programme.duration_semesters < locked_sem.semester_number:
+        raise ValidationError({
+            "programme": (
+                f"Programme '{locked_programme.code}' duration ({locked_programme.duration_semesters} sem) does not "
+                f"cover offering semester ({locked_sem.semester_number})."
+            )
+        })
+
+    # Check uniqueness under lock
     if PaperProgrammeMapping.objects.filter(paper_offering=locked_offering, programme=locked_programme).exists():
         raise ValidationError({"non_field_errors": ["Paper programme mapping already exists."]})
 
-    # 5. Create mapping
     mapping = PaperProgrammeMapping.objects.create(
         paper_offering=locked_offering,
         programme=locked_programme,
     )
 
-    # 6. Maintain is_common_paper flag atomically
     if not locked_offering.is_common_paper:
         locked_offering.is_common_paper = True
         locked_offering.save(update_fields=["is_common_paper"])
@@ -283,45 +386,75 @@ def update_paper_programme_mapping(
 ) -> PaperProgrammeMapping:
     """
     Safely updates an existing PaperProgrammeMapping under strict concurrency control.
-    Lock order: Affected PaperOffering rows (ascending PK) -> PaperProgrammeMapping -> Programme -> validation -> persistence.
+    Lock hierarchy:
+    1. College(s) in ascending PK order
+    2. Affected PaperOffering rows (select_for_update, order_by('pk'))
+    3. PaperProgrammeMapping row (select_for_update)
+    4. Target Programme (select_for_update)
+    5. Authoritative validation
+    6. Persistence
     """
-    # 1. Fetch current offering and programme IDs
-    initial = PaperProgrammeMapping.objects.values("paper_offering_id", "programme_id").get(pk=mapping_id)
+    initial = PaperProgrammeMapping.objects.values(
+        "paper_offering_id", "programme_id", "paper_offering__academic_session__college_id", "programme__college_id"
+    ).get(pk=mapping_id)
     current_po_id = initial["paper_offering_id"]
 
     proposed_po = validated_data.get("paper_offering")
     target_po_id = proposed_po.pk if proposed_po else current_po_id
 
-    # 2. Exclusively lock affected PaperOffering rows in deterministic ascending PK order
+    proposed_prog = validated_data.get("programme")
+    target_prog_id = proposed_prog.pk if proposed_prog else initial["programme_id"]
+
+    college_ids = {initial["paper_offering__academic_session__college_id"], initial["programme__college_id"]}
+    if proposed_po:
+        college_ids.add(proposed_po.academic_session.college_id)
+    if proposed_prog:
+        college_ids.add(proposed_prog.college_id)
+
+    # 1. Lock College(s) in deterministic ascending PK order
+    lock_colleges(*college_ids)
+
+    # 2. Lock affected PaperOffering rows in ascending PK order
     po_ids = sorted({current_po_id, target_po_id})
     locked_pos = {
         po.pk: po
         for po in PaperOffering.objects.select_for_update()
-        .select_related("academic_session", "semester")
         .filter(pk__in=po_ids)
         .order_by("pk")
     }
 
-    # 3. Exclusively lock the existing PaperProgrammeMapping row
+    # 3. Lock existing PaperProgrammeMapping row
     locked_mapping = PaperProgrammeMapping.objects.select_for_update().get(pk=mapping_id)
 
-    # 4. Exclusively lock target Programme row
-    proposed_prog = validated_data.get("programme")
-    target_prog_id = proposed_prog.pk if proposed_prog else initial["programme_id"]
+    # 4. Lock target Programme row
     locked_prog = Programme.objects.select_for_update().get(pk=target_prog_id)
 
     # 5. Authoritative validation under lock
     target_po = locked_pos[target_po_id]
-    validate_paper_programme_mapping(target_po, locked_prog)
+    locked_sem = Semester.objects.select_for_update().get(pk=target_po.semester_id)
 
-    # Check uniqueness if offering or programme changed
+    if locked_prog.college_id != target_po.academic_session.college_id:
+        raise ValidationError({
+            "programme": (
+                f"Programme '{locked_prog.code}' (College ID {locked_prog.college_id}) belongs to a "
+                f"different college than PaperOffering '{target_po.paper_code}' (College ID {target_po.academic_session.college_id})."
+            )
+        })
+
+    if locked_prog.duration_semesters < locked_sem.semester_number:
+        raise ValidationError({
+            "programme": (
+                f"Programme '{locked_prog.code}' duration ({locked_prog.duration_semesters} sem) does not "
+                f"cover offering semester ({locked_sem.semester_number})."
+            )
+        })
+
     if target_po_id != current_po_id or target_prog_id != initial["programme_id"]:
         if PaperProgrammeMapping.objects.filter(
             paper_offering=target_po, programme=locked_prog
         ).exclude(pk=mapping_id).exists():
             raise ValidationError({"non_field_errors": ["Paper programme mapping already exists."]})
 
-    # 6. Apply explicitly supplied fields
     if "paper_offering" in validated_data:
         locked_mapping.paper_offering = target_po
     if "programme" in validated_data:
@@ -330,7 +463,6 @@ def update_paper_programme_mapping(
     locked_mapping.full_clean()
     locked_mapping.save()
 
-    # 7. Maintain common-paper flag on target offering
     if not target_po.is_common_paper:
         target_po.is_common_paper = True
         target_po.save(update_fields=["is_common_paper"])
@@ -345,9 +477,13 @@ def delete_paper_programme_mapping(
 ) -> None:
     """
     Safely deletes a PaperProgrammeMapping under strict concurrency control.
-    Lock order: PaperOffering -> PaperProgrammeMapping -> deletion.
+    Lock hierarchy: College (select_for_update) -> PaperOffering (select_for_update) -> PaperProgrammeMapping (select_for_update) -> deletion.
     """
-    initial = PaperProgrammeMapping.objects.values("paper_offering_id").get(pk=mapping_id)
+    initial = PaperProgrammeMapping.objects.values(
+        "paper_offering_id", "paper_offering__academic_session__college_id"
+    ).get(pk=mapping_id)
+
+    lock_colleges(initial["paper_offering__academic_session__college_id"])
     locked_offering = PaperOffering.objects.select_for_update().get(pk=initial["paper_offering_id"])
     locked_mapping = PaperProgrammeMapping.objects.select_for_update().get(pk=mapping_id)
     locked_mapping.delete()
@@ -361,48 +497,68 @@ def update_paper_offering(
 ) -> PaperOffering:
     """
     Safely updates an existing PaperOffering under strict concurrency control.
-    Lock order: PaperOffering -> associated programme mappings -> validation -> persistence.
-
-    Guarantees:
-    1. Acquires select_for_update() on the PaperOffering row first.
-    2. Loads authoritative persisted database state while holding the lock.
-    3. Acquires select_for_update() on associated PaperProgrammeMapping rows in deterministic PK order.
-    4. Merges only explicitly supplied fields from validated_data onto the locked record.
-    5. Preserves concurrent changes to any fields not explicitly included in validated_data.
-    6. Validates the common-paper invariant against current persisted mappings.
-    7. Revalidates existing programme mappings against the proposed semester (duration coverage and college isolation).
-    8. Revalidates complete proposed academic state via validate_paper_offering_relationships.
-    9. Persists the freshly locked object, never a stale serializer instance.
+    Lock hierarchy:
+    1. College (select_for_update)
+    2. PaperOffering (select_for_update)
+    3. Associated PaperProgrammeMapping rows (select_for_update, order_by('pk'))
+    4. SubjectCategory (select_for_update)
+    5. Semester & Programme (select_for_update)
+    6. Authoritative validation
+    7. Persistence
     """
-    # 1. Exclusively lock the PaperOffering row
+    po_vals = PaperOffering.objects.values(
+        "academic_session__college_id", "subject_category_id", "semester_id", "subject_id", "academic_session_id"
+    ).get(pk=paper_offering_id)
+    current_college_id = po_vals["academic_session__college_id"]
+    proposed_session = validated_data.get("academic_session")
+    target_college_id = proposed_session.college_id if proposed_session else current_college_id
+
+    # 1. Lock College(s) in deterministic ascending PK order
+    lock_colleges(current_college_id, target_college_id)
+
+    # 2. Exclusively lock the PaperOffering row
     locked_offering = PaperOffering.objects.select_for_update().get(pk=paper_offering_id)
 
-    # 2. Exclusively lock associated programme mappings in deterministic PK order
+    # 3. Exclusively lock associated programme mappings in deterministic PK order
     existing_mappings = list(
         PaperProgrammeMapping.objects.select_for_update()
         .filter(paper_offering=locked_offering)
-        .select_related("programme")
         .order_by("pk")
     )
 
-    # 3. Determine proposed values (merge validated_data onto locked record)
-    proposed_session = validated_data.get("academic_session", locked_offering.academic_session)
-    proposed_semester = validated_data.get("semester", locked_offering.semester)
-    proposed_subject = validated_data.get("subject", locked_offering.subject)
-    proposed_category = validated_data.get("subject_category", locked_offering.subject_category)
+    # 4. Exclusively lock the (current or proposed) SubjectCategory row
+    cat_id = validated_data.get("subject_category").pk if "subject_category" in validated_data else locked_offering.subject_category_id
+    locked_cat = SubjectCategory.objects.select_for_update().get(pk=cat_id)
+
+    # 5. Exclusively lock the (current or proposed) Semester and Programme rows
+    sem_id = validated_data.get("semester").pk if "semester" in validated_data else locked_offering.semester_id
+    locked_sem = Semester.objects.select_for_update().get(pk=sem_id)
+    locked_prog = Programme.objects.select_for_update().get(pk=locked_sem.programme_id)
+    locked_sem.programme = locked_prog
+
+    # 6. Exclusively lock the (current or proposed) Subject and Department rows
+    sub_id = validated_data.get("subject").pk if "subject" in validated_data else locked_offering.subject_id
+    locked_sub = Subject.objects.select_for_update().get(pk=sub_id)
+    locked_dept = Department.objects.select_for_update().get(pk=locked_sub.department_id)
+    locked_sub.department = locked_dept
+
+    # 7. Exclusively lock the (current or proposed) AcademicSession row
+    sess_id = validated_data.get("academic_session").pk if "academic_session" in validated_data else locked_offering.academic_session_id
+    locked_session = AcademicSession.objects.select_for_update().get(pk=sess_id)
+
+    # Determine proposed values (merge validated_data onto locked record)
     proposed_credits = validated_data.get("credits", locked_offering.credits)
     proposed_int_marks = validated_data.get("max_marks_internal", locked_offering.max_marks_internal)
     proposed_ext_marks = validated_data.get("max_marks_external", locked_offering.max_marks_external)
     proposed_pass_marks = validated_data.get("pass_marks_external", locked_offering.pass_marks_external)
 
-    # If is_common_paper was explicitly supplied, use it; otherwise preserve current database state
     proposed_is_common = (
         validated_data["is_common_paper"]
         if "is_common_paper" in validated_data
         else locked_offering.is_common_paper
     )
 
-    # 4. Invariant: Common-paper flag check against current mappings
+    # Common-paper flag check against current mappings
     if existing_mappings:
         if not proposed_is_common:
             raise ValidationError({
@@ -413,16 +569,16 @@ def update_paper_offering(
             })
         proposed_is_common = True
 
-    # 5. Invariant: Semester change mapping revalidation
+    # Semester change mapping revalidation
     if existing_mappings:
-        sem_num = proposed_semester.semester_number
+        sem_num = locked_sem.semester_number
         for mapping in existing_mappings:
             prog = mapping.programme
-            if prog.college_id != proposed_session.college_id:
+            if prog.college_id != locked_session.college_id:
                 raise ValidationError({
                     "semester": (
                         f"Mapped programme '{prog.code}' belongs to College ID {prog.college_id}, "
-                        f"which does not match academic session College ID {proposed_session.college_id}."
+                        f"which does not match academic session College ID {locked_session.college_id}."
                     )
                 })
             if prog.duration_semesters < sem_num:
@@ -434,29 +590,65 @@ def update_paper_offering(
                     )
                 })
 
-    # 6. Revalidate complete proposed academic state
+    # Revalidate complete proposed academic state under lock
     validate_paper_offering_relationships(
-        academic_session=proposed_session,
-        semester=proposed_semester,
-        subject=proposed_subject,
-        subject_category=proposed_category,
+        academic_session=locked_session,
+        semester=locked_sem,
+        subject=locked_sub,
+        subject_category=locked_cat,
         credits=proposed_credits,
         max_marks_internal=proposed_int_marks,
         max_marks_external=proposed_ext_marks,
         pass_marks_external=proposed_pass_marks,
     )
 
-    # 7. Apply explicitly supplied fields onto the locked record
+    # Apply explicitly supplied fields onto the locked record
     for field, val in validated_data.items():
         setattr(locked_offering, field, val)
 
-    # Ensure invariant is strictly reflected on the object
     if existing_mappings:
         locked_offering.is_common_paper = True
 
     locked_offering.full_clean()
     locked_offering.save()
     return locked_offering
+
+
+@transaction.atomic
+def create_programme(
+    *,
+    college_id: int,
+    validated_data: dict,
+) -> Programme:
+    """
+    Safely creates a new Programme under strict concurrency control.
+    Lock hierarchy: College (select_for_update) -> validation -> persistence.
+    """
+    locked_colleges = lock_colleges(college_id)
+    locked_college = locked_colleges[college_id]
+
+    code = validated_data.get("code", "").strip()
+    if not code:
+        raise ValidationError({"code": "Programme code is required."})
+
+    duration = validated_data.get("duration_semesters", 8)
+    if duration < 1:
+        raise ValidationError({"duration_semesters": "Duration in semesters must be at least 1."})
+
+    if Programme.objects.filter(college=locked_college, code=code).exists():
+        raise ValidationError({"code": f"Programme with code '{code}' already exists for this college."})
+
+    programme = Programme(
+        college=locked_college,
+        name=validated_data.get("name", "").strip(),
+        code=code,
+        duration_semesters=duration,
+        degree_type=validated_data.get("degree_type", "UG"),
+        is_active=validated_data.get("is_active", True),
+    )
+    programme.full_clean()
+    programme.save()
+    return programme
 
 
 @transaction.atomic
@@ -472,13 +664,22 @@ def update_programme(
     2. Duration cannot be reduced below any mapped PaperOffering's semester_number.
     3. College cannot be changed if dependent paper offerings or mappings exist.
     """
+    initial = Programme.objects.values("college_id").get(pk=programme_id)
+    current_college_id = initial["college_id"]
+    proposed_college = validated_data.get("college")
+    target_college_id = proposed_college.pk if proposed_college else current_college_id
+
+    # 1. Level 1 coordination lock: College(s) in deterministic ascending PK order
+    lock_colleges(current_college_id, target_college_id)
+
+    # 2. Exclusively lock the Programme row
     locked_prog = Programme.objects.select_for_update().get(pk=programme_id)
 
     proposed_duration = validated_data.get("duration_semesters", locked_prog.duration_semesters)
     if proposed_duration < 1:
         raise ValidationError({"duration_semesters": "Duration in semesters must be at least 1."})
 
-    # Check 1: Existing semesters
+    # Check 1: Existing semesters under lock
     max_sem = Semester.objects.filter(programme=locked_prog).aggregate(max_num=models.Max("semester_number"))["max_num"]
     if max_sem is not None and proposed_duration < max_sem:
         raise ValidationError({
@@ -487,7 +688,7 @@ def update_programme(
             )
         })
 
-    # Check 2: Mapped paper offerings
+    # Check 2: Mapped paper offerings under lock
     max_mapped_sem = PaperProgrammeMapping.objects.filter(programme=locked_prog).aggregate(
         max_sem=models.Max("paper_offering__semester__semester_number")
     )["max_sem"]
@@ -499,8 +700,7 @@ def update_programme(
         })
 
     # Check 3: College change
-    proposed_college = validated_data.get("college", locked_prog.college)
-    if proposed_college.pk != locked_prog.college_id:
+    if proposed_college and proposed_college.pk != locked_prog.college_id:
         has_offerings = PaperOffering.objects.filter(semester__programme=locked_prog).exists()
         has_mappings = PaperProgrammeMapping.objects.filter(programme=locked_prog).exists()
         if has_offerings or has_mappings:
@@ -517,6 +717,49 @@ def update_programme(
 
 
 @transaction.atomic
+def create_semester(
+    *,
+    programme_id: int,
+    validated_data: dict,
+) -> Semester:
+    """
+    Safely creates a new Semester under strict concurrency control.
+    Lock hierarchy: College (select_for_update) -> Programme (select_for_update) -> validation -> persistence.
+    """
+    prog_college_id = Programme.objects.values_list("college_id", flat=True).get(pk=programme_id)
+
+    # 1. Level 1 coordination lock
+    lock_colleges(prog_college_id)
+
+    # 2. Level 2 parent lock
+    locked_prog = Programme.objects.select_for_update().get(pk=programme_id)
+
+    # 3. Authoritative validation under lock
+    sem_num = validated_data.get("semester_number")
+    if sem_num is None or sem_num < 1:
+        raise ValidationError({"semester_number": "Semester number must be at least 1."})
+    if sem_num > locked_prog.duration_semesters:
+        raise ValidationError({
+            "semester_number": f"Semester number ({sem_num}) exceeds programme duration ({locked_prog.duration_semesters})."
+        })
+
+    if Semester.objects.filter(programme=locked_prog, semester_number=sem_num).exists():
+        raise ValidationError({
+            "semester_number": f"Semester {sem_num} already exists for programme '{locked_prog.code}'."
+        })
+
+    semester = Semester(
+        programme=locked_prog,
+        semester_number=sem_num,
+        name=validated_data.get("name", f"Semester {sem_num}"),
+        is_active=validated_data.get("is_active", True),
+    )
+    semester.full_clean()
+    semester.save()
+    return semester
+
+
+@transaction.atomic
 def update_semester(
     *,
     semester_id: int,
@@ -524,26 +767,48 @@ def update_semester(
 ) -> Semester:
     """
     Safely updates a Semester under strict concurrency control.
-    Enforces that:
-    1. Semester number cannot exceed programme duration.
-    2. Semester number cannot exceed the duration of any programme mapped to dependent paper offerings.
-    3. Programme cannot be reassigned to a different college while dependent paper offerings exist.
+    Lock hierarchy: College -> Programme -> Semester -> validation -> persistence.
     """
-    locked_sem = Semester.objects.select_for_update().select_related("programme").get(pk=semester_id)
+    initial = Semester.objects.values("programme_id", "programme__college_id").get(pk=semester_id)
+    current_prog_id = initial["programme_id"]
+    current_college_id = initial["programme__college_id"]
 
-    proposed_prog = validated_data.get("programme", locked_sem.programme)
+    proposed_prog = validated_data.get("programme")
+    target_prog_id = proposed_prog.pk if proposed_prog else current_prog_id
+    target_college_id = proposed_prog.college_id if proposed_prog else current_college_id
+
+    # 1. Level 1 coordination lock
+    lock_colleges(current_college_id, target_college_id)
+
+    # 2. Exclusively lock affected Programme rows in ascending PK order
+    prog_ids = sorted({current_prog_id, target_prog_id})
+    locked_progs = {
+        p.pk: p
+        for p in Programme.objects.select_for_update().filter(pk__in=prog_ids).order_by("pk")
+    }
+
+    # 3. Exclusively lock the Semester row
+    locked_sem = Semester.objects.select_for_update().get(pk=semester_id)
+    target_prog = locked_progs[target_prog_id]
+
     proposed_sem_num = validated_data.get("semester_number", locked_sem.semester_number)
-
     if proposed_sem_num < 1:
         raise ValidationError({"semester_number": "Semester number must be at least 1."})
 
     # Check 1: Exceeds programme duration
-    if proposed_sem_num > proposed_prog.duration_semesters:
+    if proposed_sem_num > target_prog.duration_semesters:
         raise ValidationError({
             "semester_number": (
-                f"Semester number ({proposed_sem_num}) exceeds programme duration ({proposed_prog.duration_semesters})."
+                f"Semester number ({proposed_sem_num}) exceeds programme duration ({target_prog.duration_semesters})."
             )
         })
+
+    # Check uniqueness if semester_number or programme changed
+    if proposed_sem_num != locked_sem.semester_number or target_prog_id != current_prog_id:
+        if Semester.objects.filter(programme=target_prog, semester_number=proposed_sem_num).exclude(pk=semester_id).exists():
+            raise ValidationError({
+                "semester_number": f"Semester {proposed_sem_num} already exists for programme '{target_prog.code}'."
+            })
 
     # Check 2: Mapped programmes of dependent paper offerings
     min_mapped_prog_dur = PaperProgrammeMapping.objects.filter(
@@ -557,7 +822,7 @@ def update_semester(
         })
 
     # Check 3: Programme reassignment college mismatch
-    if proposed_prog.college_id != locked_sem.programme.college_id:
+    if target_prog.college_id != locked_progs[current_prog_id].college_id:
         if PaperOffering.objects.filter(semester=locked_sem).exists():
             raise ValidationError({
                 "programme": "Cannot reassign semester to a programme in a different college while dependent paper offerings exist."
@@ -566,9 +831,42 @@ def update_semester(
     for field, val in validated_data.items():
         setattr(locked_sem, field, val)
 
+    if proposed_prog:
+        locked_sem.programme = target_prog
+
     locked_sem.full_clean()
     locked_sem.save()
     return locked_sem
+
+
+@transaction.atomic
+def create_department(
+    *,
+    college_id: int,
+    validated_data: dict,
+) -> Department:
+    """
+    Safely creates a new Department under strict concurrency control.
+    Lock hierarchy: College (select_for_update) -> validation -> persistence.
+    """
+    locked_colleges = lock_colleges(college_id)
+    locked_college = locked_colleges[college_id]
+
+    code = validated_data.get("code", "").strip()
+    if not code:
+        raise ValidationError({"code": "Department code is required."})
+
+    if Department.objects.filter(college=locked_college, code=code).exists():
+        raise ValidationError({"code": f"Department with code '{code}' already exists for this college."})
+
+    dept = Department(
+        college=locked_college,
+        name=validated_data.get("name", "").strip(),
+        code=code,
+    )
+    dept.full_clean()
+    dept.save()
+    return dept
 
 
 @transaction.atomic
@@ -582,10 +880,15 @@ def update_department(
     Enforces that:
     1. College cannot be changed while dependent paper offerings reference subjects of this department.
     """
+    initial = Department.objects.values("college_id").get(pk=department_id)
+    current_college_id = initial["college_id"]
+    proposed_college = validated_data.get("college")
+    target_college_id = proposed_college.pk if proposed_college else current_college_id
+
+    lock_colleges(current_college_id, target_college_id)
     locked_dept = Department.objects.select_for_update().get(pk=department_id)
 
-    proposed_college = validated_data.get("college", locked_dept.college)
-    if proposed_college.pk != locked_dept.college_id:
+    if proposed_college and proposed_college.pk != locked_dept.college_id:
         if PaperOffering.objects.filter(subject__department=locked_dept).exists():
             raise ValidationError({
                 "college": "Cannot change department college while dependent paper offerings exist."
@@ -600,6 +903,39 @@ def update_department(
 
 
 @transaction.atomic
+def create_subject(
+    *,
+    department_id: int,
+    validated_data: dict,
+) -> Subject:
+    """
+    Safely creates a new Subject under strict concurrency control.
+    Lock hierarchy: College (select_for_update) -> Department (select_for_update) -> validation -> persistence.
+    """
+    dept_college_id = Department.objects.values_list("college_id", flat=True).get(pk=department_id)
+    lock_colleges(dept_college_id)
+    locked_dept = Department.objects.select_for_update().get(pk=department_id)
+
+    code = validated_data.get("code", "").strip()
+    if not code:
+        raise ValidationError({"code": "Subject code is required."})
+
+    if Subject.objects.filter(department=locked_dept, code=code).exists():
+        raise ValidationError({"code": f"Subject with code '{code}' already exists for this department."})
+
+    subject = Subject(
+        department=locked_dept,
+        name=validated_data.get("name", "").strip(),
+        code=code,
+        description=validated_data.get("description", ""),
+        is_active=validated_data.get("is_active", True),
+    )
+    subject.full_clean()
+    subject.save()
+    return subject
+
+
+@transaction.atomic
 def update_subject(
     *,
     subject_id: int,
@@ -610,10 +946,24 @@ def update_subject(
     Enforces that:
     1. Department cannot be reassigned to a different college while dependent paper offerings exist.
     """
-    locked_sub = Subject.objects.select_for_update().select_related("department").get(pk=subject_id)
+    initial = Subject.objects.values("department_id", "department__college_id").get(pk=subject_id)
+    current_dept_id = initial["department_id"]
+    current_college_id = initial["department__college_id"]
 
-    proposed_dept = validated_data.get("department", locked_sub.department)
-    if proposed_dept.college_id != locked_sub.department.college_id:
+    proposed_dept = validated_data.get("department")
+    target_dept_id = proposed_dept.pk if proposed_dept else current_dept_id
+    target_college_id = proposed_dept.college_id if proposed_dept else current_college_id
+
+    lock_colleges(current_college_id, target_college_id)
+    dept_ids = sorted({current_dept_id, target_dept_id})
+    locked_depts = {
+        d.pk: d
+        for d in Department.objects.select_for_update().filter(pk__in=dept_ids).order_by("pk")
+    }
+    locked_sub = Subject.objects.select_for_update().get(pk=subject_id)
+    target_dept = locked_depts[target_dept_id]
+
+    if target_dept.college_id != locked_depts[current_dept_id].college_id:
         if PaperOffering.objects.filter(subject=locked_sub).exists():
             raise ValidationError({
                 "department": "Cannot reassign subject to a department in a different college while dependent paper offerings exist."
@@ -622,9 +972,54 @@ def update_subject(
     for field, val in validated_data.items():
         setattr(locked_sub, field, val)
 
+    if proposed_dept:
+        locked_sub.department = target_dept
+
     locked_sub.full_clean()
     locked_sub.save()
     return locked_sub
+
+
+@transaction.atomic
+def create_subject_category(
+    *,
+    college_id: int,
+    validated_data: dict,
+) -> SubjectCategory:
+    """
+    Safely creates a new SubjectCategory under strict concurrency control.
+    Lock hierarchy: College (select_for_update) -> validation -> persistence.
+    """
+    locked_colleges = lock_colleges(college_id)
+    locked_college = locked_colleges[college_id]
+
+    code = validated_data.get("code", "").strip()
+    if not code:
+        raise ValidationError({"code": "Subject category code is required."})
+
+    min_credits = validated_data.get("min_credits", Decimal("2.0"))
+    max_credits = validated_data.get("max_credits", Decimal("4.0"))
+
+    if min_credits < Decimal("0.0"):
+        raise ValidationError({"min_credits": "Minimum credits cannot be negative."})
+    if max_credits < min_credits:
+        raise ValidationError({"max_credits": "Maximum credits cannot be less than minimum credits."})
+
+    if SubjectCategory.objects.filter(college=locked_college, code=code).exists():
+        raise ValidationError({"code": f"Subject category with code '{code}' already exists for this college."})
+
+    cat = SubjectCategory(
+        college=locked_college,
+        name=validated_data.get("name", "").strip(),
+        code=code,
+        description=validated_data.get("description", ""),
+        min_credits=min_credits,
+        max_credits=max_credits,
+        is_active=validated_data.get("is_active", True),
+    )
+    cat.full_clean()
+    cat.save()
+    return cat
 
 
 @transaction.atomic
@@ -640,6 +1035,12 @@ def update_subject_category(
     2. max_credits cannot be decreased below any dependent PaperOffering's credits.
     3. College cannot be changed while dependent paper offerings exist.
     """
+    initial = SubjectCategory.objects.values("college_id").get(pk=category_id)
+    current_college_id = initial["college_id"]
+    proposed_college = validated_data.get("college")
+    target_college_id = proposed_college.pk if proposed_college else current_college_id
+
+    lock_colleges(current_college_id, target_college_id)
     locked_cat = SubjectCategory.objects.select_for_update().get(pk=category_id)
 
     proposed_min = validated_data.get("min_credits", locked_cat.min_credits)
@@ -670,8 +1071,7 @@ def update_subject_category(
             )
         })
 
-    proposed_college = validated_data.get("college", locked_cat.college)
-    if proposed_college.pk != locked_cat.college_id:
+    if proposed_college and proposed_college.pk != locked_cat.college_id:
         if PaperOffering.objects.filter(subject_category=locked_cat).exists():
             raise ValidationError({
                 "college": "Cannot change subject category college while dependent paper offerings exist."
@@ -686,6 +1086,42 @@ def update_subject_category(
 
 
 @transaction.atomic
+def create_academic_session(
+    *,
+    college_id: int,
+    validated_data: dict,
+) -> AcademicSession:
+    """
+    Safely creates a new AcademicSession under strict concurrency control.
+    Lock hierarchy: College (select_for_update) -> validation -> persistence.
+    """
+    locked_colleges = lock_colleges(college_id)
+    locked_college = locked_colleges[college_id]
+
+    start_date = validated_data.get("start_date")
+    end_date = validated_data.get("end_date")
+    validate_academic_session_dates(start_date, end_date)
+
+    name = validated_data.get("name", "").strip()
+    if not name:
+        raise ValidationError({"name": "Academic session name is required."})
+
+    if AcademicSession.objects.filter(college=locked_college, name=name).exists():
+        raise ValidationError({"name": f"Academic session '{name}' already exists for this college."})
+
+    session = AcademicSession(
+        college=locked_college,
+        name=name,
+        start_date=start_date,
+        end_date=end_date,
+        is_current=False,
+    )
+    session.full_clean()
+    session.save()
+    return session
+
+
+@transaction.atomic
 def update_academic_session(
     *,
     session_id: int,
@@ -697,14 +1133,19 @@ def update_academic_session(
     1. start_date must strictly precede end_date.
     2. College cannot be changed while dependent paper offerings exist.
     """
+    initial = AcademicSession.objects.values("college_id").get(pk=session_id)
+    current_college_id = initial["college_id"]
+    proposed_college = validated_data.get("college")
+    target_college_id = proposed_college.pk if proposed_college else current_college_id
+
+    lock_colleges(current_college_id, target_college_id)
     locked_session = AcademicSession.objects.select_for_update().get(pk=session_id)
 
     proposed_start = validated_data.get("start_date", locked_session.start_date)
     proposed_end = validated_data.get("end_date", locked_session.end_date)
     validate_academic_session_dates(proposed_start, proposed_end)
 
-    proposed_college = validated_data.get("college", locked_session.college)
-    if proposed_college.pk != locked_session.college_id:
+    if proposed_college and proposed_college.pk != locked_session.college_id:
         if PaperOffering.objects.filter(academic_session=locked_session).exists():
             raise ValidationError({
                 "college": "Cannot change academic session college while dependent paper offerings exist."

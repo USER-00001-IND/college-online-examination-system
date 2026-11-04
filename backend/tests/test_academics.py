@@ -3085,3 +3085,478 @@ class DependentAcademicRecordIntegrityRegressionTests(TestCase):
             self.session.clean()
         self.assertIn("college", cm.exception.message_dict)
         self.session.college = self.college
+
+
+class ParentChildAcademicMutationRaceRegressionTests(TestCase):
+    """
+    Round 6 Regression Tests for High Finding A:
+    Parent-Child Academic Mutation Race & Coordinated Academic Lock Hierarchy.
+    Guarantees:
+    - Level 1 College row lock coordinates mutations across programmes, semesters, and offerings.
+    - Programme duration reduction coordinates with child semester creation.
+    - Programme duration reduction coordinates with paper-programme mapping.
+    - Bulk mapping coordinates with programme duration.
+    - Direct mapping PATCH revalidates against concurrently updated programme duration.
+    - Semester update coordinates with programme duration reduction.
+    - Transaction rollback on failed mutation preserves clean database state.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.college = College.objects.create(
+            name="Model College", code="MC-GU", contact_email="admin@mc.edu"
+        )
+        self.session = AcademicSession.objects.create(
+            college=self.college,
+            name="2026-2027",
+            start_date=date(2026, 7, 1),
+            end_date=date(2027, 6, 30),
+        )
+        self.dept = Department.objects.create(college=self.college, name="Pol Sci", code="POL")
+        self.sub = Subject.objects.create(department=self.dept, name="Pol Sci", code="POLSCI")
+        self.cat = SubjectCategory.objects.create(
+            college=self.college, code="MAJOR", name="Major", min_credits=Decimal("2.0"), max_credits=Decimal("6.0")
+        )
+        self.prog = Programme.objects.create(
+            college=self.college, name="Bachelor of Arts", code="BA", duration_semesters=8
+        )
+        self.sem2 = Semester.objects.create(programme=self.prog, semester_number=2, name="Sem 2")
+        self.sem4 = Semester.objects.create(programme=self.prog, semester_number=4, name="Sem 4")
+        self.admin = User.objects.create_user(
+            username="academic_admin_r6",
+            email="admin_r6@mc.edu",
+            password="Password123!",
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+    def test_a1_programme_duration_reduced_while_semester_creation_prepared_rejected(self):
+        """
+        Test A1:
+        Request prepares to create Semester 6 for prog (currently duration 8).
+        Serializer validation passes against duration 8.
+        Concurrent update reduces programme duration to 4 and commits.
+        serializer.save() acquires college and programme locks, discovers duration 4 < 6,
+        and is rejected with DRFValidationError!
+        Zero semester 6 row inserted.
+        """
+        from apps.academics.serializers import SemesterSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        serializer = SemesterSerializer(data={
+            "programme": self.prog.id,
+            "semester_number": 6,
+            "name": "Semester 6",
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Simulate concurrent transaction committing programme duration reduction to 4
+        self.prog.duration_semesters = 4
+        self.prog.save(update_fields=["duration_semesters"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.assertEqual(Semester.objects.filter(programme=self.prog, semester_number=6).count(), 0)
+
+    def test_a2_semester_created_first_blocks_concurrent_duration_reduction(self):
+        """
+        Test A2:
+        Semester 6 exists for programme.
+        Attempting to reduce programme duration to 4 via API is rejected with HTTP 400.
+        Database state remains duration 8.
+        """
+        Semester.objects.create(programme=self.prog, semester_number=6, name="Semester 6")
+
+        url = reverse("academics:programme-detail", kwargs={"pk": self.prog.id})
+        res = self.client.patch(url, {"duration_semesters": 4})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.prog.refresh_from_db()
+        self.assertEqual(self.prog.duration_semesters, 8)
+
+    def test_b1_programme_duration_reduced_while_mapping_prepared_rejected(self):
+        """
+        Test B1:
+        Paper offering is in Semester 6 of prog_a.
+        prog_b has duration 8.
+        PaperProgrammeMappingSerializer validates mapping offering to prog_b (passes).
+        Concurrent update reduces prog_b duration to 4.
+        serializer.save() discovers duration 4 < offering semester 6 under lock and fails!
+        Zero mapping row inserted.
+        """
+        from apps.academics.serializers import PaperProgrammeMappingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        prog_b = Programme.objects.create(
+            college=self.college, name="BSc", code="BSC", duration_semesters=8
+        )
+        sem6 = Semester.objects.create(programme=self.prog, semester_number=6, name="Sem 6")
+        offering_sem6 = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=sem6,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="POL601",
+            title="Advanced Politics",
+            credits=Decimal("4.0"),
+        )
+
+        serializer = PaperProgrammeMappingSerializer(data={
+            "paper_offering": offering_sem6.id,
+            "programme": prog_b.id,
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent update reduces prog_b duration to 4
+        prog_b.duration_semesters = 4
+        prog_b.save(update_fields=["duration_semesters"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.assertEqual(PaperProgrammeMapping.objects.filter(paper_offering=offering_sem6, programme=prog_b).count(), 0)
+
+    def test_b2_mapping_created_first_blocks_concurrent_duration_reduction(self):
+        """
+        Test B2:
+        Mapping of Semester 6 paper exists for prog_b (duration 8).
+        Attempting to reduce prog_b duration to 4 is rejected with HTTP 400.
+        """
+        prog_b = Programme.objects.create(
+            college=self.college, name="BSc", code="BSC", duration_semesters=8
+        )
+        sem6 = Semester.objects.create(programme=self.prog, semester_number=6, name="Sem 6")
+        offering_sem6 = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=sem6,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="POL602",
+            title="Advanced Politics II",
+            credits=Decimal("4.0"),
+        )
+        PaperProgrammeMapping.objects.create(paper_offering=offering_sem6, programme=prog_b)
+        offering_sem6.is_common_paper = True
+        offering_sem6.save()
+
+        url = reverse("academics:programme-detail", kwargs={"pk": prog_b.id})
+        res = self.client.patch(url, {"duration_semesters": 4})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        prog_b.refresh_from_db()
+        self.assertEqual(prog_b.duration_semesters, 8)
+
+    def test_b3_bulk_map_paper_to_programmes_coordinates_with_duration_reduction(self):
+        """
+        Test B3:
+        Bulk mapping via map_paper_to_programmes checks programme duration under row locks.
+        prog_b duration reduced to 4 -> bulk mapping to Semester 6 offering rejected with ValidationError.
+        """
+        prog_b = Programme.objects.create(
+            college=self.college, name="BSc", code="BSC", duration_semesters=4
+        )
+        sem6 = Semester.objects.create(programme=self.prog, semester_number=6, name="Sem 6")
+        offering_sem6 = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=sem6,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="POL603",
+            title="Advanced Politics III",
+            credits=Decimal("4.0"),
+        )
+
+        url = reverse("academics:paper-offering-map-programmes", kwargs={"pk": offering_sem6.id})
+        res = self.client.post(url, {"programme_ids": [prog_b.id], "replace": False}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(PaperProgrammeMapping.objects.filter(paper_offering=offering_sem6).count(), 0)
+
+    def test_b4_direct_mapping_patch_revalidates_against_concurrent_duration_reduction(self):
+        """
+        Test B4:
+        Direct mapping exists with offering in Semester 4.
+        Target programme has duration 4.
+        Serializer validates change to paper offering in Semester 6 (initially programme had duration 8).
+        Concurrent update reduces programme duration to 4.
+        PATCH is rejected under row locks with HTTP 400.
+        """
+        from apps.academics.serializers import PaperProgrammeMappingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        prog_b = Programme.objects.create(
+            college=self.college, name="BSc", code="BSC", duration_semesters=8
+        )
+        sem6 = Semester.objects.create(programme=self.prog, semester_number=6, name="Sem 6")
+        offering_sem4 = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=self.sem4,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="POL401",
+            title="Political Thought",
+            credits=Decimal("4.0"),
+            is_common_paper=True,
+        )
+        offering_sem6 = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=sem6,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="POL604",
+            title="Global Politics",
+            credits=Decimal("4.0"),
+        )
+        mapping = PaperProgrammeMapping.objects.create(paper_offering=offering_sem4, programme=prog_b)
+
+        serializer = PaperProgrammeMappingSerializer(
+            instance=mapping, data={"paper_offering": offering_sem6.id}, partial=True
+        )
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent transaction reduces prog_b duration to 4
+        prog_b.duration_semesters = 4
+        prog_b.save(update_fields=["duration_semesters"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        mapping.refresh_from_db()
+        self.assertEqual(mapping.paper_offering, offering_sem4)
+
+    def test_b5_semester_update_increasing_number_coordinates_with_programme_duration(self):
+        """
+        Test B5:
+        Attempting to increase semester number from 2 to 6 on a programme with duration 4
+        is rejected with HTTP 400.
+        """
+        self.prog.duration_semesters = 4
+        self.prog.save()
+
+        url = reverse("academics:semester-detail", kwargs={"pk": self.sem2.id})
+        res = self.client.patch(url, {"semester_number": 6})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.sem2.refresh_from_db()
+        self.assertEqual(self.sem2.semester_number, 2)
+
+
+class SubjectCategoryCreditRangeConcurrencyRegressionTests(TestCase):
+    """
+    Round 6 Regression Tests for Medium Finding B:
+    Subject-Category Credit-Range Concurrency Race & Mutual Locking.
+    Guarantees:
+    - SubjectCategory updates and PaperOffering creation/updates acquire Level 1 College coordination lock.
+    - Category max_credits reduction coordinates with paper credit updates.
+    - Category max_credits reduction coordinates with paper creation.
+    - Category min_credits increase coordinates with paper credit updates.
+    - Category reassignment on paper offering revalidates against target category credit bounds.
+    - Zero-credit papers are valid when category min_credits is 0.0.
+    - Failed mutations roll back cleanly leaving database unmodified.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.college = College.objects.create(
+            name="Model College", code="MC-GU", contact_email="admin@mc.edu"
+        )
+        self.session = AcademicSession.objects.create(
+            college=self.college,
+            name="2026-2027",
+            start_date=date(2026, 7, 1),
+            end_date=date(2027, 6, 30),
+        )
+        self.prog = Programme.objects.create(
+            college=self.college, name="BA", code="BA", duration_semesters=8
+        )
+        self.sem2 = Semester.objects.create(programme=self.prog, semester_number=2, name="Sem 2")
+        self.dept = Department.objects.create(college=self.college, name="Pol Sci", code="POL")
+        self.sub = Subject.objects.create(department=self.dept, name="Pol Sci", code="POLSCI")
+        self.cat = SubjectCategory.objects.create(
+            college=self.college, code="SEC", name="Skill Enhancement", min_credits=Decimal("2.0"), max_credits=Decimal("6.0")
+        )
+        self.offering = PaperOffering.objects.create(
+            academic_session=self.session,
+            semester=self.sem2,
+            subject=self.sub,
+            subject_category=self.cat,
+            paper_code="SEC201",
+            title="Public Speaking",
+            credits=Decimal("4.0"),
+        )
+        self.admin = User.objects.create_user(
+            username="academic_admin_cat_r6",
+            email="admin_cat_r6@mc.edu",
+            password="Password123!",
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+    def test_c1_category_max_credits_reduced_while_paper_credit_update_prepared_rejected(self):
+        """
+        Test C1:
+        Serializer prepared to update offering credits from 4.0 to 5.0 (category max is 6.0).
+        Preliminary serializer validation passes.
+        Concurrent update reduces category max_credits to 4.0 and commits.
+        serializer.save() under row lock discovers 5.0 > locked_cat.max_credits (4.0)
+        and raises DRFValidationError!
+        offering credits remain 4.0.
+        """
+        from apps.academics.serializers import PaperOfferingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        serializer = PaperOfferingSerializer(
+            instance=self.offering, data={"credits": "5.0"}, partial=True
+        )
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent transaction reduces category max_credits to 4.0
+        self.cat.max_credits = Decimal("4.0")
+        self.cat.save(update_fields=["max_credits"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.credits, Decimal("4.0"))
+
+    def test_c2_paper_credit_update_commits_first_blocks_category_max_credit_reduction(self):
+        """
+        Test C2:
+        Paper offering credits updated to 5.0.
+        Subsequent attempt to reduce category max_credits to 4.0 via API is rejected with HTTP 400.
+        Category max_credits remains 6.0.
+        """
+        self.offering.credits = Decimal("5.0")
+        self.offering.save(update_fields=["credits"])
+
+        url = reverse("academics:subject-category-detail", kwargs={"pk": self.cat.id})
+        res = self.client.patch(url, {"max_credits": "4.0"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.cat.refresh_from_db()
+        self.assertEqual(self.cat.max_credits, Decimal("6.0"))
+
+    def test_d1_category_max_credits_reduced_while_paper_creation_prepared_rejected(self):
+        """
+        Test D1:
+        Serializer prepared to create new paper offering with 5.0 credits (category max is 6.0).
+        Preliminary serializer validation passes.
+        Concurrent update reduces category max_credits to 4.0.
+        serializer.save() revalidates against locked category under row lock and fails!
+        Zero new paper offering row inserted.
+        """
+        from apps.academics.serializers import PaperOfferingSerializer
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        serializer = PaperOfferingSerializer(data={
+            "academic_session": self.session.id,
+            "semester": self.sem2.id,
+            "subject": self.sub.id,
+            "subject_category": self.cat.id,
+            "paper_code": "SEC205",
+            "title": "Debating Skills",
+            "credits": "5.0",
+        })
+        self.assertTrue(serializer.is_valid())
+
+        # Concurrent update reduces category max_credits to 4.0
+        self.cat.max_credits = Decimal("4.0")
+        self.cat.save(update_fields=["max_credits"])
+
+        with self.assertRaises(DRFValidationError):
+            serializer.save()
+
+        self.assertEqual(PaperOffering.objects.filter(paper_code="SEC205").count(), 0)
+
+    def test_d2_paper_creation_commits_first_blocks_category_max_credit_reduction(self):
+        """
+        Test D2:
+        New paper offering created with 5.0 credits.
+        Attempting to reduce category max_credits to 4.0 via API is rejected with HTTP 400.
+        """
+        url_create = reverse("academics:paper-offering-list")
+        res_create = self.client.post(url_create, {
+            "academic_session": self.session.id,
+            "semester": self.sem2.id,
+            "subject": self.sub.id,
+            "subject_category": self.cat.id,
+            "paper_code": "SEC206",
+            "title": "Negotiation Skills",
+            "credits": "5.0",
+        })
+        self.assertEqual(res_create.status_code, status.HTTP_201_CREATED)
+
+        url_cat = reverse("academics:subject-category-detail", kwargs={"pk": self.cat.id})
+        res_cat = self.client.patch(url_cat, {"max_credits": "4.0"})
+        self.assertEqual(res_cat.status_code, status.HTTP_400_BAD_REQUEST)
+        self.cat.refresh_from_db()
+        self.assertEqual(self.cat.max_credits, Decimal("6.0"))
+
+    def test_d3_category_min_credits_increased_while_paper_update_prepared_rejected(self):
+        """
+        Test D3:
+        Category has min 2.0. Paper offering has 4.0 credits.
+        Concurrent update increases category min_credits to 4.0.
+        Attempting to update offering credits to 3.0 is rejected under lock with HTTP 400.
+        """
+        self.cat.min_credits = Decimal("4.0")
+        self.cat.save(update_fields=["min_credits"])
+
+        url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+        res = self.client.patch(url, {"credits": "3.0"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.credits, Decimal("4.0"))
+
+    def test_d4_category_reassignment_revalidates_against_target_category_limits(self):
+        """
+        Test D4:
+        Offering has credits 4.0 in cat (range [2.0, 6.0]).
+        Target category cat_tight has range [1.0, 3.0].
+        Attempting to reassign offering to cat_tight is rejected with HTTP 400 because 4.0 > 3.0.
+        Offering remains in original category.
+        """
+        cat_tight = SubjectCategory.objects.create(
+            college=self.college, code="AEC", name="Ability Enhancement", min_credits=Decimal("1.0"), max_credits=Decimal("3.0")
+        )
+        url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+        res = self.client.patch(url, {"subject_category": cat_tight.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.subject_category, self.cat)
+
+    def test_d5_zero_credit_papers_valid_when_category_min_credits_is_zero(self):
+        """
+        Test D5:
+        Category configured with min_credits=0.0 (e.g. Audit course).
+        Creating paper offering with credits=0.0 succeeds with HTTP 201.
+        """
+        cat_audit = SubjectCategory.objects.create(
+            college=self.college, code="AUDIT", name="Audit Non-Credit", min_credits=Decimal("0.0"), max_credits=Decimal("2.0")
+        )
+        url = reverse("academics:paper-offering-list")
+        res = self.client.post(url, {
+            "academic_session": self.session.id,
+            "semester": self.sem2.id,
+            "subject": self.sub.id,
+            "subject_category": cat_audit.id,
+            "paper_code": "AUD101",
+            "title": "Library Science",
+            "credits": "0.0",
+        })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        created_offering = PaperOffering.objects.get(paper_code="AUD101")
+        self.assertEqual(created_offering.credits, Decimal("0.0"))
+
+    def test_d6_failed_mutation_rolls_back_cleanly_leaving_database_unmodified(self):
+        """
+        Test D6:
+        Verify that rejected credit range mutations leave all related records completely unchanged.
+        """
+        url = reverse("academics:paper-offering-detail", kwargs={"pk": self.offering.id})
+        res = self.client.patch(url, {"credits": "10.0"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.credits, Decimal("4.0"))
+        self.cat.refresh_from_db()
+        self.assertEqual(self.cat.min_credits, Decimal("2.0"))
+        self.assertEqual(self.cat.max_credits, Decimal("6.0"))
