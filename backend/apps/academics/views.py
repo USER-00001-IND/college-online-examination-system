@@ -29,6 +29,7 @@ from apps.academics.permissions import (
     IsFacultyOrAdminAssignmentPermission,
     IsInstitutionalConfigPermission,
 )
+from apps.accounts.authorization import get_actor_authorized_college_ids
 from apps.accounts.models import RoleChoices
 from apps.academics.serializers import (
     AcademicSessionSerializer,
@@ -367,6 +368,23 @@ class FacultySubjectAssignmentViewSet(viewsets.ModelViewSet):
 
         if user.role == RoleChoices.FACULTY:
             qs = qs.filter(faculty__user=user)
+        else:
+            # Multi-college scoping for administrators
+            authorized = get_actor_authorized_college_ids(user)
+            if authorized is not None:
+                if not authorized:
+                    return qs.none()
+                qs = qs.filter(faculty__college_id__in=authorized)
+
+            college_id = self.request.query_params.get("college")
+            if college_id:
+                try:
+                    cid = int(college_id)
+                    if authorized is not None and cid not in authorized:
+                        return qs.none()
+                    qs = qs.filter(faculty__college_id=cid)
+                except (ValueError, TypeError):
+                    return qs.none()
 
         faculty_id = self.request.query_params.get("faculty")
         if faculty_id:

@@ -85,6 +85,8 @@ class BaseStudentFacultyTestCase(TestCase):
             role=RoleChoices.ADMIN,
             is_active=True,
         )
+        self.admin.college = self.college_a
+        self.admin.college_id = self.college_a.pk
 
         # 3. Academic Structure for College A
         self.session_a = AcademicSession.objects.create(
@@ -223,6 +225,70 @@ class BaseStudentFacultyTestCase(TestCase):
             current_semester=1,
             phone_number="9123456780",
             guardian_name="Bhaben Barman",
+        )
+
+        # 8. Seeded Faculty & Student in College B
+        self.sem_b1 = Semester.objects.create(
+            programme=self.prog_b,
+            semester_number=1,
+        )
+        self.faculty_user_b = User.objects.create_user(
+            username="faculty_bob_b",
+            email="bob_b@gauhati.ac.in",
+            password=self.password,
+            first_name="Bob",
+            last_name="Barua",
+            role=RoleChoices.FACULTY,
+            is_active=True,
+        )
+        self.faculty_profile_b = FacultyProfile.objects.create(
+            user=self.faculty_user_b,
+            college=self.college_b,
+            department=self.dept_b,
+            employee_code="EMP-BBC-BOB-01",
+            designation="Assistant Professor",
+            is_examiner=True,
+        )
+        self.student_user_b = User.objects.create_user(
+            username="student_rahul_b",
+            email="rahul_b@gauhati.ac.in",
+            password=self.password,
+            first_name="Rahul",
+            last_name="Das",
+            role=RoleChoices.STUDENT,
+            is_active=True,
+        )
+        self.student_profile_b = StudentProfile.objects.create(
+            user=self.student_user_b,
+            college=self.college_b,
+            programme=self.prog_b,
+            enrollment_number="ENR-BBC-RAHUL-01",
+            registration_year=2026,
+            current_semester=1,
+        )
+        self.subject_b = Subject.objects.create(
+            department=self.dept_b,
+            name="Mechanics BBC",
+            code="PHY-101",
+        )
+        self.sub_cat_b = SubjectCategory.objects.create(
+            college=self.college_b,
+            name="Major BBC",
+            code="DSC-B",
+            min_credits=Decimal("2.0"),
+            max_credits=Decimal("6.0"),
+        )
+        self.paper_offering_b = PaperOffering.objects.create(
+            academic_session=self.session_b,
+            semester=self.sem_b1,
+            subject=self.subject_b,
+            subject_category=self.sub_cat_b,
+            paper_code="PHY-101-BBC",
+            credits=Decimal("4.0"),
+            max_marks_internal=Decimal("20.0"),
+            max_marks_external=Decimal("80.0"),
+            pass_marks_external=Decimal("32.0"),
+            is_active=True,
         )
 
 
@@ -812,8 +878,15 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         self.assertFalse(ev.is_used)
         self.assertIsNone(ev.verified_at)
 
-        # 2. GET verification with confirm=true consumes token
-        response = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
+        # GET even with confirm=true does NOT consume token (R3 Hardening)
+        get_res = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
+        self.assertEqual(get_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(get_res.data["status"], "CONFIRM_REQUIRED")
+        ev.refresh_from_db()
+        self.assertFalse(ev.is_used)
+
+        # 2. POST is authoritative and consumes token
+        response = self.client.post("/api/v1/auth/verify-email/", {"token": raw_token}, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data["is_email_verified"])
 
@@ -822,7 +895,7 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         self.assertFalse(user.is_active)
 
         # 3. Attempting to use the same token again is rejected
-        response_reused = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
+        response_reused = self.client.post("/api/v1/auth/verify-email/", {"token": raw_token}, format="json")
         self.assertEqual(response_reused.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_email_verification_expired_token_rejected(self):
@@ -1297,7 +1370,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
         self.assertFalse(ev.is_used)
         self.assertIsNone(ev.verified_at)
 
-    def test_student_email_verification_get_confirm_consumes_token(self):
+    def test_student_email_verification_get_does_not_consume_token_even_with_confirm_flag(self):
         user, profile, raw_token = register_student(
             username="get_confirm_student",
             email="get_confirm@gauhati.ac.in",
@@ -1309,12 +1382,20 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
             enrollment_number="ENR-2026-GC01",
             registration_year=2026,
         )
+        # GET with confirm=true strictly returns confirmation prompt without consuming token (R3 Hardening)
         confirm_res = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
         self.assertEqual(confirm_res.status_code, status.HTTP_200_OK)
-        self.assertTrue(confirm_res.data["is_email_verified"])
+        self.assertEqual(confirm_res.data["status"], "CONFIRM_REQUIRED")
         ev = EmailVerification.objects.get(user=user)
+        self.assertFalse(ev.is_used)
+        self.assertIsNone(ev.verified_at)
+
+        # Only POST authoritatively consumes token
+        post_res = self.client.post("/api/v1/auth/verify-email/", {"token": raw_token}, format="json")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(post_res.data["is_email_verified"])
+        ev.refresh_from_db()
         self.assertTrue(ev.is_used)
-        self.assertIsNotNone(ev.verified_at)
 
     def test_student_email_verification_post_consumes_token(self):
         user, profile, raw_token = register_student(
@@ -1554,3 +1635,385 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
                 validated_data={"academic_session": self.session_b},
             )
         self.assertIn("academic_session", ctx.exception.message_dict)
+
+
+class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
+    """
+    Dedicated tests verifying all Chunk 06 Round 3 audit corrections:
+    - R3-A: Administrator cross-college authorization scoping & fail-closed ambiguous boundaries.
+    - R3-B: Faculty department change strict lock hierarchy (College lock -> Dept lock -> Profile reload).
+    - R3-C: Faculty assignment update lock hierarchy (College lock -> Offering & Faculty lock -> Assignment reload).
+    - R3-D: Administrator direct StudentProfile creation endpoint disabled with HTTP 403.
+    - R3-E: Registration email failure atomic cleanup service & recovery state checks.
+    - Hardening: Email verification GET endpoint strictly non-consuming; POST authoritative.
+    """
+
+    # --------------------------------------------------------------------------
+    # R3-A: Multi-College Administrator Scoping Tests
+    # --------------------------------------------------------------------------
+    def test_ordinary_admin_cannot_list_another_college_students(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get("/api/v1/students/profiles/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        returned_ids = [item["id"] for item in res.data]
+        self.assertIn(self.student_profile.pk, returned_ids)
+        self.assertNotIn(self.student_profile_b.pk, returned_ids)
+
+    def test_ordinary_admin_cannot_retrieve_another_college_student_by_id(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get(f"/api/v1/students/profiles/{self.student_profile_b.pk}/")
+        self.assertIn(res.status_code, [status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN])
+
+    def test_ordinary_admin_cannot_update_another_college_student(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.patch(
+            f"/api/v1/students/profiles/{self.student_profile_b.pk}/",
+            {"current_semester": 2},
+            format="json",
+        )
+        self.assertIn(res.status_code, [status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN])
+
+        with self.assertRaises(DjangoPermissionDenied):
+            update_student_profile(
+                profile_id=self.student_profile_b.pk,
+                acting_user=self.admin,
+                validated_data={"current_semester": 2},
+            )
+
+    def test_ordinary_admin_cannot_approve_another_college_student_registration(self):
+        user_reg, prof_reg, token = register_student(
+            username="reg_b_student",
+            email="reg_b@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="RegB",
+            last_name="Student",
+            college=self.college_b,
+            programme=self.prog_b,
+            enrollment_number="ENR-REG-B-01",
+            registration_year=2026,
+        )
+        approval_b = RegistrationApproval.objects.get(user=user_reg)
+
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post(f"/api/v1/students/registrations/{approval_b.pk}/approve/")
+        self.assertIn(res.status_code, [status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN])
+
+        with self.assertRaises(DjangoPermissionDenied):
+            review_student_registration(
+                approval_id=approval_b.pk,
+                action="APPROVE",
+                reviewer=self.admin,
+            )
+
+    def test_ordinary_admin_cannot_create_faculty_in_unauthorized_college(self):
+        self.client.force_authenticate(user=self.admin)
+        payload = {
+            "username": "new_b_faculty_user",
+            "email": "new_b_fac@gauhati.ac.in",
+            "first_name": "NewB",
+            "last_name": "Faculty",
+            "college": self.college_b.pk,
+            "department": self.dept_b.pk,
+            "employee_code": "EMP-NEW-B01",
+        }
+        res = self.client.post("/api/v1/faculty/profiles/", payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        with self.assertRaises(DjangoPermissionDenied):
+            create_faculty_profile(
+                acting_user=self.admin,
+                username="new_b_fac_svc",
+                email="new_b_svc@gauhati.ac.in",
+                first_name="NewB",
+                last_name="Faculty",
+                college=self.college_b,
+                department=self.dept_b,
+                employee_code="EMP-NEW-B02",
+            )
+
+    def test_ordinary_admin_cannot_modify_another_college_faculty_record(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.patch(
+            f"/api/v1/faculty/profiles/{self.faculty_profile_b.pk}/",
+            {"designation": "Professor"},
+            format="json",
+        )
+        self.assertIn(res.status_code, [status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN])
+
+        with self.assertRaises(DjangoPermissionDenied):
+            update_faculty_profile(
+                profile_id=self.faculty_profile_b.pk,
+                acting_user=self.admin,
+                validated_data={"designation": "Professor"},
+            )
+
+    def test_ordinary_admin_cannot_create_or_modify_another_college_academic_record(self):
+        from apps.enrollments.services import create_student_academic_record, update_student_academic_record
+
+        # Admin for College A cannot create academic record for student in College B
+        with self.assertRaises(DjangoPermissionDenied):
+            create_student_academic_record(
+                acting_user=self.admin,
+                student=self.student_profile_b,
+                programme=self.prog_b,
+                academic_session=self.session_b,
+                admission_date=date(2026, 8, 1),
+            )
+
+        # Superadmin creates record in College B
+        rec_b = create_student_academic_record(
+            acting_user=self.superadmin,
+            student=self.student_profile_b,
+            programme=self.prog_b,
+            academic_session=self.session_b,
+            admission_date=date(2026, 8, 1),
+        )
+
+        # Admin for College A cannot update record in College B
+        with self.assertRaises(DjangoPermissionDenied):
+            update_student_academic_record(
+                record_id=rec_b.pk,
+                acting_user=self.admin,
+                validated_data={"status": "SUSPENDED"},
+            )
+
+    def test_ordinary_admin_cannot_create_or_modify_another_college_faculty_assignment(self):
+        from apps.academics.services import assign_faculty_to_paper, update_faculty_assignment, delete_faculty_assignment
+
+        # Admin A cannot assign in College B
+        with self.assertRaises(DjangoPermissionDenied):
+            assign_faculty_to_paper(
+                acting_user=self.admin,
+                faculty=self.faculty_profile_b,
+                paper_offering=self.paper_offering_b,
+                role=FacultyAssignmentRole.TEACHER,
+            )
+
+        # Superadmin assigns in College B
+        assign_b = assign_faculty_to_paper(
+            acting_user=self.superadmin,
+            faculty=self.faculty_profile_b,
+            paper_offering=self.paper_offering_b,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+
+        # Admin A cannot update assignment in College B
+        with self.assertRaises(DjangoPermissionDenied):
+            update_faculty_assignment(
+                assignment_id=assign_b.pk,
+                acting_user=self.admin,
+                validated_data={"role": FacultyAssignmentRole.INTERNAL_EXAMINER},
+            )
+
+        # Admin A cannot delete assignment in College B
+        with self.assertRaises(DjangoPermissionDenied):
+            delete_faculty_assignment(
+                acting_user=self.admin,
+                assignment_id=assign_b.pk,
+            )
+
+    def test_query_parameters_cannot_widen_admin_access(self):
+        self.client.force_authenticate(user=self.admin)
+        r1 = self.client.get(f"/api/v1/students/profiles/?college={self.college_b.pk}")
+        self.assertEqual(len(r1.data), 0)
+
+        r2 = self.client.get(f"/api/v1/faculty/profiles/?college={self.college_b.pk}")
+        self.assertEqual(len(r2.data), 0)
+
+        r3 = self.client.get(f"/api/v1/enrollments/academic-records/?college={self.college_b.pk}")
+        self.assertEqual(len(r3.data), 0)
+
+        r4 = self.client.get(f"/api/v1/academics/faculty-assignments/?college={self.college_b.pk}")
+        self.assertEqual(len(r4.data), 0)
+
+    def test_admin_with_ambiguous_scope_fails_closed(self):
+        from apps.accounts.authorization import check_college_operation_authority
+        unscoped_admin = User.objects.create_user(
+            username="unscoped_admin_user",
+            email="unscoped@gauhati.ac.in",
+            password=self.password,
+            role=RoleChoices.ADMIN,
+            is_active=True,
+        )
+        with self.assertRaises(DjangoPermissionDenied):
+            check_college_operation_authority(unscoped_admin, self.college_a.pk)
+
+        self.client.force_authenticate(user=unscoped_admin)
+        res = self.client.get("/api/v1/students/profiles/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data), 0)
+
+    def test_superadmin_has_multi_college_access(self):
+        self.client.force_authenticate(user=self.superadmin)
+        res = self.client.get("/api/v1/students/profiles/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        ids = [item["id"] for item in res.data]
+        self.assertIn(self.student_profile.pk, ids)
+        self.assertIn(self.student_profile_b.pk, ids)
+
+    # --------------------------------------------------------------------------
+    # R3-B: Faculty Department Change Lock Hierarchy Tests
+    # --------------------------------------------------------------------------
+    def test_faculty_department_change_same_college_succeeds(self):
+        updated = update_faculty_profile(
+            profile_id=self.faculty_profile.pk,
+            acting_user=self.admin,
+            validated_data={"department": self.dept_math},
+        )
+        self.assertEqual(updated.department, self.dept_math)
+        self.faculty_profile.refresh_from_db()
+        self.assertEqual(self.faculty_profile.department, self.dept_math)
+
+    def test_faculty_department_change_cross_college_fails(self):
+        with self.assertRaises(ValidationError) as ctx:
+            update_faculty_profile(
+                profile_id=self.faculty_profile.pk,
+                acting_user=self.admin,
+                validated_data={"department": self.dept_b},
+            )
+        self.assertIn("department", ctx.exception.message_dict)
+
+    def test_faculty_cannot_change_own_department(self):
+        with self.assertRaises(DjangoPermissionDenied):
+            update_faculty_profile(
+                profile_id=self.faculty_profile.pk,
+                acting_user=self.faculty_user,
+                validated_data={"department": self.dept_math},
+            )
+
+    # --------------------------------------------------------------------------
+    # R3-C: Faculty Assignment Update Lock Order Tests
+    # --------------------------------------------------------------------------
+    def test_faculty_assignment_update_college_first_locking_and_reassignment(self):
+        from apps.academics.services import assign_faculty_to_paper, update_faculty_assignment
+
+        assign = assign_faculty_to_paper(
+            acting_user=self.admin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+
+        updated = update_faculty_assignment(
+            assignment_id=assign.pk,
+            acting_user=self.admin,
+            validated_data={"role": FacultyAssignmentRole.INTERNAL_EXAMINER},
+        )
+        self.assertEqual(updated.role, FacultyAssignmentRole.INTERNAL_EXAMINER)
+
+    def test_faculty_assignment_update_cross_college_faculty_rejected(self):
+        from apps.academics.services import assign_faculty_to_paper, update_faculty_assignment
+
+        assign = assign_faculty_to_paper(
+            acting_user=self.admin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+
+        with self.assertRaises(ValidationError) as ctx:
+            update_faculty_assignment(
+                assignment_id=assign.pk,
+                acting_user=self.admin,
+                validated_data={"faculty": self.faculty_profile_b},
+            )
+        self.assertIn("faculty", ctx.exception.message_dict)
+
+    # --------------------------------------------------------------------------
+    # R3-D: Administrator Direct StudentProfile POST Disabled Tests
+    # --------------------------------------------------------------------------
+    def test_direct_student_profile_post_disabled_with_403(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post(
+            "/api/v1/students/profiles/",
+            {
+                "user": self.student_user.pk,
+                "college": self.college_a.pk,
+                "programme": self.prog_bca.pk,
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("Direct student profile creation is not permitted", str(res.data))
+
+    def test_unauthenticated_direct_student_profile_post_rejected(self):
+        self.client.force_authenticate(user=None)
+        res = self.client.post("/api/v1/students/profiles/", {}, format="json")
+        self.assertIn(res.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+
+    # --------------------------------------------------------------------------
+    # R3-E: Registration Email Delivery Failure Atomic Cleanup Tests
+    # --------------------------------------------------------------------------
+    def test_registration_email_delivery_failure_atomic_cleanup_and_recovery(self):
+        from unittest.mock import patch
+        from apps.students.services import VerificationEmailDeliveryError
+
+        with patch("apps.students.services.send_student_verification_email", side_effect=VerificationEmailDeliveryError("SMTP error")):
+            payload = {
+                "username": "smtp_cleanup_student",
+                "email": "smtp_cleanup@gauhati.ac.in",
+                "password": "StrongPassword@2026",
+                "first_name": "Cleanup",
+                "last_name": "Student",
+                "college": self.college_a.pk,
+                "programme": self.prog_bca.pk,
+                "enrollment_number": "ENR-2026-CLEAN01",
+                "registration_year": 2026,
+            }
+            res = self.client.post("/api/v1/auth/register/", payload, format="json")
+            self.assertEqual(res.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+            self.assertEqual(res.data["error"]["code"], "EMAIL_DELIVERY_UNAVAILABLE")
+
+            # Verify atomic cleanup: no dangling user or profile
+            self.assertFalse(User.objects.filter(username="smtp_cleanup_student").exists())
+            self.assertFalse(StudentProfile.objects.filter(enrollment_number="ENR-2026-CLEAN01").exists())
+
+        # Repeated registration succeeds without conflict
+        res_retry = self.client.post("/api/v1/auth/register/", payload, format="json")
+        self.assertEqual(res_retry.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(User.objects.filter(username="smtp_cleanup_student").exists())
+
+    def test_cleanup_unverified_registration_refuses_to_delete_verified_or_approved_user(self):
+        from apps.students.services import cleanup_unverified_registration
+
+        # Active user cannot be cleaned up
+        cleaned_active = cleanup_unverified_registration(self.student_user.pk)
+        self.assertFalse(cleaned_active)
+        self.assertTrue(User.objects.filter(pk=self.student_user.pk).exists())
+
+    # --------------------------------------------------------------------------
+    # Hardening: Email Verification GET Strictly Non-Consuming Tests
+    # --------------------------------------------------------------------------
+    def test_email_verification_get_never_consumes_token(self):
+        user, profile, raw_token = register_student(
+            username="get_hardening_student",
+            email="hardening@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="Hardening",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-2026-HARD01",
+            registration_year=2026,
+        )
+
+        # GET without confirm
+        res1 = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}")
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res1.data["status"], "CONFIRM_REQUIRED")
+
+        # GET with confirm=true still does NOT consume token
+        res2 = self.client.get(f"/api/v1/auth/verify-email/?token={raw_token}&confirm=true")
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data["status"], "CONFIRM_REQUIRED")
+
+        ev = EmailVerification.objects.get(user=user)
+        self.assertFalse(ev.is_used)
+
+        # Only POST authoritatively consumes token
+        post_res = self.client.post("/api/v1/auth/verify-email/", {"token": raw_token}, format="json")
+        self.assertEqual(post_res.status_code, status.HTTP_200_OK)
+        self.assertTrue(post_res.data["is_email_verified"])
+
+        ev.refresh_from_db()
+        self.assertTrue(ev.is_used)

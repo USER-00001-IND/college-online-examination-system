@@ -11,6 +11,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied as DRFPermissionDenied, ValidationError as DRFValidationError
 from rest_framework.response import Response
 
+from apps.accounts.authorization import check_college_operation_authority, get_actor_authorized_college_ids
 from apps.accounts.models import RoleChoices
 from apps.faculty.models import FacultyProfile
 from apps.faculty.permissions import IsFacultySelfOrAdmin
@@ -45,10 +46,22 @@ class FacultyProfileViewSet(viewsets.ModelViewSet):
         if user.role == RoleChoices.FACULTY:
             return qs.filter(user=user)
 
-        # Admin filtering options
+        authorized = get_actor_authorized_college_ids(user)
+        if authorized is not None:
+            if not authorized:
+                return qs.none()
+            qs = qs.filter(college_id__in=authorized)
+
+        # Admin filtering options - query params cannot widen access
         college_id = self.request.query_params.get('college')
         if college_id:
-            qs = qs.filter(college_id=college_id)
+            try:
+                cid = int(college_id)
+                if authorized is not None and cid not in authorized:
+                    return qs.none()
+                qs = qs.filter(college_id=cid)
+            except (ValueError, TypeError):
+                return qs.none()
 
         department_id = self.request.query_params.get('department')
         if department_id:
@@ -80,6 +93,12 @@ class FacultyProfileViewSet(viewsets.ModelViewSet):
 
         serializer = FacultyProvisioningSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
+
+        target_college = serializer.validated_data.get('college')
+        if target_college:
+            cid = target_college.pk if hasattr(target_college, 'pk') else int(target_college)
+            check_college_operation_authority(user, cid, "provision_faculty")
+
         try:
             profile = serializer.save()
         except DjangoValidationError as exc:

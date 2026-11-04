@@ -9,6 +9,7 @@ from rest_framework import status, viewsets
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
 
+from apps.accounts.authorization import get_actor_authorized_college_ids
 from apps.accounts.models import RoleChoices
 from apps.enrollments.models import StudentAcademicRecord
 from apps.enrollments.permissions import IsStudentAcademicRecordPermission
@@ -46,7 +47,23 @@ class StudentAcademicRecordViewSet(viewsets.ModelViewSet):
         if user.role == RoleChoices.STUDENT:
             return qs.filter(student__user=user)
 
-        # Admin filtering options
+        authorized = get_actor_authorized_college_ids(user)
+        if authorized is not None:
+            if not authorized:
+                return qs.none()
+            qs = qs.filter(student__college_id__in=authorized)
+
+        # Admin filtering options - query params cannot widen access
+        college_id = self.request.query_params.get('college')
+        if college_id:
+            try:
+                cid = int(college_id)
+                if authorized is not None and cid not in authorized:
+                    return qs.none()
+                qs = qs.filter(student__college_id=cid)
+            except (ValueError, TypeError):
+                return qs.none()
+
         student_id = self.request.query_params.get('student')
         if student_id:
             qs = qs.filter(student_id=student_id)

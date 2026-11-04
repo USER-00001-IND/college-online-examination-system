@@ -22,8 +22,8 @@ Round 2 corrections specifically addressed student email dispatch fail-closed se
 - **Django System Check (`production` deploy):** 0 issues identified (0 silenced).
 - **Migration Graph & Drift:** Clean acyclic dependency graph; `makemigrations --check --dry-run` reports 0 changes.
 - **Automated Test Results:**
-  - Dedicated Chunk 06 tests (`backend/tests/test_students_faculty.py`): **72 passed, 0 failed**.
-  - Full repository test suite (`backend/tests/`): **481 passed, 10 skipped, 0 failed** (491 total discovered).
+  - Dedicated Chunk 06 tests (`backend/tests/test_students_faculty.py`): **93 passed, 0 failed**.
+  - Full repository test suite (`backend/tests/`): **502 passed, 10 skipped, 0 failed** (512 total discovered).
   - 10 live Redis integration tests cleanly skipped pending disposable Redis infrastructure.
 - **Protected Documentation Integrity:** `design.md`, `handover.txt`, `docs/architecture.md`, and `docs/database-architecture.md` remain 100% byte-identical and untouched.
 - **Git Commit Discipline:** 0 git commits or pushes executed.
@@ -116,7 +116,7 @@ Four approved database tables were implemented in strict conformance with `docs/
 
 | Finding # | Severity | Defect Description | Resolution / Implementation Detail |
 | :---: | :---: | :--- | :--- |
-| **A** | **HIGH** | Student email verification delivery failure: `register` endpoint never sent email; token returned in API response; URL prefetchers consumed single-use tokens. | Added `send_student_verification_email` service; registration view dispatches email and fails closed (HTTP 503) on failure with automatic rollback; raw tokens removed from API response; GET without `confirm=true` inspects token safely without consuming; POST and GET with `confirm=true` consume token. |
+| **A** | **HIGH** | Student email verification delivery failure: `register` endpoint never sent email; token returned in API response; URL prefetchers consumed single-use tokens. | Added `send_student_verification_email` service; registration view dispatches email and fails closed (HTTP 503) on failure with atomic database cleanup service (`cleanup_unverified_registration`); raw tokens removed from API response; GET strictly inspects token safely without consuming credentials; POST authoritatively consumes token. |
 | **B** | **HIGH** | Insecure faculty account activation: provisioning accepted admin passwords and activated accounts immediately (`is_active=True`). | Removed `password` argument from `create_faculty_profile` service and `FacultyProvisioningSerializer`; sets `user.set_unusable_password()`, `is_active=False`, `is_staff=False`, `is_superuser=False`; newly provisioned faculty cannot log in until activated. |
 | **C** | **HIGH** | Unsafe profile and ledger deletion permissions: default DRF `destroy()` permitted hard deletion of profiles and academic ledgers. | Overrode `destroy()` in `StudentProfileViewSet`, `FacultyProfileViewSet`, and `StudentAcademicRecordViewSet` to raise `PermissionDenied` (HTTP 403), enforcing immutability of academic identity ledgers. |
 | **D** | **HIGH** | Faculty and administrative data access scoping: faculty could access arbitrary student academic records and peer paper assignments. | `IsStudentAcademicRecordPermission` and `StudentAcademicRecordViewSet.get_queryset()` explicitly deny faculty access to student records; `IsFacultyOrAdminAssignmentPermission` and `FacultySubjectAssignmentViewSet.get_queryset()` scope faculty exclusively to their own assignments (`faculty__user=request.user`). |
@@ -202,9 +202,121 @@ Migration plan execution order verified via `manage.py migrate --plan`. Clean ex
 
 ---
 
-## 9. Governance & Next Steps
+## 10. ROUND 3 — ADMINISTRATIVE AUTHORIZATION, LOCK HIERARCHY AND REGISTRATION RECOVERY
 
-Chunk 06 Round 2 corrections are fully implemented, verified, and submitted for independent audit review.
+Round 3 addresses the remaining 5 independent audit findings (2 HIGH, 3 MEDIUM) alongside verification endpoint hardening.
+
+### 10.1 Finding R3-A (HIGH) — Administrator Cross-College Authorization Scoping
+1. **Root Cause:** In the approved 52-table schema ([docs/database-architecture.md](file:///home/zero/Documents/college/docs/database-architecture.md)), `accounts_user` and `accounts_user_role` contain no `college_id` column. ViewSets allowed users with generic `ADMIN` roles to query and mutate records across institutions, and query parameters (`?college=2`) allowed arbitrary filtering.
+2. **Severity:** HIGH.
+3. **Files Modified:**
+   - `backend/apps/accounts/authorization.py` (new centralized authorization service)
+   - `backend/apps/students/views.py`
+   - `backend/apps/students/services.py`
+   - `backend/apps/faculty/views.py`
+   - `backend/apps/faculty/services.py`
+   - `backend/apps/enrollments/views.py`
+   - `backend/apps/enrollments/services.py`
+   - `backend/apps/academics/views.py`
+   - `backend/apps/academics/services.py`
+4. **Exact Correction:**
+   - Introduced `get_actor_authorized_college_ids(actor)` and `check_college_operation_authority(actor, college_id, operation)`.
+   - Superadministrators (`SUPERADMIN` or `is_superuser`) retain system-wide access.
+   - Ordinary administrators (`ADMIN` or granular roles `COLLEGE_SUPERADMIN`, `EXAM_OFFICER`) resolve scope from explicit college linkage (runtime property `college` / `college_id` or linked `FacultyProfile`).
+   - If an ordinary administrator's institutional scope cannot be established, the system fails closed (raises `PermissionDenied`, returns empty querysets).
+   - ViewSet `get_queryset()` methods apply college scoping before pagination or filtering; query parameters like `?college=2` can never widen access beyond authorized scope.
+   - Direct service functions enforce `check_college_operation_authority` before acquiring locks or executing mutations.
+5. **Authorization Behavior:** Explicit institutional administrative authority is required per target college; cross-college actions by ordinary administrators raise HTTP 403 `PermissionDenied`.
+6. **Transaction Strategy:** Scoping evaluated before entering transaction; service-level checks re-verified under lock.
+7. **Lock Order:** N/A (Authorization precedes Level 1 row locking).
+8. **Regression Evidence:** Covered by 11 targeted tests in `Chunk06Round3CorrectionsTests` (`test_ordinary_admin_cannot_*`, `test_query_parameters_cannot_widen_admin_access`, `test_admin_with_ambiguous_scope_fails_closed`, `test_superadmin_has_multi_college_access`).
+9. **Actual Test Results:** All 11 tests passed cleanly.
+10. **Remaining Risks / Schema Limitation:** In the approved relational schema, `accounts_user` does not include a `college_id` foreign key. Ordinary administrators without a runtime college binding fail closed. Permanent resolution requires an architectural decision by the project owner (e.g. adding `college_id` to `accounts_user` or an approved institutional administrative mapping table).
+
+### 10.2 Finding R3-B (HIGH) — Faculty Department Change Lock Hierarchy
+1. **Root Cause:** `update_faculty_profile()` previously locked `FacultyProfile` before resolving and locking academic parent records, risking deadlocks and race conditions during concurrent department college reassignments.
+2. **Severity:** HIGH.
+3. **Files Modified:** `backend/apps/faculty/services.py`.
+4. **Exact Correction:** Refactored `update_faculty_profile()` to adhere strictly to the Five-Level Academic Lock Hierarchy:
+   - Step 1: Read minimum candidate identifiers (`college_id`, `department_id`, proposed `department`) without holding child row locks.
+   - Step 2: Acquire Level 1 College coordination locks (`lock_colleges`) in deterministic ascending PK order.
+   - Step 3: Acquire Level 2 Department row locks (`select_for_update`) in ascending PK order.
+   - Step 4: Reload and lock `FacultyProfile` (Level 3 child entity).
+   - Step 5: Revalidate that acquired College locks cover authoritative profile ownership.
+   - Step 6: Verify administrative authorization for target college.
+   - Step 7: Resolve complete proposed department relationship and validate same-college compatibility.
+   - Step 8: Validate examiner assignment dependencies (blocking revocation of `is_examiner` with active assignments).
+   - Step 9: Persist atomically.
+5. **Authorization Behavior:** Enforces administrative authority or self-service restrictions under lock.
+6. **Transaction Strategy:** Single atomic transaction (`@transaction.atomic`).
+7. **Lock Order:** Level 1 College Coordination Lock $\rightarrow$ Level 2 Department $\rightarrow$ Level 3 FacultyProfile $\rightarrow$ Validation $\rightarrow$ Persistence.
+8. **Regression Evidence:** Tested in `test_faculty_department_change_same_college_succeeds`, `test_faculty_department_change_cross_college_fails`, and `test_faculty_cannot_change_own_department`.
+9. **Actual Test Results:** All passed with zero errors.
+10. **Remaining Risks:** Multi-connection MySQL concurrency integration testing remains pending.
+
+### 10.3 Finding R3-C (MEDIUM) — Faculty Assignment Update Lock-Order Inversion
+1. **Root Cause:** `update_faculty_assignment()` locked `FacultySubjectAssignment` before acquiring the Level 1 College coordination lock and parent entity locks, inverting the established academic lock protocol.
+2. **Severity:** MEDIUM.
+3. **Files Modified:** `backend/apps/academics/services.py`.
+4. **Exact Correction:** Refactored `update_faculty_assignment()`:
+   - Step 1: Read candidate identifiers (`faculty_id`, `paper_offering_id`) without locking child rows.
+   - Step 2: Resolve current and proposed candidate college owners from `FacultyProfile` and `PaperOffering`.
+   - Step 3: Acquire Level 1 College coordination locks in ascending PK order (`lock_colleges`).
+   - Step 4: Reload and lock `FacultySubjectAssignment` row.
+   - Step 5: Lock relevant parent entities in consistent order: Level 2 `PaperOffering` (ordered by PK), Level 3 `FacultyProfile` (ordered by PK).
+   - Step 6: Verify that acquired College locks cover authoritative owners.
+   - Step 7: Resolve complete proposed state, recheck institutional administrative authority, validate same-college boundary, examiner eligibility, and uniqueness.
+   - Step 8: Persist atomically.
+5. **Authorization Behavior:** Validates administrator authority over target offering college.
+6. **Transaction Strategy:** `@transaction.atomic`.
+7. **Lock Order:** Level 1 College Coordination Lock $\rightarrow$ Level 2 PaperOffering $\rightarrow$ Level 3 FacultyProfile $\rightarrow$ Level 3 FacultySubjectAssignment $\rightarrow$ Validation $\rightarrow$ Persistence.
+8. **Regression Evidence:** Tested in `test_faculty_assignment_update_college_first_locking_and_reassignment` and `test_faculty_assignment_update_cross_college_faculty_rejected`.
+9. **Actual Test Results:** All passed cleanly.
+10. **Remaining Risks:** Multi-connection live MySQL InnoDB concurrency verification remains pending.
+
+### 10.4 Finding R3-D (MEDIUM) — Broken Administrator Student-Profile Creation Endpoint
+1. **Root Cause:** `StudentProfileViewSet` inherited `ModelViewSet` exposing POST `/api/v1/students/profiles/`, but `StudentProfileSerializer` marked required fields (`user`, `college`, `programme`, `enrollment_number`) read-only, causing database integrity errors or unhandled 500 exceptions on direct POST.
+2. **Severity:** MEDIUM.
+3. **Files Modified:** `backend/apps/students/views.py`.
+4. **Exact Correction:** Overrode `create()` and `perform_create()` in `StudentProfileViewSet` to raise `PermissionDenied` (HTTP 403) with an explicit, controlled error message. Direct POST creation is disabled. The exclusive authorized path for student onboarding is student self-registration (`POST /api/v1/auth/register/`) followed by administrative review and approval (`POST /api/v1/students/registrations/{id}/approve/`).
+5. **Authorization Behavior:** All callers (anonymous, student, faculty, ordinary admin, superadmin) receive HTTP 403 on direct StudentProfile POST.
+6. **Transaction Strategy:** N/A (Rejected at controller level).
+7. **Lock Order:** N/A.
+8. **Regression Evidence:** Tested in `test_direct_student_profile_post_disabled_with_403` and `test_unauthenticated_direct_student_profile_post_rejected`.
+9. **Actual Test Results:** All passed with controlled HTTP 403 responses.
+10. **Remaining Risks:** None.
+
+### 10.5 Finding R3-E (MEDIUM) — Registration Email-Failure Cleanup Atomicity & Recovery
+1. **Root Cause:** On verification email dispatch failure, `StudentRegisterView` executed sequential, uncoordinated `delete()` calls across multiple tables after the registration transaction had committed. If any delete failed, orphaned unverified records remained. Additionally, previous audit text inaccurately described this as an "automatic rollback".
+2. **Severity:** MEDIUM.
+3. **Files Modified:** `backend/apps/students/services.py`, `backend/apps/accounts/views.py`.
+4. **Exact Correction:**
+   - Introduced dedicated atomic cleanup service `cleanup_unverified_registration(user_id)`.
+   - Executes inside `@transaction.atomic` under row lock on `User`.
+   - Precondition checks under lock: verifies `user.is_active is False`, `EmailVerification.is_used is False`, and `RegistrationApproval.status == PENDING`. If any check fails (e.g. concurrent verification or approval), cleanup safely refuses deletion and aborts.
+   - If preconditions are met, atomically deletes `StudentProfile`, `EmailVerification`, `RegistrationApproval`, and `User`.
+   - Corrected documentation: SMTP handoff is external to database transactions; atomic cleanup is executed upon SMTP failure.
+5. **Authorization Behavior:** System-internal transactional service.
+6. **Transaction Strategy:** `@transaction.atomic` with row-level locks on `User`, `EmailVerification`, and `RegistrationApproval`.
+7. **Lock Order:** User lock $\rightarrow$ Verification & Approval lock $\rightarrow$ State verification $\rightarrow$ Atomic deletion.
+8. **Regression Evidence:** Tested in `test_registration_email_delivery_failure_atomic_cleanup_and_recovery` and `test_cleanup_unverified_registration_refuses_to_delete_verified_or_approved_user`.
+9. **Actual Test Results:** Passed cleanly; repeated registration with same credentials succeeds after cleanup.
+10. **Remaining Risks:** External email delivery limitations (SMTP acceptance is not inbox receipt confirmation).
+
+### 10.6 Hardening — Email Verification Token Consumption Exclusively via POST
+1. **Root Cause:** `GET /api/v1/auth/verify-email/?token=...&confirm=true` previously consumed single-use verification tokens. State-changing token consumption via GET is unsafe against email security crawlers, prefetchers, and query-string browser caching.
+2. **Exact Correction:**
+   - Removed `confirm=true` token consumption from `VerifyEmailView.get()`.
+   - `GET` exclusively executes non-consuming token validity inspection (`_inspect_token`), returning HTTP 200 `CONFIRM_REQUIRED` if valid without modifying database state.
+   - `POST {"token": "..."}` is the exclusive, authoritative token consumption endpoint.
+3. **Regression Evidence:** Tested in `test_email_verification_get_never_consumes_token` and `test_student_email_verification_get_does_not_consume_token_even_with_confirm_flag`.
+4. **Actual Test Results:** Passed cleanly.
+
+---
+
+## 11. Governance & Next Steps
+
+Chunk 06 Round 3 corrections are fully implemented, verified, and submitted for independent audit review.
 
 - **Current Status:** `IN REVIEW — PENDING INDEPENDENT AUDIT`.
 - **Chunk 07 Onward:** Strictly **GATED — NOT AUTHORIZED**.

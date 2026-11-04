@@ -10,6 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied as DRFPermissionDenied, ValidationError as DRFValidationError
 from rest_framework.response import Response
 
+from apps.accounts.authorization import get_actor_authorized_college_ids
 from apps.accounts.models import RegistrationApproval, RoleChoices
 from apps.accounts.permissions import IsAdminUserRole
 from apps.students.models import StudentProfile
@@ -49,10 +50,22 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
         if user.role == RoleChoices.STUDENT:
             return qs.filter(user=user)
 
-        # Admin filtering options
+        authorized = get_actor_authorized_college_ids(user)
+        if authorized is not None:
+            if not authorized:
+                return qs.none()
+            qs = qs.filter(college_id__in=authorized)
+
+        # Admin filtering options - query params cannot widen access
         college_id = self.request.query_params.get('college')
         if college_id:
-            qs = qs.filter(college_id=college_id)
+            try:
+                cid = int(college_id)
+                if authorized is not None and cid not in authorized:
+                    return qs.none()
+                qs = qs.filter(college_id=cid)
+            except (ValueError, TypeError):
+                return qs.none()
 
         programme_id = self.request.query_params.get('programme')
         if programme_id:
@@ -68,11 +81,19 @@ class StudentProfileViewSet(viewsets.ModelViewSet):
 
         return qs
 
+    def create(self, request, *args, **kwargs):
+        """
+        Direct creation of StudentProfile via POST is strictly disabled (Finding R3-D).
+        Students must be onboarded through the student self-registration workflow
+        (POST /api/v1/auth/register/) and administrative review/approval.
+        """
+        raise DRFPermissionDenied(
+            "Direct student profile creation is not permitted. Students must be onboarded "
+            "through the student self-registration workflow and administrative approval."
+        )
+
     def perform_create(self, serializer):
-        user = self.request.user
-        if user.role == RoleChoices.STUDENT:
-            raise DRFPermissionDenied("Students must register through the self-registration workflow.")
-        serializer.save()
+        raise DRFPermissionDenied("Direct student profile creation is not permitted.")
 
     def destroy(self, request, *args, **kwargs):
         """Prohibits deletion of student profiles to preserve academic history."""
@@ -122,6 +143,7 @@ class RegistrationApprovalViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAdminUserRole]
 
     def get_queryset(self):
+        user = self.request.user
         qs = RegistrationApproval.objects.select_related(
             'user',
             'reviewed_by',
@@ -129,6 +151,12 @@ class RegistrationApprovalViewSet(viewsets.ReadOnlyModelViewSet):
             'user__student_profile__college',
             'user__student_profile__programme',
         ).all().order_by('-submitted_at')
+
+        authorized = get_actor_authorized_college_ids(user)
+        if authorized is not None:
+            if not authorized:
+                return qs.none()
+            qs = qs.filter(user__student_profile__college_id__in=authorized)
 
         status_param = self.request.query_params.get('status')
         if status_param:

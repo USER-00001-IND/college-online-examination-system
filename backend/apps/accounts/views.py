@@ -368,16 +368,9 @@ class StudentRegisterView(APIView):
         try:
             send_student_verification_email(user=user, raw_token=raw_token)
         except VerificationEmailDeliveryError:
-            # Clean up the unverified account so duplicate username/email/enrollment do not block future retries
-            try:
-                from apps.students.models import StudentProfile
-                from apps.accounts.models import EmailVerification, RegistrationApproval
-                StudentProfile.objects.filter(user=user).delete()
-                EmailVerification.objects.filter(user=user).delete()
-                RegistrationApproval.objects.filter(user=user).delete()
-                user.delete()
-            except Exception as cleanup_exc:
-                logger.error("Failed to clean up unverified user %s after email failure: %s", user.pk, type(cleanup_exc).__name__)
+            # Atomically clean up the unverified account so duplicate username/email/enrollment do not block future retries
+            from apps.students.services import cleanup_unverified_registration
+            cleanup_unverified_registration(user.pk)
 
             return Response(
                 {
@@ -403,11 +396,8 @@ class StudentRegisterView(APIView):
 class VerifyEmailView(APIView):
     """
     Public cryptographic email verification endpoint.
-    - POST {"token": "..."}: Consumes verification token atomically.
-    - GET ?token=...:
-      * With confirm=true: Consumes verification token atomically.
-      * Without confirm=true: Safely checks token validity WITHOUT consuming credentials,
-        instructing client to submit confirmation (prevents accidental consumption by link prefetchers).
+    - POST {"token": "..."}: Authoritatively validates and atomically consumes verification token.
+    - GET ?token=...: Non-consuming token validity inspection (safe against email scanners and link prefetchers).
     Validates token expiration (24h) and single-use constraint.
     Does NOT activate account; account remains inactive pending administrator approval.
     """
@@ -415,14 +405,11 @@ class VerifyEmailView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        token_str = request.data.get("token")
+        token_str = request.data.get("token") if isinstance(request.data, dict) else None
         return self._consume_token(token_str)
 
     def get(self, request):
         token_str = request.query_params.get("token")
-        confirm = request.query_params.get("confirm", "").lower() in ("true", "1", "yes")
-        if confirm:
-            return self._consume_token(token_str)
         return self._inspect_token(token_str)
 
     def _inspect_token(self, token_str):
@@ -449,7 +436,7 @@ class VerifyEmailView(APIView):
                 "status": "CONFIRM_REQUIRED",
                 "action_required": "CONFIRM_REQUIRED",
                 "token_valid": True,
-                "message": "Verification token validated. Submit a POST request with this token or add confirm=true to complete email verification.",
+                "message": "Verification token validated. Submit a POST request with this token to complete email verification.",
             },
             status=status.HTTP_200_OK,
         )

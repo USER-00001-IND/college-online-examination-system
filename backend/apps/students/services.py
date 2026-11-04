@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from apps.academics.models import College, Programme
 from apps.academics.services import check_institutional_admin_authority, lock_colleges
+from apps.accounts.authorization import check_college_operation_authority
 from apps.accounts.models import (
     EmailVerification,
     RegistrationApproval,
@@ -76,6 +77,48 @@ def send_student_verification_email(*, user: User, raw_token: str) -> None:
         raise VerificationEmailDeliveryError(
             "Email delivery infrastructure unavailable. Verification email could not be delivered."
         ) from exc
+
+
+@transaction.atomic
+def cleanup_unverified_registration(user_id: int) -> bool:
+    """
+    Atomically cleans up an unverified student registration after email delivery failure.
+    Enforces strict safety preconditions under row lock:
+    1. Locks User row (select_for_update).
+    2. Verifies user is inactive (is_active is False).
+    3. Verifies email verification token was not consumed (verified_at is None, is_used is False).
+    4. Verifies registration approval is still pending (status is PENDING).
+    If any check fails (e.g. concurrent verification or approval), refuses deletion and returns False.
+    Otherwise, atomically deletes related records and user, and returns True.
+    """
+    try:
+        user = User.objects.select_for_update().get(pk=user_id)
+    except User.DoesNotExist:
+        return False
+
+    if user.is_active:
+        logger.warning("Refusing cleanup: User %s is already active.", user_id)
+        return False
+
+    # Check EmailVerification under lock
+    verifications = EmailVerification.objects.select_for_update().filter(user=user)
+    if verifications.filter(is_used=True).exists():
+        logger.warning("Refusing cleanup: User %s verification token was already consumed.", user_id)
+        return False
+
+    # Check RegistrationApproval under lock
+    approvals = RegistrationApproval.objects.select_for_update().filter(user=user)
+    if approvals.exclude(status=RegistrationApprovalStatus.PENDING).exists():
+        logger.warning("Refusing cleanup: User %s registration approval is no longer pending.", user_id)
+        return False
+
+    # Safe to clean up atomically
+    StudentProfile.objects.filter(user=user).delete()
+    verifications.delete()
+    approvals.delete()
+    user.delete()
+    logger.info("Atomically cleaned up unverified user %s after email dispatch failure.", user_id)
+    return True
 
 
 @transaction.atomic
@@ -237,11 +280,18 @@ def review_student_registration(
 
     approval = (
         RegistrationApproval.objects.select_for_update()
+        .select_related('user__student_profile')
         .filter(pk=approval_id)
         .first()
     )
     if not approval:
         raise ValidationError({"approval": "Registration approval record not found."})
+
+    # Check institutional admin authority over this specific college
+    if hasattr(approval.user, 'student_profile') and approval.user.student_profile:
+        check_college_operation_authority(reviewer, approval.user.student_profile.college_id, "review_student_registration")
+    else:
+        check_institutional_admin_authority(reviewer)
 
     if approval.status != RegistrationApprovalStatus.PENDING:
         raise ValidationError({
@@ -325,6 +375,8 @@ def update_student_profile(
         attempted_disallowed = set(validated_data.keys()).intersection(disallowed_fields)
         if attempted_disallowed:
             raise PermissionDenied(f"Students cannot modify institutional fields: {', '.join(sorted(attempted_disallowed))}.")
+    else:
+        check_college_operation_authority(acting_user, profile.college_id, "update_student_profile")
 
     # Apply permitted fields
     if is_admin and 'current_semester' in validated_data:

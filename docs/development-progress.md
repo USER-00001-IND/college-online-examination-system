@@ -1,16 +1,16 @@
 # Development Progress Tracker
 
 **Project:** College Online Examination System (Gauhati University FYUGP Academic Context)  
-**Last Updated:** 2026-11-04 (Chunk 05 Approved with Warnings by Owner; Chunk 06 Round 2 Corrections In Review)  
+**Last Updated:** 2026-11-04 (Chunk 05 Approved with Warnings by Owner; Chunk 06 Round 3 Corrections In Review)  
 
 ---
 
 ## 1. Overall Status
 
 * **Current Active Chunk:** **CHUNK 06 — STUDENT AND FACULTY MANAGEMENT**
-* **Project Phase:** Student & Faculty Management (Chunk 06 Round 2 Security, Authorization, Account Onboarding & Academic Integrity Corrections)
-* **Implementation Permission:** **IN REVIEW — ROUND 2 CORRECTIONS, OWNER APPROVAL PENDING** (Chunk 05 explicitly approved with warnings by project owner on 2026-11-04; Chunk 06 Round 2 implementation completed resolving all audit findings: student email verification delivery and safe prefetch handling, secure faculty provisioning with inactive accounts, deletion protection across student and faculty profiles and academic ledgers, faculty data access scoping, complete-state validation on faculty assignment PATCH, and academic parent update integrity protection for student/faculty dependents; Chunk 07 onward remains strictly gated)
-* **Next Permitted Action:** Independent audit review of Chunk 06 Round 2 corrections; Chunk 07 onward remains strictly gated
+* **Project Phase:** Student & Faculty Management (Chunk 06 Round 3 Final Authorization, Transaction Safety & Integrity Corrections)
+* **Implementation Permission:** **IN REVIEW — ROUND 3 IMPLEMENTATION COMPLETE, INDEPENDENT AUDIT PENDING** (Chunk 05 explicitly approved with warnings by project owner on 2026-11-04; Chunk 06 Round 3 implementation completed resolving all audit findings: administrator cross-college authorization scoping and fail-closed ambiguous boundaries, faculty department change College-first lock hierarchy, faculty assignment update lock-order inversion correction, disabling broken direct StudentProfile POST endpoint, atomic registration cleanup service and recoverable state handling, and hardening verification token consumption exclusively to POST; Chunk 07 onward remains strictly gated)
+* **Next Permitted Action:** Independent audit review of Chunk 06 Round 3 corrections; Chunk 07 onward remains strictly gated
 
 ---
 
@@ -24,7 +24,7 @@
 | **03** | Backend Foundation | **COMPLETED** | [`docs/audits/chunk-03-backend-foundation-audit.md`](chunk-03-backend-foundation-audit.md) | **APPROVED** (2026-11-03) |
 | **04** | Authentication and Roles | **COMPLETED** | [`docs/audits/chunk-04-authentication-roles-audit.md`](chunk-04-authentication-roles-audit.md) | **APPROVED WITH WARNINGS** (2026-11-03, Commit: `78d1c0a5fae07713c3810e7230ef5860b91ccc28`) |
 | **05** | FYUGP Academic Management | **COMPLETED** | [`docs/audits/chunk-05-fyugp-academic-management-audit.md`](chunk-05-fyugp-academic-management-audit.md) | **APPROVED WITH WARNINGS** (2026-11-04) |
-| **06** | Student and Faculty Management | **IN REVIEW** | [`docs/audits/chunk-06-student-faculty-management-audit.md`](chunk-06-student-faculty-management-audit.md) | **IN REVIEW — ROUND 2 CORRECTIONS, OWNER APPROVAL PENDING** |
+| **06** | Student and Faculty Management | **IN REVIEW** | [`docs/audits/chunk-06-student-faculty-management-audit.md`](chunk-06-student-faculty-management-audit.md) | **IN REVIEW — ROUND 3 IMPLEMENTATION COMPLETE, INDEPENDENT AUDIT PENDING** |
 | **07** | Subject Registration | NOT STARTED | — | **GATED — NOT AUTHORIZED** |
 | **08** | General Examination Creation | NOT STARTED | — | **GATED — NOT AUTHORIZED** |
 | **09** | Eligibility Engine | NOT STARTED | — | **GATED — NOT AUTHORIZED** |

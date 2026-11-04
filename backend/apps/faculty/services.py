@@ -11,6 +11,7 @@ from django.db import transaction
 
 from apps.academics.models import College, Department
 from apps.academics.services import check_institutional_admin_authority, lock_colleges
+from apps.accounts.authorization import check_college_operation_authority
 from apps.accounts.models import RoleChoices, User
 from apps.faculty.models import FacultyProfile
 
@@ -45,6 +46,7 @@ def create_faculty_profile(
 
     # 1. Coordinate via College row lock
     college_id = college.pk if hasattr(college, 'pk') else int(college)
+    check_college_operation_authority(acting_user, college_id, "create_faculty_profile")
     lock_colleges(college_id)
     locked_college = College.objects.get(pk=college_id)
 
@@ -102,13 +104,22 @@ def update_faculty_profile(
     validated_data: dict,
 ) -> FacultyProfile:
     """
-    Updates a FacultyProfile under row-level lock.
-    Enforces authorization:
-    - Faculty members can only update contact fields (phone_number).
-    - Administrators can update designation, department, is_examiner, and contact fields.
-    - Institutional identity fields (college, user, employee_code) are immutable.
+    Updates a FacultyProfile under strict academic coordination lock hierarchy (Finding R3-B):
+    1. Read minimum candidate identifiers without locking child rows.
+    2. Determine existing and proposed institutional owners.
+    3. Acquire College coordination locks in ascending PK order.
+    4. Acquire Department locks in consistent order.
+    5. Reload and lock FacultyProfile under lock.
+    6. Verify that College locks cover authoritative ownership.
+    7. Recheck administrator authorization for target institution.
+    8. Resolve proposed department and validate compatibility.
+    9. Validate examiner assignment dependencies.
+    10. Apply update and persist atomically.
     """
-    profile = FacultyProfile.objects.select_for_update().get(pk=profile_id)
+    # 1. Read minimum candidate identifiers without locking child rows
+    initial = FacultyProfile.objects.values("college_id", "department_id", "user_id").get(pk=profile_id)
+    current_college_id = initial["college_id"]
+    current_dept_id = initial["department_id"]
 
     is_admin = (
         acting_user.role in (RoleChoices.ADMIN, RoleChoices.SUPERADMIN)
@@ -117,14 +128,49 @@ def update_faculty_profile(
     )
 
     if not is_admin:
-        # Faculty updating their own profile
-        if profile.user_id != acting_user.pk:
+        if initial["user_id"] != acting_user.pk:
             raise PermissionDenied("You do not have permission to modify this faculty profile.")
-
         disallowed_fields = {'college', 'department', 'employee_code', 'designation', 'is_examiner', 'user'}
         attempted = set(validated_data.keys()).intersection(disallowed_fields)
         if attempted:
             raise PermissionDenied(f"Faculty cannot modify institutional fields: {', '.join(sorted(attempted))}.")
+
+    proposed_dept = validated_data.get("department") if is_admin else None
+    if proposed_dept:
+        dept_id = proposed_dept.pk if hasattr(proposed_dept, "pk") else int(proposed_dept)
+        dept_college_id = Department.objects.values_list("college_id", flat=True).get(pk=dept_id)
+        candidate_college_ids = {current_college_id, dept_college_id}
+        candidate_dept_ids = {current_dept_id, dept_id}
+    else:
+        dept_id = None
+        candidate_college_ids = {current_college_id}
+        candidate_dept_ids = {current_dept_id}
+
+    # 2. Acquire required College coordination locks in deterministic ascending PK order
+    lock_colleges(*sorted(candidate_college_ids))
+
+    # 3. Acquire relevant Department locks in consistent order
+    Department.objects.select_for_update().filter(pk__in=sorted(candidate_dept_ids)).order_by("pk")
+
+    # 4. Reload the FacultyProfile under lock
+    profile = FacultyProfile.objects.select_for_update().get(pk=profile_id)
+
+    # 5. Revalidate that relevant College locks cover authoritative ownership
+    if profile.college_id not in candidate_college_ids:
+        raise ValidationError("Authoritative college ownership changed concurrently.")
+
+    # 7. Recheck administrator authorization for target institution
+    if is_admin:
+        check_college_operation_authority(acting_user, profile.college_id, "update_faculty_profile")
+
+    # 6 & 8. Resolve proposed department and validate department-to-college compatibility
+    if is_admin and proposed_dept:
+        locked_dept = Department.objects.select_for_update().get(pk=dept_id)
+        if locked_dept.college_id != profile.college_id:
+            raise ValidationError({
+                "department": f"Department '{locked_dept.code}' belongs to college ID {locked_dept.college_id}, not {profile.college_id}."
+            })
+        profile.department = locked_dept
 
     # Immutable fields cannot be modified even by admin
     immutable_fields = {'college', 'user', 'employee_code'}
@@ -132,15 +178,7 @@ def update_faculty_profile(
         if imm in validated_data and validated_data[imm] != getattr(profile, imm):
             raise ValidationError({imm: f"Field '{imm}' is immutable once assigned."})
 
-    # If department is being updated by admin, verify same college
-    if is_admin and 'department' in validated_data:
-        new_dept = validated_data['department']
-        if new_dept.college_id != profile.college_id:
-            raise ValidationError({
-                "department": f"Department '{new_dept.code}' belongs to college ID {new_dept.college_id}, not {profile.college_id}."
-            })
-        profile.department = new_dept
-
+    # 9. Validate examiner assignment dependencies
     if is_admin:
         if 'designation' in validated_data:
             profile.designation = validated_data['designation'].strip()
@@ -163,6 +201,7 @@ def update_faculty_profile(
     if 'phone_number' in validated_data:
         profile.phone_number = validated_data['phone_number'].strip() if validated_data['phone_number'] else None
 
+    # 10. Persist atomically
     profile.full_clean()
     profile.save()
     return profile

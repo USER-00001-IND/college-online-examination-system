@@ -24,6 +24,7 @@ from apps.academics.models import (
     FacultyAssignmentRole,
     FacultySubjectAssignment,
 )
+from apps.accounts.authorization import check_college_operation_authority
 from apps.accounts.models import RoleChoices
 from apps.faculty.models import FacultyProfile
 from apps.students.models import StudentProfile
@@ -1547,6 +1548,9 @@ def assign_faculty_to_paper(
     candidate_offering = PaperOffering.objects.select_related("academic_session").get(pk=offering_id)
     target_college_id = candidate_offering.academic_session.college_id
 
+    # Check institutional admin authority over target college
+    check_college_operation_authority(acting_user, target_college_id, "assign_faculty")
+
     # 1. Level 1 College Coordination Lock
     lock_colleges(target_college_id)
 
@@ -1603,7 +1607,12 @@ def delete_faculty_assignment(
     """Atomically deletes a FacultySubjectAssignment under lock."""
     check_institutional_admin_authority(acting_user)
 
-    assignment = FacultySubjectAssignment.objects.select_for_update().get(pk=assignment_id)
+    assignment = FacultySubjectAssignment.objects.select_related("paper_offering__academic_session").select_for_update().get(pk=assignment_id)
+    check_college_operation_authority(
+        acting_user,
+        assignment.paper_offering.academic_session.college_id,
+        "delete_faculty_assignment",
+    )
     assignment.delete()
 
 
@@ -1615,57 +1624,96 @@ def update_faculty_assignment(
     validated_data: dict,
 ) -> FacultySubjectAssignment:
     """
-    Atomically updates a FacultySubjectAssignment (Table 20) under lock.
-    Enforces:
-    1. Administrator authorization.
-    2. Single-table lock on existing assignment.
-    3. Deterministic Level 1 College Coordination Lock.
-    4. Reloading and locking proposed faculty and paper offering under College lock.
-    5. Complete-state resolution (merging existing state with partial PATCH updates).
-    6. Complete-state examiner eligibility check: INTERNAL_EXAMINER / EXTERNAL_EXAMINER
-       strictly requires faculty.is_examiner == True.
-    7. Complete-state same-college boundary check.
-    8. Uniqueness constraint check excluding self.
+    Atomically updates a FacultySubjectAssignment (Table 20) conforming strictly
+    to the Five-Level Academic Lock Hierarchy (Finding R3-C):
+    1. Obtain candidate identifiers without retaining child-row locks.
+    2. Determine existing and proposed institutional owners.
+    3. Acquire all relevant College locks in ascending primary-key order.
+    4. Reload and lock the authoritative existing assignment.
+    5. Lock the relevant academic (PaperOffering) and faculty (FacultyProfile) parent records
+       in consistent order.
+    6. Verify that all authoritative college owners are covered by acquired locks.
+    7. Resolve the complete proposed assignment state.
+    8. Validate institutional ownership & administrative authority.
+    9. Validate examiner eligibility against resolved proposed role.
+    10. Validate uniqueness excluding self.
+    11. Apply the update and persist atomically.
     """
     check_institutional_admin_authority(acting_user)
 
+    # 1. Obtain candidate identifiers without retaining child-row locks
+    initial = FacultySubjectAssignment.objects.values(
+        "faculty_id", "paper_offering_id"
+    ).get(pk=assignment_id)
+    current_faculty_id = initial["faculty_id"]
+    current_offering_id = initial["paper_offering_id"]
+
+    proposed_faculty = validated_data.get("faculty", current_faculty_id)
+    proposed_offering = validated_data.get("paper_offering", current_offering_id)
+
+    target_faculty_id = proposed_faculty.pk if hasattr(proposed_faculty, "pk") else int(proposed_faculty)
+    target_offering_id = proposed_offering.pk if hasattr(proposed_offering, "pk") else int(proposed_offering)
+
+    # 2. Determine existing and proposed institutional owners
+    faculty_colleges = set(
+        FacultyProfile.objects.filter(pk__in={current_faculty_id, target_faculty_id}).values_list("college_id", flat=True)
+    )
+    offering_colleges = set(
+        PaperOffering.objects.filter(pk__in={current_offering_id, target_offering_id}).values_list("academic_session__college_id", flat=True)
+    )
+    candidate_college_ids = sorted(faculty_colleges.union(offering_colleges))
+    if not candidate_college_ids:
+        raise ValidationError("Unable to resolve candidate college owners.")
+
+    # 3. Acquire all relevant College coordination locks in deterministic ascending PK order
+    lock_colleges(*candidate_college_ids)
+
+    # 4. Reload and lock the authoritative existing assignment
     assignment = FacultySubjectAssignment.objects.select_for_update().get(pk=assignment_id)
 
-    # Resolve complete proposed references
-    proposed_faculty = validated_data.get("faculty", assignment.faculty)
-    proposed_offering = validated_data.get("paper_offering", assignment.paper_offering)
+    # 5. Lock relevant academic (PaperOffering) and faculty (FacultyProfile) parent records in consistent order
+    all_offering_ids = sorted({assignment.paper_offering_id, target_offering_id})
+    all_faculty_ids = sorted({assignment.faculty_id, target_faculty_id})
+
+    locked_offerings = {
+        po.pk: po
+        for po in PaperOffering.objects.select_for_update().filter(pk__in=all_offering_ids).order_by("pk")
+    }
+    locked_faculties = {
+        fp.pk: fp
+        for fp in FacultyProfile.objects.select_for_update().filter(pk__in=all_faculty_ids).order_by("pk")
+    }
+
+    # 6. Verify that all authoritative college owners are covered by acquired locks
+    locked_faculty = locked_faculties[target_faculty_id]
+    locked_offering = locked_offerings[target_offering_id]
+    offering_college_id = locked_offering.academic_session.college_id
+
+    if locked_faculty.college_id not in candidate_college_ids or offering_college_id not in candidate_college_ids:
+        raise ValidationError("Authoritative college ownership changed concurrently.")
+
+    # 7. Resolve complete proposed assignment state
     proposed_role = validated_data.get("role", assignment.role)
 
-    faculty_id = proposed_faculty.pk if hasattr(proposed_faculty, "pk") else int(proposed_faculty)
-    offering_id = proposed_offering.pk if hasattr(proposed_offering, "pk") else int(proposed_offering)
+    # 8. Validate institutional ownership & administrative authority
+    check_college_operation_authority(acting_user, offering_college_id, "update_faculty_assignment")
 
-    candidate_offering = PaperOffering.objects.select_related("academic_session").get(pk=offering_id)
-    target_college_id = candidate_offering.academic_session.college_id
-
-    # 1. Level 1 College Coordination Lock
-    lock_colleges(target_college_id)
-
-    # 2. Reload related entities under lock
-    locked_faculty = FacultyProfile.objects.select_for_update().get(pk=faculty_id)
-    locked_offering = PaperOffering.objects.select_for_update().get(pk=offering_id)
-
-    # 3. Same-college boundary validation
-    if locked_faculty.college_id != target_college_id:
+    if locked_faculty.college_id != offering_college_id:
         raise ValidationError({
             "faculty": (
                 f"Faculty college ID {locked_faculty.college_id} does not match "
-                f"paper offering college ID {target_college_id}."
+                f"paper offering college ID {offering_college_id}."
             )
         })
 
-    # 4. Examiner eligibility validation against resolved proposed role
+    # 9. Validate examiner eligibility against resolved proposed role
     if proposed_role in (FacultyAssignmentRole.INTERNAL_EXAMINER, FacultyAssignmentRole.EXTERNAL_EXAMINER):
         if not locked_faculty.is_examiner:
             raise ValidationError({
                 "role": f"Faculty member '{locked_faculty.employee_code}' is not marked as eligible for examiner roles."
             })
 
-    # 5. Check uniqueness excluding self
+    # 10. Validate uniqueness excluding self
     if FacultySubjectAssignment.objects.filter(
         faculty=locked_faculty,
         paper_offering=locked_offering,
@@ -1678,6 +1726,7 @@ def update_faculty_assignment(
             )
         })
 
+    # 11. Apply update atomically
     assignment.faculty = locked_faculty
     assignment.paper_offering = locked_offering
     assignment.role = proposed_role

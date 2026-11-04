@@ -11,6 +11,7 @@ from django.db import transaction
 
 from apps.academics.models import AcademicSession, College, Programme
 from apps.academics.services import check_institutional_admin_authority, lock_colleges
+from apps.accounts.authorization import check_college_operation_authority
 from apps.accounts.models import User
 from apps.enrollments.models import AcademicRecordStatus, StudentAcademicRecord
 from apps.students.models import StudentProfile
@@ -42,6 +43,9 @@ def create_student_academic_record(
     # 1. Fetch uncommitted references to identify target college
     candidate_student = StudentProfile.objects.select_related('college').get(pk=student_id)
     target_college_id = candidate_student.college_id
+
+    # Check institutional admin authority over target college
+    check_college_operation_authority(acting_user, target_college_id, "create_student_academic_record")
 
     # 2. Acquire Level 1 College Coordination Lock
     lock_colleges(target_college_id)
@@ -110,6 +114,7 @@ def update_student_academic_record(
     check_institutional_admin_authority(acting_user)
 
     record = StudentAcademicRecord.objects.select_for_update().get(pk=record_id)
+    check_college_operation_authority(acting_user, record.student.college_id, "update_student_academic_record")
 
     # Immutable fields verification
     immutable_fields = {'student', 'programme', 'academic_session'}
