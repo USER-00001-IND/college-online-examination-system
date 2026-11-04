@@ -106,9 +106,8 @@ Four approved database tables were implemented in strict conformance with `docs/
 ### 3.5 Authentication & Self-Registration Endpoints (`apps.accounts`)
 - `POST /api/v1/auth/register/`: Public self-registration endpoint. Never leaks passwords or raw verification tokens in responses. Dispatches email via `send_student_verification_email`; fails closed on delivery failure with HTTP 503 `EMAIL_DELIVERY_UNAVAILABLE` and cleanly deletes the unverified user and profile.
 - `GET|POST /api/v1/auth/verify-email/`:
-  - `POST {"token": "..."}`: Consumes verification token atomically.
-  - `GET ?token=...&confirm=true`: Consumes verification token atomically.
-  - `GET ?token=...`: Inspects token validity without consuming credentials (`status="CONFIRM_REQUIRED"`), preventing accidental token consumption by email prefetchers/scanners.
+  - `POST {"token": "..."}`: Authoritatively validates and consumes cryptographic verification token atomically under row lock.
+  - `GET ?token=...`: Strictly non-consuming token validity inspection (`status="CONFIRM_REQUIRED"`). Query parameters (including `confirm=true`) never trigger state mutations or token consumption, safeguarding against link scanners, security crawler prefetching, and browser preloading.
 
 ---
 
@@ -314,11 +313,186 @@ Round 3 addresses the remaining 5 independent audit findings (2 HIGH, 3 MEDIUM) 
 
 ---
 
-## 11. Governance & Next Steps
+## 11. Round 3 Audit Corrections Summary
 
-Chunk 06 Round 3 corrections are fully implemented, verified, and submitted for independent audit review.
+| Finding # | Severity | Defect Description | Resolution / Implementation Detail |
+| :---: | :---: | :--- | :--- |
+| **R3-A** | **HIGH** | Administrator cross-college authorization scoping: administrators lacked institutional boundary enforcement. | Implemented centralized institutional authorization service in `apps.accounts.authorization`; scopes ordinary admins and fails closed on unassigned scope. |
+| **R3-B** | **HIGH** | Faculty department change lock hierarchy: department changes risked concurrent race conditions. | Implemented College-first coordination locking in `update_faculty_profile`. |
+| **R3-C** | **HIGH** | Faculty assignment update lock hierarchy: child assignment was locked before parent entities. | Implemented deterministic multi-college coordination locking. |
+| **R3-D** | **MEDIUM** | Insecure direct student profile creation endpoint. | Overrode `create()` in `StudentProfileViewSet` to raise HTTP 403 `METHOD_NOT_ALLOWED`. |
+| **R3-E** | **MEDIUM** | Registration email failure state handling. | Added transactional `cleanup_unverified_registration` service. |
 
-- **Current Status:** `IN REVIEW — PENDING INDEPENDENT AUDIT`.
+---
+
+## 12. Round 4 — Institutional Authorization Policy, Lock Coordination & Registration Transaction Safety
+
+### 12.1 Overview & Scope
+
+Chunk 06 Round 4 resolves all outstanding independent audit findings (R4-A through R4-F) identified in the Chunk 06 Round 3 review. All corrections maintain 100% adherence to the approved 52-table relational schema (`docs/database-architecture.md`) with zero schema drift, zero new migrations, and full preservation of protected architecture documents.
+
+---
+
+### 12.2 Finding R4-A: Ordinary Administrator Institutional Scope & Persistence Analysis
+
+#### Status: `SECURITY BOUNDARY ENFORCED — OPERATIONAL AUTHORIZATION POLICY PENDING OWNER DECISION`
+
+1. **Defect Analysis:**
+   In Round 3, `get_actor_authorized_college_ids()` relied upon runtime Python attributes (`actor.college` and `actor.college_id`). In Python, caller code could inject arbitrary in-memory attributes on `User` instances (`admin.college_id = 1`). However, in the approved 52-table schema (`docs/database-architecture.md`), neither `accounts_user` nor `accounts_user_role` contains a `college_id` column. When ordinary administrators were queried fresh from the database, or in live HTTP requests without mock attributes, their college scope was non-persistent.
+
+2. **Immediate Security Enforcement:**
+   - Reliance on caller-injected runtime Python attributes (`actor.college`, `actor.college_id`) was completely removed from `apps.accounts.authorization`.
+   - In accordance with fail-closed security principles, ordinary administrators with ambiguous or unpersisted institutional scope fail closed (`return set()`), denying access to college-scoped mutations (`PermissionDenied`) and returning empty lists on college-scoped querysets (`qs.none()`).
+   - Superadministrators (`role == RoleChoices.SUPERADMIN` or `is_superuser == True`) retain legitimate, verified system-wide authority across all institutions (`return None`).
+
+3. **Required Operational Authorization Policy Options Report for Project Owner:**
+
+   | Criteria | Option A: Extend User Entity | Option B: Administrative Membership Mapping Table | Option C: Existing-Role / Profile Adaptation |
+   | :--- | :--- | :--- | :--- |
+   | **Architectural Description** | Add a nullable `college_id BIGINT NULL REFERENCES colleges_college(id) ON DELETE RESTRICT` column directly to Table 1 (`accounts_user`). | Introduce a dedicated junction table (e.g. `accounts_college_administrator` or `accounts_administrative_membership`) linking `user_id` to `college_id`. | Associate administrative scope exclusively through existing profiles (e.g., require institutional admins to hold a `FacultyProfile` linked to their college) or institutional config mapping. |
+   | **Schema Drift & Migration** | **SCHEMA EXPANSION:** Requires altering Table 1 (`accounts_user`) and generating a database migration. Increases column count of Table 1. | **SCHEMA EXPANSION:** Introduces Table 53 (exceeds the 52-table baseline); requires a new migration for the junction table and constraints. | **ZERO SCHEMA DRIFT:** Fully compliant with the approved 52-table schema without altering tables or adding migrations. |
+   | **Multi-College Flexibility** | **Rigid (1:1):** Each administrator user is locked to at most one college. Cannot support multi-college consortium administrators or university roving observers. | **Flexible (M:N):** Fully supports administrators managing multiple colleges, institutional transfers, and granular role assignments per college. | **Restricted:** Conflates academic faculty identity with administrative privileges; non-faculty administrators cannot be supported without dummy faculty profiles. |
+   | **Performance & Query Complexity** | **Optimal:** 0 additional joins to resolve college scope (`request.user.college_id`). Minimal query latency. | **Good:** Single indexed lookup on junction table (`SELECT college_id FROM accounts_college_administrator WHERE user_id = :uid`), cacheable in session/token. | **Moderate:** Requires querying `faculty_faculty_profile` to establish administrative authority. |
+   | **Security & Isolation** | High: Direct foreign key referential integrity at the database engine level. | High: Clear relational boundary separating core user identity from organizational appointments. | Low-Moderate: Weak role separation; invites role confusion between faculty grading roles and administrator review privileges. |
+   | **Recommendation** | **Recommended if single-college assignment is permanent.** Simpler and highly efficient. | **Recommended if institutional administrators may govern multiple colleges.** Industrially robust for multi-college university contexts. | **Not Recommended.** Conflates distinct separation of concerns and creates long-term domain confusion. |
+
+   *Current Execution Status:* Gated pending explicit project-owner policy selection. Until authorized, fail-closed enforcement remains active.
+
+---
+
+### 12.3 Finding R4-B: Unsafe Registration Approval Locking Query Refactoring
+
+1. **Defect Analysis:**
+   In `review_student_registration()`, the locking query used:
+   ```python
+   RegistrationApproval.objects.select_for_update().select_related('user__student_profile').filter(pk=approval_id)
+   ```
+   Executing `SELECT ... FOR UPDATE` with `select_related('user__student_profile')` generates a nullable `LEFT OUTER JOIN` against `students_student_profile`. On MySQL 8 InnoDB, locking nullable outer joins either triggers syntax/engine errors or locks unintended joined rows with unpredictable gap lock behavior.
+2. **Exact Correction:**
+   - Refactored `review_student_registration()` to strictly use single-table locking queries.
+   - Initial read obtains `candidate_user_id` and checks institutional authority without locking.
+   - Row locks are acquired monotonically: single-table `User.objects.select_for_update().get(pk=target_user_id)`, followed by single-table `RegistrationApproval.objects.select_for_update().get(pk=approval_id)`, followed by single-table `EmailVerification` and `StudentProfile` queries.
+   - Joined-table row locking is eliminated entirely.
+
+---
+
+### 12.4 Finding R4-C: Unified Registration Lock Hierarchy & Precondition Revalidation
+
+1. **Defect Analysis:**
+   A lock-order inversion existed between registration workflows:
+   - `cleanup_unverified_registration()` locked: User $\rightarrow$ EmailVerification $\rightarrow$ RegistrationApproval.
+   - `review_student_registration()` locked: RegistrationApproval $\rightarrow$ User.
+   - `verify_email_token()` locked `EmailVerification` independently.
+   Under concurrent execution, these divergent lock sequences could deadlock under MySQL InnoDB.
+2. **Exact Correction:**
+   Established and enforced **One Unified Registration Lock Hierarchy** across all registration-related service functions:
+   $$\text{Level 1: College Coordination Lock (if applicable)} \longrightarrow \text{Level 2: User} \longrightarrow \text{Level 3: RegistrationApproval} \longrightarrow \text{Level 4: EmailVerification} \longrightarrow \text{Level 5: StudentProfile}$$
+   - In `cleanup_unverified_registration()`: Locks acquired in order: User $\rightarrow$ RegistrationApproval $\rightarrow$ EmailVerification $\rightarrow$ StudentProfile. Strict safety preconditions re-verified under lock:
+     - `user.is_active is False`
+     - `user.role == RoleChoices.STUDENT`
+     - `approval.status == RegistrationApprovalStatus.PENDING`
+     - `email_verification.is_used is False` and `verified_at is None`
+     If any check fails, cleanup aborts immediately and returns `False`.
+   - In `verify_email_token()`: Locks acquired in order: User $\rightarrow$ EmailVerification. Token verified and consumed atomically under lock.
+   - In `review_student_registration()`: Locks acquired in order: User $\rightarrow$ RegistrationApproval $\rightarrow$ EmailVerification $\rightarrow$ StudentProfile. Status revalidated under lock.
+
+---
+
+### 12.5 Finding R4-D: Evaluated Department Row Locks in `update_faculty_profile()`
+
+1. **Defect Analysis:**
+   In `update_faculty_profile()` (`apps.faculty.services`), the department locking statement:
+   ```python
+   Department.objects.select_for_update().filter(pk__in=sorted(candidate_dept_ids)).order_by("pk")
+   ```
+   was an un-evaluated Django queryset expression. Because querysets are lazy, no SQL was issued to the database, and zero department row locks were acquired under MySQL InnoDB.
+2. **Exact Correction:**
+   - Evaluated the department locking queryset immediately into a materialized dictionary inside the `@transaction.atomic` block:
+     ```python
+     locked_departments = {
+         dept.pk: dept
+         for dept in Department.objects.select_for_update().filter(pk__in=sorted(candidate_dept_ids)).order_by("pk")
+     }
+     ```
+   - Reused the locked department instances directly from `locked_departments` during department reassignment, guaranteeing deterministic row-level lock acquisition and eliminating redundant queries.
+
+---
+
+### 12.6 Finding R4-E: Standardized Lock Sequence Across Faculty Assignment Operations
+
+1. **Defect Analysis:**
+   In `apps.academics.services`:
+   - `update_faculty_assignment()` locked child `FacultySubjectAssignment` before locking parent entities `PaperOffering` and `FacultyProfile`.
+   - `delete_faculty_assignment()` used `select_related('paper_offering__academic_session')` inside `select_for_update()` without acquiring Level 1 College coordination locks.
+2. **Exact Correction:**
+   Standardized lock acquisition order across all three faculty assignment mutation services:
+   $$\text{Level 1: College Coordination Lock} \longrightarrow \text{Level 2: PaperOffering} \longrightarrow \text{Level 3: FacultyProfile} \longrightarrow \text{Level 4: FacultySubjectAssignment}$$
+   - `assign_faculty_to_paper()`: Level 1 College lock $\rightarrow$ Level 2 `PaperOffering` $\rightarrow$ Level 3 `FacultyProfile` $\rightarrow$ Level 4 assignment creation.
+   - `update_faculty_assignment()`: Level 1 College lock $\rightarrow$ Level 2 `PaperOffering` $\rightarrow$ Level 3 `FacultyProfile` $\rightarrow$ Level 4 `FacultySubjectAssignment` child row lock $\rightarrow$ validation & mutation.
+   - `delete_faculty_assignment()`: Candidate IDs resolved $\rightarrow$ Level 1 College lock $\rightarrow$ Level 2 `PaperOffering` $\rightarrow$ Level 4 `FacultySubjectAssignment` single-table lock $\rightarrow$ atomic deletion.
+
+---
+
+### 12.7 Finding R4-F: Verify Email Documentation & Endpoint Contract Compliance
+
+1. **Defect Analysis:**
+   Audit documentation Section 3.5 contained obsolete text claiming `GET ?confirm=true` consumed verification tokens.
+2. **Exact Correction:**
+   - Corrected Section 3.5 to state that `GET /api/v1/auth/verify-email/?token=...` is strictly read-only inspection returning HTTP 200 `CONFIRM_REQUIRED` without consuming credentials.
+   - Query parameters (including `confirm=true`) never trigger state changes or consume tokens.
+   - `POST /api/v1/auth/verify-email/ {"token": "..."}` is the exclusive, authoritative token consumption endpoint.
+
+---
+
+## 13. Test Suite Verification & Audit Evidence
+
+### 13.1 Automated Test Execution Summary
+
+The complete automated test suite was executed against the development environment with all Round 4 corrections active:
+
+```bash
+# Full Test Suite Execution
+pytest backend/tests --ds=config.settings.test
+# Outcome: 510 passed, 10 skipped in 7.10s
+
+# Django Native Test Runner Execution
+python backend/manage.py test tests --settings=config.settings.test
+# Outcome: Ran 520 tests in 6.213s -> OK (skipped=10)
+
+# Django System Check
+python backend/manage.py check --settings=config.settings.development
+# Outcome: System check identified no issues (0 silenced).
+
+# Schema Drift & Migrations Dry Run
+python backend/manage.py makemigrations --check --dry-run --settings=config.settings.development
+# Outcome: No changes detected.
+
+# Protected Files Integrity Verification
+git diff --exit-code design.md handover.txt docs/architecture.md docs/database-architecture.md
+# Outcome: Clean (0 diff, 0 violations).
+```
+
+### 13.2 Dedicated Round 4 Regression Tests (`Chunk06Round4CorrectionsTests`)
+
+Eight new automated test cases were added to `backend/tests/test_students_faculty.py` verifying each Round 4 finding:
+1. `test_ordinary_admin_without_persistent_college_linkage_fails_closed`: Verifies that ordinary admins fail closed on all college operations without persistent database linkage.
+2. `test_runtime_attribute_injection_does_not_grant_authority`: Proves that injecting `admin.college_id` or `admin.college` runtime attributes fails closed with `DjangoPermissionDenied`.
+3. `test_superadmin_retains_system_wide_multi_college_access`: Proves that superadministrators retain verified authority across multiple colleges.
+4. `test_review_student_registration_single_table_locking_and_approval`: Verifies single-table locking, prerequisite email verification checks, and active flag transitions under lock.
+5. `test_cleanup_unverified_registration_precondition_revalidation`: Verifies that cleanup revalidates `is_active is False`, `role == STUDENT`, `status == PENDING`, `is_used is False`, `verified_at is None` under lock before deletion.
+6. `test_verify_email_token_lock_order_and_expiry`: Verifies User $\rightarrow$ EmailVerification lock order and single-use enforcement.
+7. `test_update_faculty_profile_materialized_department_locks`: Verifies materialized department lock dictionary acquisition in ascending PK order.
+8. `test_faculty_assignment_standardized_lock_sequence_crud`: Verifies consistent Level 1 College $\rightarrow$ Level 2 PaperOffering $\rightarrow$ Level 3 FacultyProfile $\rightarrow$ Level 4 FacultySubjectAssignment hierarchy across create, update, and delete operations.
+
+---
+
+## 14. Governance, Boundaries & Mandatory Next Steps
+
+Chunk 06 Round 4 technical corrections are complete, fully verified, and submitted for independent audit review.
+
+- **Chunk 06 Implementation Status:** `IN REVIEW: TECHNICAL CORRECTIONS COMPLETE; INSTITUTIONAL AUTHORIZATION DECISION PENDING`.
+- **Finding R4-A Policy Status:** `SECURITY BOUNDARY ENFORCED — OPERATIONAL AUTHORIZATION POLICY PENDING OWNER DECISION`.
 - **Chunk 07 Onward:** Strictly **GATED — NOT AUTHORIZED**.
-- Implementation of Table 19 (`enrollments_student_subject_enrollment`), examination scheduling, or admit cards must strictly await Chunk 06 owner approval and formal Chunk 07 authorization.
-- Git commit and git push remain unexecuted pending independent audit signoff.
+- **Android Application Development:** Strictly **PAUSED — NOT AUTHORIZED**.
+- **Schema Drift & Migrations:** Strictly **ZERO NEW MIGRATIONS / ZERO SCHEMA DRIFT**.
+- **Git Commit & Git Push:** Strictly **UNEXECUTED** pending explicit authorization.

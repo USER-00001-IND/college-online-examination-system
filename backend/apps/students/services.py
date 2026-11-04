@@ -83,13 +83,21 @@ def send_student_verification_email(*, user: User, raw_token: str) -> None:
 def cleanup_unverified_registration(user_id: int) -> bool:
     """
     Atomically cleans up an unverified student registration after email delivery failure.
-    Enforces strict safety preconditions under row lock:
-    1. Locks User row (select_for_update).
-    2. Verifies user is inactive (is_active is False).
-    3. Verifies email verification token was not consumed (verified_at is None, is_used is False).
-    4. Verifies registration approval is still pending (status is PENDING).
-    If any check fails (e.g. concurrent verification or approval), refuses deletion and returns False.
-    Otherwise, atomically deletes related records and user, and returns True.
+    Enforces strict safety preconditions under the Unified Registration Lock Hierarchy:
+    Level 2: User (select_for_update)
+    Level 3: RegistrationApproval (select_for_update)
+    Level 4: EmailVerification (select_for_update)
+    Level 5: StudentProfile (select_for_update)
+
+    Preconditions verified under lock:
+    1. User is inactive (is_active is False).
+    2. User holds primary role STUDENT.
+    3. Registration approval is still pending (status is PENDING).
+    4. Email verification token was never consumed or verified (is_used is False, verified_at is None).
+
+    If any precondition check fails (e.g. concurrent verification or approval),
+    refuses deletion and returns False.
+    Otherwise, atomically deletes related records and user in reverse dependency order, and returns True.
     """
     try:
         user = User.objects.select_for_update().get(pk=user_id)
@@ -100,22 +108,29 @@ def cleanup_unverified_registration(user_id: int) -> bool:
         logger.warning("Refusing cleanup: User %s is already active.", user_id)
         return False
 
-    # Check EmailVerification under lock
-    verifications = EmailVerification.objects.select_for_update().filter(user=user)
-    if verifications.filter(is_used=True).exists():
-        logger.warning("Refusing cleanup: User %s verification token was already consumed.", user_id)
+    if user.role != RoleChoices.STUDENT:
+        logger.warning("Refusing cleanup: User %s role is '%s', not STUDENT.", user_id, user.role)
         return False
 
-    # Check RegistrationApproval under lock
-    approvals = RegistrationApproval.objects.select_for_update().filter(user=user)
-    if approvals.exclude(status=RegistrationApprovalStatus.PENDING).exists():
-        logger.warning("Refusing cleanup: User %s registration approval is no longer pending.", user_id)
+    # Check RegistrationApproval under lock (Level 3)
+    approvals = list(RegistrationApproval.objects.select_for_update().filter(user=user))
+    if not approvals or any(app.status != RegistrationApprovalStatus.PENDING for app in approvals):
+        logger.warning("Refusing cleanup: User %s registration approval is missing or not pending.", user_id)
         return False
 
-    # Safe to clean up atomically
+    # Check EmailVerification under lock (Level 4)
+    verifications = list(EmailVerification.objects.select_for_update().filter(user=user))
+    if not verifications or any(ev.is_used or ev.verified_at is not None for ev in verifications):
+        logger.warning("Refusing cleanup: User %s verification token was already consumed or verified.", user_id)
+        return False
+
+    # Lock StudentProfile (Level 5)
+    StudentProfile.objects.select_for_update().filter(user=user)
+
+    # Safe to clean up atomically in reverse dependency order
     StudentProfile.objects.filter(user=user).delete()
-    verifications.delete()
-    approvals.delete()
+    EmailVerification.objects.filter(user=user).delete()
+    RegistrationApproval.objects.filter(user=user).delete()
     user.delete()
     logger.info("Atomically cleaned up unverified user %s after email dispatch failure.", user_id)
     return True
@@ -229,20 +244,20 @@ def register_student(
 def verify_email_token(raw_token: str) -> User:
     """
     Validates a cryptographic email verification token and consumes it atomically.
+    Follows Unified Registration Lock Hierarchy: Level 2: User -> Level 4: EmailVerification.
     Does NOT activate the account; user remains is_active=False until administrative approval.
     """
     if not raw_token or not raw_token.strip():
         raise ValidationError({"token": "Verification token is required."})
 
     token_hash = hashlib.sha256(raw_token.strip().encode('utf-8')).hexdigest()
-    verification = (
-        EmailVerification.objects.select_for_update()
-        .filter(token_hash=token_hash)
-        .first()
-    )
-
-    if not verification:
+    candidate = EmailVerification.objects.filter(token_hash=token_hash).values("id", "user_id").first()
+    if not candidate:
         raise ValidationError({"token": "Invalid verification token."})
+
+    # Acquire row locks in unified hierarchy order
+    user = User.objects.select_for_update().get(pk=candidate["user_id"])
+    verification = EmailVerification.objects.select_for_update().get(pk=candidate["id"])
 
     if verification.is_used:
         raise ValidationError({"token": "Verification token has already been used."})
@@ -254,7 +269,7 @@ def verify_email_token(raw_token: str) -> User:
     verification.verified_at = timezone.now()
     verification.save(update_fields=['is_used', 'verified_at'])
 
-    return verification.user
+    return user
 
 
 @transaction.atomic
@@ -267,6 +282,13 @@ def review_student_registration(
 ) -> RegistrationApproval:
     """
     Performs administrative review on a pending registration approval.
+    Enforces Unified Registration Lock Hierarchy:
+    Level 1: College Coordination Lock (if applicable)
+    Level 2: User (select_for_update)
+    Level 3: RegistrationApproval (select_for_update, single-table query)
+    Level 4: EmailVerification (select_for_update)
+    Level 5: StudentProfile (select_for_update)
+
     - APPROVE: Requires verified email. Atomically sets approval status to APPROVED
       and user.is_active = True under row lock.
     - REJECT: Atomically sets status to REJECTED with rejection reason and leaves
@@ -278,35 +300,46 @@ def review_student_registration(
     if action not in ("APPROVE", "REJECT"):
         raise ValidationError({"action": "Action must be 'APPROVE' or 'REJECT'."})
 
-    approval = (
-        RegistrationApproval.objects.select_for_update()
-        .select_related('user__student_profile')
-        .filter(pk=approval_id)
-        .first()
-    )
-    if not approval:
+    # 1. Read candidate identifiers without locking (avoids nullable outer-join locks)
+    initial = RegistrationApproval.objects.values("id", "user_id", "status").filter(pk=approval_id).first()
+    if not initial:
         raise ValidationError({"approval": "Registration approval record not found."})
 
-    # Check institutional admin authority over this specific college
-    if hasattr(approval.user, 'student_profile') and approval.user.student_profile:
-        check_college_operation_authority(reviewer, approval.user.student_profile.college_id, "review_student_registration")
+    target_user_id = initial["user_id"]
+
+    # Cannot approve self
+    if target_user_id == reviewer.pk:
+        raise PermissionDenied("Administrators cannot approve their own registration requests.")
+
+    # Resolve target college for institutional authority check
+    candidate_college_id = StudentProfile.objects.filter(user_id=target_user_id).values_list("college_id", flat=True).first()
+    if candidate_college_id:
+        check_college_operation_authority(reviewer, candidate_college_id, "review_student_registration")
     else:
         check_institutional_admin_authority(reviewer)
 
+    # 2. Acquire locks in strict unified hierarchy
+    # Level 2: User lock
+    user = User.objects.select_for_update().get(pk=target_user_id)
+
+    # Level 3: RegistrationApproval lock (single-table query, no select_related)
+    approval = RegistrationApproval.objects.select_for_update().get(pk=approval_id)
+
+    # Level 4: EmailVerification lock
+    email_verifications = list(EmailVerification.objects.select_for_update().filter(user=user))
+
+    # Level 5: StudentProfile lock
+    student_profile = StudentProfile.objects.select_for_update().filter(user=user).first()
+
+    # 3. Revalidate preconditions under lock
     if approval.status != RegistrationApprovalStatus.PENDING:
         raise ValidationError({
             "status": f"Registration request is already {approval.status} and cannot be reviewed again."
         })
 
-    # Cannot approve self
-    if approval.user_id == reviewer.pk:
-        raise PermissionDenied("Administrators cannot approve their own registration requests.")
-
-    user = User.objects.select_for_update().get(pk=approval.user_id)
-
     if action == "APPROVE":
         # Enforce prerequisite: Email must be verified before approval
-        is_email_verified = EmailVerification.objects.filter(user=user, is_used=True).exists()
+        is_email_verified = any(ev.is_used for ev in email_verifications)
         if not is_email_verified:
             raise ValidationError({
                 "email": "Cannot approve registration before student completes email verification."

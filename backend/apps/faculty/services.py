@@ -149,8 +149,11 @@ def update_faculty_profile(
     # 2. Acquire required College coordination locks in deterministic ascending PK order
     lock_colleges(*sorted(candidate_college_ids))
 
-    # 3. Acquire relevant Department locks in consistent order
-    Department.objects.select_for_update().filter(pk__in=sorted(candidate_dept_ids)).order_by("pk")
+    # 3. Acquire relevant Department locks in deterministic ascending PK order (materialized dictionary)
+    locked_departments = {
+        dept.pk: dept
+        for dept in Department.objects.select_for_update().filter(pk__in=sorted(candidate_dept_ids)).order_by("pk")
+    }
 
     # 4. Reload the FacultyProfile under lock
     profile = FacultyProfile.objects.select_for_update().get(pk=profile_id)
@@ -159,13 +162,15 @@ def update_faculty_profile(
     if profile.college_id not in candidate_college_ids:
         raise ValidationError("Authoritative college ownership changed concurrently.")
 
-    # 7. Recheck administrator authorization for target institution
+    # 6. Recheck administrator authorization for target institution
     if is_admin:
         check_college_operation_authority(acting_user, profile.college_id, "update_faculty_profile")
 
-    # 6 & 8. Resolve proposed department and validate department-to-college compatibility
+    # 7 & 8. Resolve proposed department from locked instances and validate department-to-college compatibility
     if is_admin and proposed_dept:
-        locked_dept = Department.objects.select_for_update().get(pk=dept_id)
+        locked_dept = locked_departments.get(dept_id)
+        if not locked_dept:
+            raise ValidationError({"department": "Target department does not exist."})
         if locked_dept.college_id != profile.college_id:
             raise ValidationError({
                 "department": f"Department '{locked_dept.code}' belongs to college ID {locked_dept.college_id}, not {profile.college_id}."

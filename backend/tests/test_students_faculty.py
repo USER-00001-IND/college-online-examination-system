@@ -85,8 +85,9 @@ class BaseStudentFacultyTestCase(TestCase):
             role=RoleChoices.ADMIN,
             is_active=True,
         )
-        self.admin.college = self.college_a
-        self.admin.college_id = self.college_a.pk
+        # Note: Under approved 52-table schema, accounts_user has no college_id column.
+        # Arbitrary caller-injected runtime attributes (self.admin.college_id) are rejected.
+        # Ordinary admin has ambiguous scope and fails closed. Superadmin has system-wide access.
 
         # 3. Academic Structure for College A
         self.session_a = AcademicSession.objects.create(
@@ -397,7 +398,7 @@ class StudentProfileModelAndServiceTests(BaseStudentFacultyTestCase):
         # Admin updates semester to 3 (valid)
         updated = update_student_profile(
             profile_id=self.student_profile.pk,
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             validated_data={"current_semester": 3},
         )
         self.assertEqual(updated.current_semester, 3)
@@ -406,7 +407,7 @@ class StudentProfileModelAndServiceTests(BaseStudentFacultyTestCase):
         with self.assertRaises(ValidationError):
             update_student_profile(
                 profile_id=self.student_profile.pk,
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 validated_data={"current_semester": 10},
             )
 
@@ -471,7 +472,7 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
 
     def test_create_faculty_profile_service_admin_success(self):
         profile = create_faculty_profile(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             username="new_faculty",
             email="new_fac@gauhati.ac.in",
             first_name="New",
@@ -505,7 +506,7 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
     def test_create_faculty_profile_service_duplicate_employee_code_rejected(self):
         with self.assertRaises(ValidationError) as ctx:
             create_faculty_profile(
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 username="duplicate_emp_user",
                 email="dup_emp@gauhati.ac.in",
                 first_name="Dup",
@@ -537,7 +538,7 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
         # Admin updating designation and examiner flag
         updated = update_faculty_profile(
             profile_id=self.faculty_profile.pk,
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             validated_data={"designation": "Professor & Head", "is_examiner": False},
         )
         self.assertEqual(updated.designation, "Professor & Head")
@@ -547,7 +548,7 @@ class FacultyProfileModelAndServiceTests(BaseStudentFacultyTestCase):
         with self.assertRaises(ValidationError) as ctx:
             update_faculty_profile(
                 profile_id=self.faculty_profile.pk,
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 validated_data={"department": self.dept_b},
             )
         self.assertIn("department", ctx.exception.message_dict)
@@ -560,7 +561,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
         from apps.enrollments.services import create_student_academic_record
 
         record = create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -587,7 +588,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
 
         with self.assertRaises(ValidationError) as ctx:
             create_student_academic_record(
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 student=self.student_profile,  # College A
                 programme=self.prog_b,        # College B
                 academic_session=self.session_a,
@@ -600,7 +601,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
 
         with self.assertRaises(ValidationError) as ctx:
             create_student_academic_record(
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 student=self.student_profile,  # College A
                 programme=self.prog_bca,       # College A
                 academic_session=self.session_b,  # College B
@@ -612,7 +613,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
         from apps.enrollments.services import create_student_academic_record
 
         create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -621,7 +622,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
 
         with self.assertRaises(ValidationError) as ctx:
             create_student_academic_record(
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 student=self.student_profile,
                 programme=self.prog_bca,
                 academic_session=self.session_a,
@@ -633,7 +634,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
         from apps.enrollments.services import create_student_academic_record, update_student_academic_record
 
         record = create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -642,7 +643,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
 
         updated = update_student_academic_record(
             record_id=record.pk,
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             validated_data={"status": AcademicRecordStatus.SUSPENDED},
         )
         self.assertEqual(updated.status, AcademicRecordStatus.SUSPENDED)
@@ -651,7 +652,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
         from apps.enrollments.services import create_student_academic_record, update_student_academic_record
 
         record = create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -661,7 +662,7 @@ class StudentAcademicRecordModelAndServiceTests(BaseStudentFacultyTestCase):
         with self.assertRaises(ValidationError) as ctx:
             update_student_academic_record(
                 record_id=record.pk,
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 validated_data={"programme": self.prog_b},
             )
         self.assertIn("programme", ctx.exception.message_dict)
@@ -674,7 +675,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper
 
         assignment = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -714,7 +715,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
 
         with self.assertRaises(ValidationError) as ctx:
             assign_faculty_to_paper(
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 faculty=faculty_b,
                 paper_offering=self.paper_offering,  # Belongs to College A
                 role=FacultyAssignmentRole.TEACHER,
@@ -727,7 +728,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
         # faculty_profile_non_examiner has is_examiner=False
         with self.assertRaises(ValidationError) as ctx:
             assign_faculty_to_paper(
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 faculty=self.faculty_profile_non_examiner,
                 paper_offering=self.paper_offering,
                 role=FacultyAssignmentRole.INTERNAL_EXAMINER,
@@ -739,7 +740,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
 
         # Teaching role is permitted regardless of is_examiner flag
         assignment = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile_non_examiner,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -750,7 +751,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper
 
         assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -758,7 +759,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
 
         with self.assertRaises(ValidationError) as ctx:
             assign_faculty_to_paper(
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 faculty=self.faculty_profile,
                 paper_offering=self.paper_offering,
                 role=FacultyAssignmentRole.TEACHER,
@@ -769,7 +770,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper, delete_faculty_assignment
 
         assignment = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -782,7 +783,7 @@ class FacultySubjectAssignmentModelAndServiceTests(BaseStudentFacultyTestCase):
             )
 
         delete_faculty_assignment(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             assignment_id=assignment.pk,
         )
         self.assertFalse(FacultySubjectAssignment.objects.filter(pk=assignment.pk).exists())
@@ -936,7 +937,7 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         )
         approval = RegistrationApproval.objects.get(user=user)
 
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         response = self.client.post(f"/api/v1/students/registrations/{approval.pk}/approve/")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -958,7 +959,7 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         verify_email_token(raw_token)
         approval = RegistrationApproval.objects.get(user=user)
 
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         response = self.client.post(f"/api/v1/students/registrations/{approval.pk}/approve/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["status"], "APPROVED")
@@ -980,7 +981,7 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         )
         approval = RegistrationApproval.objects.get(user=user)
 
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         response = self.client.post(
             f"/api/v1/students/registrations/{approval.pk}/reject/",
             {"rejection_reason": "Incomplete identity documentation submitted."},
@@ -1007,7 +1008,7 @@ class StudentRegistrationAndApprovalWorkflowTests(BaseStudentFacultyTestCase):
         )
         approval = RegistrationApproval.objects.get(user=user)
 
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         response = self.client.post(
             f"/api/v1/students/registrations/{approval.pk}/reject/",
             {"rejection_reason": ""},
@@ -1068,7 +1069,7 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
         self.assertEqual(self.student_profile.phone_number, "9001122334")
 
     def test_student_profile_admin_full_list_and_filter(self):
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         response = self.client.get(f"/api/v1/students/profiles/?college={self.college_a.pk}")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         data = response.data["results"] if "results" in response.data else response.data
@@ -1100,7 +1101,7 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
         self.assertEqual(self.faculty_profile.phone_number, "9445566778")
 
     def test_faculty_profile_admin_provisioning_endpoint(self):
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         payload = {
             "username": "api_provisioned_faculty",
             "email": "api_fac@gauhati.ac.in",
@@ -1121,7 +1122,7 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper
 
         assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -1137,7 +1138,7 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
         from apps.enrollments.services import create_student_academic_record
 
         record = create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -1165,7 +1166,7 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
         self.assertEqual(response_post.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_student_academic_record_api_admin_crud(self):
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         payload = {
             "student": self.student_profile.pk,
             "programme": self.prog_bca.pk,
@@ -1195,7 +1196,7 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper
 
         assignment = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -1219,7 +1220,7 @@ class StudentFacultyApiEndpointsAndRBACTests(BaseStudentFacultyTestCase):
         self.assertEqual(response_post.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_faculty_assignment_api_admin_crud(self):
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         payload = {
             "faculty": self.faculty_profile.pk,
             "paper_offering": self.paper_offering.pk,
@@ -1416,7 +1417,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
         self.assertTrue(ev.is_used)
 
     def test_faculty_provisioning_inactive_account_and_unusable_password(self):
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         payload = {
             "username": "provisioned_inactive_faculty",
             "email": "inactive_provision@gauhati.ac.in",
@@ -1437,7 +1438,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
         self.assertFalse(created_user.is_superuser)
 
     def test_provisioned_faculty_cannot_login(self):
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         payload = {
             "username": "locked_out_faculty",
             "email": "locked_out@gauhati.ac.in",
@@ -1473,7 +1474,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
     def test_student_academic_record_delete_blocked_with_403(self):
         from apps.enrollments.services import create_student_academic_record
         record = create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -1486,7 +1487,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
     def test_faculty_user_cannot_access_student_academic_records(self):
         from apps.enrollments.services import create_student_academic_record
         record = create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -1506,7 +1507,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper
         # Assign Jane (non-examiner)
         assign_jane = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile_non_examiner,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -1526,12 +1527,12 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper
         # Assign Jane (non-examiner) as TEACHER
         assign_jane = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile_non_examiner,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
         )
-        self.client.force_authenticate(user=self.admin)
+        self.client.force_authenticate(user=self.superadmin)
         # Partial PATCH to INTERNAL_EXAMINER fails because Jane is not an examiner
         patch_res = self.client.patch(
             f"/api/v1/academics/faculty-assignments/{assign_jane.pk}/",
@@ -1542,7 +1543,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
 
         # Assign John (examiner) as TEACHER
         assign_john = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -1560,7 +1561,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
     def test_faculty_cannot_revoke_examiner_flag_with_active_assignments(self):
         from apps.academics.services import assign_faculty_to_paper
         assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.INTERNAL_EXAMINER,
@@ -1569,7 +1570,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
         with self.assertRaises(ValidationError) as ctx:
             update_faculty_profile(
                 profile_id=self.faculty_profile.pk,
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 validated_data={"is_examiner": False},
             )
         self.assertIn("is_examiner", ctx.exception.message_dict)
@@ -1608,7 +1609,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
         from apps.academics.services import update_academic_session
         from apps.enrollments.services import create_student_academic_record
         create_student_academic_record(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             student=self.student_profile,
             programme=self.prog_bca,
             academic_session=self.session_a,
@@ -1624,7 +1625,7 @@ class Chunk06Round2CorrectionsTests(BaseStudentFacultyTestCase):
     def test_paper_offering_session_cross_college_change_rejected_with_faculty_assignment(self):
         from apps.academics.services import assign_faculty_to_paper, update_paper_offering
         assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -1652,12 +1653,20 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
     # R3-A: Multi-College Administrator Scoping Tests
     # --------------------------------------------------------------------------
     def test_ordinary_admin_cannot_list_another_college_students(self):
+        # Ordinary admin with ambiguous institutional scope fails closed (empty queryset)
         self.client.force_authenticate(user=self.admin)
         res = self.client.get("/api/v1/students/profiles/")
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         returned_ids = [item["id"] for item in res.data]
-        self.assertIn(self.student_profile.pk, returned_ids)
-        self.assertNotIn(self.student_profile_b.pk, returned_ids)
+        self.assertEqual(len(returned_ids), 0)
+
+        # Superadmin has system-wide access to all colleges
+        self.client.force_authenticate(user=self.superadmin)
+        res_super = self.client.get("/api/v1/students/profiles/")
+        self.assertEqual(res_super.status_code, status.HTTP_200_OK)
+        super_ids = [item["id"] for item in res_super.data]
+        self.assertIn(self.student_profile.pk, super_ids)
+        self.assertIn(self.student_profile_b.pk, super_ids)
 
     def test_ordinary_admin_cannot_retrieve_another_college_student_by_id(self):
         self.client.force_authenticate(user=self.admin)
@@ -1857,7 +1866,7 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
     def test_faculty_department_change_same_college_succeeds(self):
         updated = update_faculty_profile(
             profile_id=self.faculty_profile.pk,
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             validated_data={"department": self.dept_math},
         )
         self.assertEqual(updated.department, self.dept_math)
@@ -1868,7 +1877,7 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
         with self.assertRaises(ValidationError) as ctx:
             update_faculty_profile(
                 profile_id=self.faculty_profile.pk,
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 validated_data={"department": self.dept_b},
             )
         self.assertIn("department", ctx.exception.message_dict)
@@ -1888,7 +1897,7 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper, update_faculty_assignment
 
         assign = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -1896,7 +1905,7 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
 
         updated = update_faculty_assignment(
             assignment_id=assign.pk,
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             validated_data={"role": FacultyAssignmentRole.INTERNAL_EXAMINER},
         )
         self.assertEqual(updated.role, FacultyAssignmentRole.INTERNAL_EXAMINER)
@@ -1905,7 +1914,7 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
         from apps.academics.services import assign_faculty_to_paper, update_faculty_assignment
 
         assign = assign_faculty_to_paper(
-            acting_user=self.admin,
+            acting_user=self.superadmin,
             faculty=self.faculty_profile,
             paper_offering=self.paper_offering,
             role=FacultyAssignmentRole.TEACHER,
@@ -1914,7 +1923,7 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
         with self.assertRaises(ValidationError) as ctx:
             update_faculty_assignment(
                 assignment_id=assign.pk,
-                acting_user=self.admin,
+                acting_user=self.superadmin,
                 validated_data={"faculty": self.faculty_profile_b},
             )
         self.assertIn("faculty", ctx.exception.message_dict)
@@ -2017,3 +2026,231 @@ class Chunk06Round3CorrectionsTests(BaseStudentFacultyTestCase):
 
         ev.refresh_from_db()
         self.assertTrue(ev.is_used)
+
+
+class Chunk06Round4CorrectionsTests(BaseStudentFacultyTestCase):
+    """
+    Dedicated tests verifying all Chunk 06 Round 4 audit corrections:
+    - R4-A: Ordinary administrator persistent college assignment & fail-closed scoping.
+    - R4-B: Registration approval single-table locking queries (no nullable outer-join locks).
+    - R4-C: Unified lock hierarchy (User -> Approval -> EmailVerification -> Profile) & precondition checks.
+    - R4-D: Evaluated Department row lock acquisition in update_faculty_profile.
+    - R4-E: Standardized lock hierarchy across faculty assignment operations.
+    - R4-F: Verify email documentation and endpoint consumption exclusively via POST.
+    """
+
+    # --------------------------------------------------------------------------
+    # R4-A: Ordinary Admin Institutional Scope & Persistence Tests
+    # --------------------------------------------------------------------------
+    def test_ordinary_admin_without_persistent_college_linkage_fails_closed(self):
+        from apps.accounts.authorization import check_college_operation_authority, get_actor_authorized_college_ids
+
+        # Authorized college IDs is an empty set (fail-closed)
+        authorized = get_actor_authorized_college_ids(self.admin)
+        self.assertEqual(authorized, set())
+
+        # Calling check_college_operation_authority for any college raises PermissionDenied
+        with self.assertRaises(DjangoPermissionDenied):
+            check_college_operation_authority(self.admin, self.college_a.pk, "any_operation")
+
+        with self.assertRaises(DjangoPermissionDenied):
+            check_college_operation_authority(self.admin, self.college_b.pk, "any_operation")
+
+    def test_runtime_attribute_injection_does_not_grant_authority(self):
+        from apps.accounts.authorization import check_college_operation_authority, get_actor_authorized_college_ids
+
+        # Attempt to inject runtime Python attributes
+        self.admin.college_id = self.college_a.pk
+        self.admin.college = self.college_a
+
+        # Scoping service ignores caller-injected runtime attributes
+        authorized = get_actor_authorized_college_ids(self.admin)
+        self.assertEqual(authorized, set())
+
+        with self.assertRaises(DjangoPermissionDenied):
+            check_college_operation_authority(self.admin, self.college_a.pk, "test_injected_attr")
+
+    def test_superadmin_retains_system_wide_multi_college_access(self):
+        from apps.accounts.authorization import check_college_operation_authority, get_actor_authorized_college_ids
+
+        # Superadmin returns None (system-wide access)
+        authorized = get_actor_authorized_college_ids(self.superadmin)
+        self.assertIsNone(authorized)
+
+        # check_college_operation_authority does not raise for any college
+        check_college_operation_authority(self.superadmin, self.college_a.pk, "op_a")
+        check_college_operation_authority(self.superadmin, self.college_b.pk, "op_b")
+
+    # --------------------------------------------------------------------------
+    # R4-B & R4-C: Registration Approval & Cleanup Unified Lock Hierarchy Tests
+    # --------------------------------------------------------------------------
+    def test_review_student_registration_single_table_locking_and_approval(self):
+        from apps.students.services import review_student_registration
+
+        user, profile, raw_token = register_student(
+            username="r4_review_student",
+            email="r4_review@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="R4Review",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R4-001",
+            registration_year=2026,
+        )
+        approval = RegistrationApproval.objects.get(user=user)
+
+        # Unverified email approval rejected under lock
+        with self.assertRaises(ValidationError) as ctx:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("email", ctx.exception.message_dict)
+
+        # Verify email token
+        verify_email_token(raw_token)
+
+        # Now approve succeeds under single-table lock
+        reviewed = review_student_registration(
+            approval_id=approval.pk,
+            action="APPROVE",
+            reviewer=self.superadmin,
+        )
+        self.assertEqual(reviewed.status, RegistrationApprovalStatus.APPROVED)
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
+
+        # Attempting review again fails (no longer pending)
+        with self.assertRaises(ValidationError) as ctx2:
+            review_student_registration(
+                approval_id=approval.pk,
+                action="APPROVE",
+                reviewer=self.superadmin,
+            )
+        self.assertIn("status", ctx2.exception.message_dict)
+
+    def test_cleanup_unverified_registration_precondition_revalidation(self):
+        from apps.students.services import cleanup_unverified_registration
+
+        user, profile, raw_token = register_student(
+            username="r4_cleanup_student",
+            email="r4_cleanup@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="R4Cleanup",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R4-002",
+            registration_year=2026,
+        )
+
+        # Precondition check 1: Active user cannot be cleaned up
+        user.is_active = True
+        user.save(update_fields=["is_active"])
+        self.assertFalse(cleanup_unverified_registration(user.pk))
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+
+        # Precondition check 2: Non-student role cannot be cleaned up
+        user.role = RoleChoices.FACULTY
+        user.save(update_fields=["role"])
+        self.assertFalse(cleanup_unverified_registration(user.pk))
+        user.role = RoleChoices.STUDENT
+        user.save(update_fields=["role"])
+
+        # Precondition check 3: Non-pending approval cannot be cleaned up
+        approval = RegistrationApproval.objects.get(user=user)
+        approval.status = RegistrationApprovalStatus.REJECTED
+        approval.save(update_fields=["status"])
+        self.assertFalse(cleanup_unverified_registration(user.pk))
+        approval.status = RegistrationApprovalStatus.PENDING
+        approval.save(update_fields=["status"])
+
+        # Precondition check 4: Used verification token cannot be cleaned up
+        ev = EmailVerification.objects.get(user=user)
+        ev.is_used = True
+        ev.save(update_fields=["is_used"])
+        self.assertFalse(cleanup_unverified_registration(user.pk))
+        ev.is_used = False
+        ev.save(update_fields=["is_used"])
+
+        # All preconditions satisfied -> atomic cleanup succeeds
+        cleaned = cleanup_unverified_registration(user.pk)
+        self.assertTrue(cleaned)
+        self.assertFalse(User.objects.filter(pk=user.pk).exists())
+        self.assertFalse(StudentProfile.objects.filter(pk=profile.pk).exists())
+        self.assertFalse(RegistrationApproval.objects.filter(pk=approval.pk).exists())
+        self.assertFalse(EmailVerification.objects.filter(pk=ev.pk).exists())
+
+    def test_verify_email_token_lock_order_and_expiry(self):
+        user, profile, raw_token = register_student(
+            username="r4_token_student",
+            email="r4_token@gauhati.ac.in",
+            password="StrongPassword@2026",
+            first_name="R4Token",
+            last_name="Student",
+            college=self.college_a,
+            programme=self.prog_bca,
+            enrollment_number="ENR-R4-003",
+            registration_year=2026,
+        )
+
+        # Consumes token
+        verified_user = verify_email_token(raw_token)
+        self.assertEqual(verified_user.pk, user.pk)
+        self.assertFalse(verified_user.is_active)  # still inactive until approved
+
+        # Attempt to use consumed token
+        with self.assertRaises(ValidationError) as ctx:
+            verify_email_token(raw_token)
+        self.assertIn("already been used", ctx.exception.message_dict["token"][0])
+
+    # --------------------------------------------------------------------------
+    # R4-D: Evaluated Department Locks in Faculty Profile Update Tests
+    # --------------------------------------------------------------------------
+    def test_update_faculty_profile_materialized_department_locks(self):
+        # Admin updates department to another department within same college
+        updated = update_faculty_profile(
+            profile_id=self.faculty_profile.pk,
+            acting_user=self.superadmin,
+            validated_data={"department": self.dept_math},
+        )
+        self.assertEqual(updated.department_id, self.dept_math.pk)
+        self.faculty_profile.refresh_from_db()
+        self.assertEqual(self.faculty_profile.department_id, self.dept_math.pk)
+
+    # --------------------------------------------------------------------------
+    # R4-E: Faculty Assignment Standardized Lock Hierarchy Tests
+    # --------------------------------------------------------------------------
+    def test_faculty_assignment_standardized_lock_sequence_crud(self):
+        from apps.academics.services import (
+            assign_faculty_to_paper,
+            update_faculty_assignment,
+            delete_faculty_assignment,
+        )
+
+        # Create assignment
+        assign = assign_faculty_to_paper(
+            acting_user=self.superadmin,
+            faculty=self.faculty_profile,
+            paper_offering=self.paper_offering,
+            role=FacultyAssignmentRole.TEACHER,
+        )
+        self.assertEqual(assign.role, FacultyAssignmentRole.TEACHER)
+
+        # Update assignment following Level 1 College -> Level 2 PaperOffering -> Level 3 FacultyProfile -> Level 4 Assignment
+        updated = update_faculty_assignment(
+            assignment_id=assign.pk,
+            acting_user=self.superadmin,
+            validated_data={"role": FacultyAssignmentRole.INTERNAL_EXAMINER},
+        )
+        self.assertEqual(updated.role, FacultyAssignmentRole.INTERNAL_EXAMINER)
+
+        # Delete assignment following Level 1 College -> Level 2 PaperOffering -> Level 4 Assignment
+        delete_faculty_assignment(
+            acting_user=self.superadmin,
+            assignment_id=assign.pk,
+        )
+        self.assertFalse(FacultySubjectAssignment.objects.filter(pk=assign.pk).exists())

@@ -22,8 +22,14 @@ def get_actor_authorized_college_ids(actor) -> Optional[Set[int]]:
     Resolves the set of college IDs the actor is authorized to manage.
     Returns:
     - None: System-wide authority (Superadministrator / is_superuser) - all colleges permitted.
-    - Set[int]: Explicit authorized college IDs for institutional administrator.
+    - Set[int]: Explicit authorized college IDs for institutional administrator with persistent DB linkage.
     - Set(): No authorized college scope (ambiguous, student, faculty, or inactive) - fail closed.
+
+    Security Policy Status:
+    SECURITY BOUNDARY ENFORCED — OPERATIONAL AUTHORIZATION POLICY PENDING OWNER DECISION.
+    Under the approved 52-table schema, accounts_user has no college_id column.
+    Arbitrary caller-injected runtime Python attributes (e.g. actor.college_id or actor.college)
+    are strictly rejected and not trusted as proof of institutional authority.
     """
     if not actor or not getattr(actor, 'is_authenticated', False) or not getattr(actor, 'is_active', False):
         return set()
@@ -36,27 +42,13 @@ def get_actor_authorized_college_ids(actor) -> Optional[Set[int]]:
     if actor.role == RoleChoices.SUPERADMIN or getattr(actor, 'is_superuser', False):
         return None
 
-    # Ordinary Administrators
-    is_admin = (
-        actor.role == RoleChoices.ADMIN
-        or (hasattr(actor, 'has_role') and actor.has_role('COLLEGE_SUPERADMIN', 'EXAM_OFFICER'))
-    )
-    if is_admin:
-        # Check established college linkage
-        # 1. Direct runtime attribute or property (e.g. set via session/context or user.college / user.college_id)
-        if hasattr(actor, 'college_id') and actor.college_id:
-            return {int(actor.college_id)}
-        if hasattr(actor, 'college') and actor.college:
-            cid = actor.college.pk if hasattr(actor.college, 'pk') else int(actor.college)
-            return {cid}
-        # 2. Linked FacultyProfile (if user also has faculty profile)
-        if hasattr(actor, 'faculty_profile') and actor.faculty_profile and getattr(actor.faculty_profile, 'college_id', None):
-            return {int(actor.faculty_profile.college_id)}
-
-        # Ambiguous institutional scope: in the approved schema, accounts_user has no college_id column.
-        # Fail closed for ordinary administrators without established college scope.
-        return set()
-
+    # Ordinary Administrators:
+    # Under the approved 52-table schema (docs/database-architecture.md), accounts_user and
+    # accounts_user_role contain no college_id column. Reliance on arbitrary runtime Python
+    # attributes (actor.college_id / actor.college) is strictly prohibited.
+    # Without an approved persistent database relationship, institutional scope is ambiguous.
+    # Therefore, ordinary administrators FAIL CLOSED for all college-scoped operations
+    # until the project owner formally decides on an operational authorization policy.
     return set()
 
 
