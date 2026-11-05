@@ -1,11 +1,12 @@
-# Database Architecture Specification (Chunk 02 Revision — 52-Table Committed Baseline & Proposed 53-Table Expansion)
+# Database Architecture Specification (Chunk 02 Approved Baseline — 52 Relational Tables)
 
 **Project:** College Online Examination System  
+**Deploying Institution:** Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga, Goalpara, Assam
 **Academic Context:** Gauhati University FYUGP / NEP 2020 Context (College Level)  
 **Database Engine:** MySQL 8.0+ (InnoDB Storage Engine)  
 **ORM Target:** Django 5.x / Django REST Framework  
 **Character Set & Collation:** `utf8mb4` / `utf8mb4_0900_ai_ci`  
-**Status:** Committed Baseline: 52 Tables (Approved Chunk 02); Proposed Expansion: 53 Tables (Option B Proposed Architecture Pending Formal Confirmation; Implementation Gated)
+**Status:** Approved Baseline: 52 Relational Tables (Chunk 02 Approved); Single-College Deployment (PDUAM Amjonga); Proposed Table 53 is SUPERSEDED — NOT REQUIRED FOR SINGLE-COLLEGE DEPLOYMENT
 
 ---
 
@@ -19,7 +20,7 @@ The database layer functions as the authoritative single source of truth for all
 2. **Character Set & Collation:** `utf8mb4` character set with `utf8mb4_0900_ai_ci` collation across all tables to support international unicode characters, student names with regional diacritics, and rich question text.
 3. **Primary Keys (Django `BigAutoField` Compatibility):**
    - Every relational table utilizes a **signed 64-bit integer surrogate primary key** (`id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY`), matching Django's standard `BigAutoField` on MySQL.
-   - Using standard signed `BIGINT` provides a keyspace of $9.22 	imes 10^{18}$ positive values, which is practically inexhaustible while eliminating custom ORM field hacks, schema divergence, and migration incompatibilities.
+   - Using standard signed `BIGINT` provides a keyspace of $9.22 \times 10^{18}$ positive values, which is practically inexhaustible while eliminating custom ORM field hacks, schema divergence, and migration incompatibilities.
    - All corresponding foreign keys explicitly use matching signed `BIGINT NOT NULL` (or `BIGINT NULL` for nullable relations).
 4. **Naming Conventions:**
    - Table names follow Django app-prefixed lowercase snake_case convention: `<app>_<model>` (e.g., `accounts_user`, `examinations_examination`, `attempts_exam_attempt`, `evaluations_grading_outbox`).
@@ -39,13 +40,13 @@ The database layer functions as the authoritative single source of truth for all
 
 ## 2. Comprehensive Domain Data Dictionary
 
-The committed schema baseline is partitioned into nine cohesive domain modules comprising **52 relational tables**, with a proposed expansion to **53 relational tables** under the Option B Administrator-to-College Membership Architecture proposal (adding proposed Table 53 to Domain A).
+The authoritative schema baseline is partitioned into nine cohesive domain modules comprising **52 relational tables**, serving exclusively the single-college deployment for **Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga, Goalpara, Assam**. The previously proposed Option B 53-table expansion (adding proposed Table 53 to Domain A) is **SUPERSEDED — NOT REQUIRED FOR SINGLE-COLLEGE DEPLOYMENT**.
 
 ```
 +---------------------------------------------------------------------------------------------------+
 |                                  COLLEGE ONLINE EXAMINATION SYSTEM                                |
 +---------------------------------------------------------------------------------------------------+
-| Domain A: Identity & Access Control         | accounts_*, students_*, faculty_*       (8 committed; 9 proposed)  |
+| Domain A: Identity & Access Control         | accounts_*, students_*, faculty_*       (8 Tables)  |
 | Domain B: Academic Structure & FYUGP        | academics_*, enrollments_*              (13 Tables) |
 | Domain C: Examination Setup & Eligibility   | examinations_*, eligibility_*, admit_* (10 Tables) |
 | Domain D: Questions & Assessment            | questions_*                             (5 Tables)  |
@@ -55,7 +56,7 @@ The committed schema baseline is partitioned into nine cohesive domain modules c
 | Domain H: Evaluation & Results Publishing   | evaluations_*, results_*                (7 Tables)  |
 | Domain I: System Audit & Task Operations    | audit_*, operations_*                   (2 Tables)  |
 +---------------------------------------------------------------------------------------------------+
-| Total Normalized Relational Entities: 52 Tables Committed (Chunk 02); 53 Tables Proposed (Option B)|
+| Total Normalized Relational Entities: 52 Relational Tables (Chunk 02 Approved Baseline)           |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -206,9 +207,10 @@ The committed schema baseline is partitioned into nine cohesive domain modules c
   - `INDEX idx_auth_event_lookup (user_id, event_type, created_at)`
   - `INDEX idx_auth_ip_event (ip_address, event_type, created_at)`
 
-#### Table 53 (Proposed): `accounts_administrative_membership`
-* **Purpose:** Proposed dedicated institutional administrative assignment mapping table (Domain A, Option B architecture proposal). Maps an `accounts_user` with primary role `ADMIN` to an `academics_college` with a mandatory granular institutional role (`role_id` referencing `accounts_role.id`) and comprehensive lifecycle and audit metadata. Not implemented in models or migrations (implementation strictly gated).
-* **PK:** `id` (BIGINT, AUTO_INCREMENT)
+#### Table 53 (Proposed — SUPERSEDED): `accounts_administrative_membership`
+* **Status:** **SUPERSEDED — NOT REQUIRED FOR SINGLE-COLLEGE DEPLOYMENT**.
+* **Historical Context & Supersession Rationale:** Originally proposed under Option B to map administrators across multiple autonomous institutions. Following the project owner's confirmed requirement that the system serves exclusively one institution (**Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya, Amjonga, Goalpara, Assam** per `design.md:31-33, 101` and `handover.txt:62, 87`), multi-college administrative tenancy is retired. Table 53 was never implemented in Django models or database migrations and is permanently eliminated from the active design. The schema baseline remains strictly at 52 relational tables.
+* **PK:** `id` (BIGINT, AUTO_INCREMENT) [Not Implemented — Preserved for Audit Provenance]
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
@@ -231,25 +233,24 @@ The committed schema baseline is partitioned into nine cohesive domain modules c
   - `INDEX idx_admin_mem_lookup (user_id, is_active, college_id, role_id)`: Covering index for high-throughput institutional authorization checks.
   - `INDEX idx_admin_mem_college_status (college_id, status)`: Scoped institutional directory filtering.
   - `INDEX idx_admin_mem_role (role_id)`: Role dependency lookup.
-* **Design & Governance Rules:**
-  1. Only users with primary role `ADMIN` in `accounts_user` may hold administrative memberships.
-  2. Multi-tenancy: M:N cardinality permits an administrator to hold separate active memberships across multiple colleges with independent roles.
-  3. Single mutable current-state record per user-college pair; historical events are durably persisted to Table 51 (`audit_system_audit_log`) within the same atomic transaction under proposed Policy A (RECOMMENDED — OWNER SELECTION PENDING). Relational audit logging provides database-tier auditability, not standalone cryptographic non-repudiation.
-  4. Concurrency safety: Administrative mutations are designed to acquire Level 1 College Coordination Lock (`lock_colleges`), followed by User row locks in ascending primary-key order, before revalidating membership state under lock. Concurrency guarantees are conditional on full service implementation and live MySQL integration testing.
-  5. Governance Status: Proposed schema expansion. Both Table 51 and Table 53 remain explicitly unimplemented in application models and database migrations; the committed schema baseline remains 52 tables. Current academic CRUD endpoints do not yet enforce college-scoped write checks (Codex Finding F01 remains P1 HIGH — CONFIRMED — UNRESOLVED).
+* **Superseded Governance Rules:**
+  1. Historical Option B multi-tenancy rules are superseded. All administrators govern PDUAM Amjonga directly under single-college RBAC.
+  2. Table 53 is not implemented in Django models or database migrations; the active schema baseline remains strictly 52 tables.
 
 ---
 ### DOMAIN B: Academic Structure & FYUGP
 
 #### Table 9: `academics_college`
-* **Purpose:** Top-level college institution entity.
+* **Purpose:** Authoritative institutional entity for **Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga, Goalpara, Assam** (Table 9, Domain B). Retained as the singleton institutional configuration record for the deploying college. All academic structures (`AcademicSession`, `Programme`, `Department`, `SubjectCategory`, `InstitutionalConfig`) and user profiles (`StudentProfile`, `FacultyProfile`) maintain foreign-key referential integrity to this record.
+* **Institutional Identification & PK Governance:** Identification of the sole authorized institution is resolved via trusted server-side configuration (e.g. `INSTITUTION_CODE = 'PDUAM-AMJONGA'`) or controlled database initialization, never through hardcoded primary-key assumptions (assuming `College.pk == 1` is strictly prohibited). The application fails closed if the configured record is missing or if multiple active records exist.
+* **Institutional Immutability & Migration Impact:** Creation of additional college records via API is blocked; deletion is prohibited. Retaining Table 9 and its foreign keys preserves 100% of the existing database architecture, Django models, and migrations across all apps. Zero-migration impact is conditional upon retaining Table 9 and its existing schema without structural alterations.
 * **PK:** `id` (BIGINT, AUTO_INCREMENT)
 * **Fields:**
   | Column Name | SQL Type | Nullable | Default | Constraints & Description |
   | :--- | :--- | :---: | :---: | :--- |
   | `id` | BIGINT | No | AUTO | Primary Key |
   | `name` | VARCHAR(255) | No | None | Full college title |
-  | `code` | VARCHAR(20) | No | None | College institutional code e.g. `MC-GU` (`UNIQUE`) |
+  | `code` | VARCHAR(20) | No | None | College institutional code e.g. `PDUAM-AMJONGA` (`UNIQUE`) |
   | `address` | TEXT | Yes | NULL | Postal address |
   | `contact_email` | VARCHAR(254) | No | None | Official administration email |
   | `contact_phone` | VARCHAR(20) | Yes | NULL | Official phone |
@@ -1985,9 +1986,8 @@ erDiagram
 
 ```mermaid
 erDiagram
-    ACCOUNTS_USER ||--o{ ACCOUNTS_ADMINISTRATIVE_MEMBERSHIP : "holds (proposed)"
-    ACADEMICS_COLLEGE ||--o{ ACCOUNTS_ADMINISTRATIVE_MEMBERSHIP : "administers (proposed)"
-    ACCOUNTS_ROLE ||--o{ ACCOUNTS_ADMINISTRATIVE_MEMBERSHIP : "authorizes (proposed)"
+    ACCOUNTS_USER ||--o{ ACCOUNTS_USER_ROLE : "assigned"
+    ACCOUNTS_ROLE ||--o{ ACCOUNTS_USER_ROLE : "authorizes"
 
     ACCOUNTS_USER ||--o| STUDENTS_STUDENT_PROFILE : "profile"
     STUDENTS_STUDENT_PROFILE ||--o{ ENROLLMENTS_STUDENT_SUBJECT_ENROLLMENT : "enrolls"

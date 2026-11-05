@@ -1,15 +1,32 @@
 # Architectural Decision Proposal: Administrator-to-College Membership Architecture
 ## Final Service-Layer Implementation Reconciliation — Security, Trust Boundaries and Concurrency
 
-**Project:** College Online Examination System  
-**Academic Context:** Gauhati University FYUGP Context (College Level)  
-**Target Domain:** Domain A: Identity, Authentication & Role-Based Access Control  
-**Document ID:** `PROP-CHUNK-06-ADMIN-MEMBERSHIP-FINAL-RECONCILED-R2`  
-**Status:** **ARCHITECTURE PROPOSAL — RECONCILED UNDER GATE A (IMPLEMENTATION STRICTLY GATED)**
+**Project:** College Online Examination System
+**Deploying Institution:** Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga, Goalpara, Assam
+**Academic Context:** Gauhati University FYUGP Context (College Level)
+**Target Domain:** Domain A: Identity, Authentication & Role-Based Access Control
+**Document ID:** `PROP-CHUNK-06-ADMIN-MEMBERSHIP-FINAL-RECONCILED-R2`
+**Status:** **SUPERSEDED — NOT REQUIRED FOR SINGLE-COLLEGE DEPLOYMENT (PDUAM AMJONGA)**
 **Author:** Antigravity Engineering Team
-**Date:** 2026-11-05 (Gate A Documentation Reconciliation)
-**Last Independently Audited Commit:** `97e745b94ea1075ed91a091353addb4869eaf14a`  
-**Impacted Stages:** Chunk 06 (Student & Faculty Management) / Chunk 05 (FYUGP Academic Architecture) / Chunk 04 (RBAC)  
+**Date:** 2026-11-05 (Single-College Scope Realignment)
+**Last Independently Audited Commit:** `0f9b524ce2ed4afa18595ef81bfc8cdfb87fead7`
+**Impacted Stages:** Chunk 06 (Student & Faculty Management) / Chunk 05 (FYUGP Academic Architecture) / Chunk 04 (RBAC)
+
+---
+
+> [!IMPORTANT]
+> **GOVERNANCE NOTICE: OPTION B SUPERSEDED BY SINGLE-COLLEGE REALIGNMENT**
+> Following formal project-owner clarification, the College Online Examination System is confirmed to serve exclusively one deploying institution: **Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga, Goalpara, Assam** (https://pduamamjonga.ac.in/).
+>
+> This requirement directly restores the original scope boundaries established in [`design.md`](../../design.md#L31-L33) (*"The system is for a college-level deployment. Do not assume it is an official Gauhati University platform or that it has direct integration with Gauhati University systems"*), [`design.md`](../../design.md#L101) (*"Multi-college SaaS tenancy: Out of scope unless separately approved"*), and [`handover.txt`](../../handover.txt#L62) (*"This is a college-level system, not a multi-college SaaS platform"*).
+>
+> Consequently:
+> 1. Proposed Option B (Dedicated Administrative Membership Mapping Table `accounts_administrative_membership` / Table 53) is **SUPERSEDED — NOT REQUIRED FOR SINGLE-COLLEGE DEPLOYMENT**.
+> 2. The 52-table database schema baseline approved in Chunk 02 is permanently affirmed; proposed Table 53 is eliminated.
+> 3. Table 9 ([`academics_college`](../database-architecture.md#table-9-academics_college)) is retained as the authoritative singleton institutional configuration record for PDUAM Amjonga (identified via server-side configuration, never hardcoding `College.pk == 1`).
+> 4. The 25-operation multi-institutional registry and Strategy C multi-college outer coordination locking are superseded by single-college RBAC and entity row locking.
+> 5. The proposed 19-service Chunk 05 retrofit for multi-college tenancy is retired; single-college boundary and academic write authorization are retained under Gate B (Finding F01).
+> 6. This document is retained intact for governance provenance, design history, and audit trail, but its proposals are superseded for implementation.
 
 ---
 
@@ -33,7 +50,8 @@ During the Chunk 06 technical audits, ephemeral caller-injected Python attribute
 | **Final Addendum (`PROP-...-FINAL-ADDENDUM`)** | CONDITIONAL PASS | Delivered 2D read/write RBAC, service locking matrix, audit retention policy analysis; identified 4 targeted refinement findings (P4-A through P4-D). |
 | **Round 4 Revision (`PROP-...-FINAL`)** | CONDITIONAL PASS | Addressed P4-A through P4-D. Audited commit `74862dd18724524915be8c997cfb9374c33b9eff`. Identified 3 reconciliation gaps (P5-A, P5-B, P5-C). |
 | **Round 5 Reconciliation (`PROP-...-FINAL-RECONCILED`)** | REVISION REQUIRED | Addressed P5-A through P5-C. Audited commit `c3a24c0a488390e3f40259a1ddcc78d0ac1dbf89`. Identified 4 implementation and trust-boundary findings (P6-A, P6-B, P6-C, P6-D). |
-| **Round 6 Service-Layer Reconciliation (Current)** | **PENDING REVIEW** | Resolves Findings P6-A, P6-B, P6-C, and P6-D. Rigorous 5-category service implementation taxonomy (Categories A–E); mandatory transaction-level revocation serialization protocol; Chunk 05 service-layer trust-boundary analysis (Option 1 Retrofit vs Option 2 API Contract); source-verified PaperOffering read visibility baseline; and unified `academic.config.read` operation identifier consistency. Audited commit `97e745b94ea1075ed91a091353addb4869eaf14a`. |
+| **Round 6 Service-Layer Reconciliation** | CONDITIONAL PASS | Resolves Findings P6-A, P6-B, P6-C, and P6-D. Rigorous 5-category service implementation taxonomy (Categories A–E); mandatory transaction-level revocation serialization protocol; Chunk 05 service-layer trust-boundary analysis (Option 1 Retrofit vs Option 2 API Contract); source-verified PaperOffering read visibility baseline; and unified `academic.config.read` operation identifier consistency. Audited commit `97e745b94ea1075ed91a091353addb4869eaf14a`. |
+| **Single-College Scope Realignment (Current)** | **SUPERSEDED** | Authoritative single-college requirement for PDUAM Amjonga confirmed by project owner (restoring design.md:31-33, 101 and handover.txt:62, 87). Multi-college Option B, Table 53, 25-operation registry, Strategy C multi-college locking, and 19-service tenant retrofit superseded. 52-table baseline affirmed. |
 
 ### 1.3 Resolution Summary of Targeted Findings (P4-A through P4-D)
 
@@ -1217,7 +1235,9 @@ In accordance with Section 7 of the governance instructions, the following ten c
 
 ## 17. Reconciled Architectural Decision & Approval Register
 
-The following 12 architectural decisions have been reconciled following dual audits (Antigravity and OpenAI Codex) and reflect the recommended Option B baseline submitted for formal project-owner authorization:
+*(Historical Note: The 12 decisions below record the previously submitted Option B proposal. Following confirmed single-college scope for PDUAM Amjonga, items 1, 2, 3, 4, 5, 7, and 8 are formally **SUPERSEDED**. The database schema baseline remains strictly at 52 tables, Table 53 is eliminated, Table 9 is retained as the singleton institutional configuration entity, and single-college institutional boundary security is designed under Gate B).*
+
+The following architectural decision register is preserved for audit provenance:
 
 - [ ] **1. Architecture Selection (Recommended: Option B):** Option B (Dedicated Administrative Membership Mapping Table) with Two-Dimensional Institutional Authorization. (Reconciled in documentation under Gate A; awaiting formal owner sign-off).
 - [ ] **2. Schema Baseline Expansion (Proposed: 52 to 53 Tables):** Relational database architecture proposed to expand from 52 to 53 tables by adding Table 53 (`accounts_administrative_membership`) in Domain A. (Committed baseline remains 52 tables; expansion gated).

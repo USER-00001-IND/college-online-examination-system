@@ -234,7 +234,7 @@ flowchart TD
     faculty --> accounts
     students --> academics
     faculty --> academics
-    accounts -.->|administrative membership (Proposed Table 53)| academics
+    accounts -->|institutional roles (Table 9 College)| academics
 
     enrollments --> students
     enrollments --> academics
@@ -353,80 +353,97 @@ sequenceDiagram
     end
 ```
 
-### 6.4 Institutional Administrator Membership & Multi-Tenancy Architecture (Option B — Proposed Architecture)
+### 6.4 Single-College Institutional Architecture & Security Boundary (PDUAM Amjonga)
 
-*Architecture Proposal: Option B (Dedicated Administrative Membership Mapping Table). Reconciled under Gate A for Project-Owner Review; Implementation Strictly Gated.*
+*Institutional Context: Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga, Goalpara, Assam.*
+*Scope Policy: Single-College Deployment (Authoritative Requirement). Option B Multi-College Architecture & Proposed Table 53 are SUPERSEDED.*
 
-To enforce multi-institutional isolation without coupling administrator identity to single colleges, the system proposes **Option B: Dedicated Administrative Membership Mapping Table** ([`Table 53 (Proposed): accounts_administrative_membership`](database-architecture.md#table-53-proposed-accounts_administrative_membership)) to expand the committed 52-table schema to 53 tables.
+The College Online Examination System serves exclusively one institution: **Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga, Goalpara, Assam** (official portal: [https://pduamamjonga.ac.in/](https://pduamamjonga.ac.in/)), affiliated with Gauhati University under the FYUGP curriculum.
+
+#### 6.4.1 Supersession of Multi-College Architecture (Option B)
+The previously proposed Option B (Dedicated Administrative Membership Mapping Table `accounts_administrative_membership` / Table 53), the 25-operation multi-institutional registry, and Strategy C multi-college outer coordination locking were formulated under the assumption of multi-college SaaS tenancy.
+
+Following the project owner's confirmed requirement that the system is strictly a **single-college online examination system**, Option B is formally **SUPERSEDED — NOT REQUIRED FOR SINGLE-COLLEGE DEPLOYMENT**:
+1. **Alignment with Master Design:** Restores full alignment with [`design.md`](../design.md#L31-L33) (*"The system is for a college-level deployment. Do not assume it is an official Gauhati University platform or that it has direct integration with Gauhati University systems"*), [`design.md`](../design.md#L101) (*"Multi-college SaaS tenancy: Out of scope unless separately approved"*), and [`handover.txt`](../handover.txt#L62) (*"This is a college-level system, not a multi-college SaaS platform"*).
+2. **Elimination of Proposed Table 53:** Proposed Table 53 is not implemented in Django models or migrations and is permanently eliminated from the architecture. The database schema baseline remains strictly at the approved **52 relational tables**.
+3. **Preservation of Provenance:** Historical Option B proposals in [`docs/proposals/chunk-06-administrator-membership-decision.md`](proposals/chunk-06-administrator-membership-decision.md) are preserved for architectural history and audit provenance, but are marked as superseded.
 
 ```mermaid
 erDiagram
-    accounts_user ||--o{ accounts_administrative_membership : "holds"
-    academics_college ||--o{ accounts_administrative_membership : "governs"
-    accounts_role ||--o{ accounts_administrative_membership : "authorizes"
+    ACCOUNTS_USER ||--o{ ACCOUNTS_USER_ROLE : "assigned"
+    ACCOUNTS_ROLE ||--o{ ACCOUNTS_USER_ROLE : "authorizes"
+    ACADEMICS_COLLEGE ||--o{ ACADEMICS_PROGRAMME : "offers"
+    ACADEMICS_COLLEGE ||--o{ ACADEMICS_DEPARTMENT : "organizes"
+    ACADEMICS_COLLEGE ||--o{ STUDENTS_STUDENT_PROFILE : "enrolls"
+    ACADEMICS_COLLEGE ||--o{ FACULTY_FACULTY_PROFILE : "employs"
 ```
 
-#### 6.4.1 Cardinality & Mandatory Institutional Roles
-1. **Multi-Tenancy Cardinality (M:N):** Administrators with primary role `ADMIN` in `accounts_user` may hold distinct administrative appointments across multiple colleges (e.g. cluster coordinators or nodal principals).
-2. **Mandatory Institutional Role:** Each membership record requires an explicit `role_id BIGINT NOT NULL` referencing [`accounts_role(id)`](../backend/apps/accounts/models.py#L110-L130) (`COLLEGE_SUPERADMIN`, `EXAM_OFFICER`, `HEAD_EXAMINER`).
-3. **Single Mutable Current-State Record:** A unique constraint on `(user_id, college_id)` enforces a single current-state record with status choices `ACTIVE`, `SUSPENDED`, or `REVOKED`. Historical assignment tenure and revocation reasons are retained on the row and permanently logged to Table 51 (`audit_system_audit_log`) under proposed Policy A.
+#### 6.4.2 Institutional Identity & Confinement Boundary
+The application enforces strict single-college institutional boundary security:
+1. **Authoritative Institutional Entity:** Table 9 ([`academics_college`](database-architecture.md#table-9-academics_college)) in Domain B is retained as the authoritative institutional configuration entity. In deployment, it holds the verified profile of PDUAM Amjonga (name, AISHE/GU code, contact details, official website, and institutional crest).
+2. **Trusted Server-Side Identification:** The application identifies its sole deploying institution via trusted server-side configuration (`INSTITUTION_CODE = 'PDUAM-AMJONGA'` in backend settings or a verified database configuration resolver).
+   - On application startup and institutional operations, the system resolves the configured `College` instance by code.
+   - **Fail-Closed Behavior:** If the configured institution record is missing, inactive, or if multiple active college records exist, the system fails closed (raises `ImproperlyConfigured` or `PermissionDenied`) to prevent ambiguous operational state.
+   - **No Hardcoded PK Assumption:** No code, view, serializer, or service may assume `College.pk == 1`. The primary key must be resolved dynamically through the trusted configuration identifier.
+3. **Institutional Immutability & Confinement:**
+   - **Creation Prohibited:** Creation of additional `College` records via public or administrative API (`CollegeViewSet.create`) is disabled.
+   - **Deletion & Reassignment Prohibited:** Deletion of the college record (`CollegeViewSet.destroy`) is strictly prohibited. Modifying the institution code or core identity is restricted to Superadmin maintenance workflows.
+   - **Foreign-Key Confinement:** All academic entities (`Programme`, `Department`, `AcademicSession`, `SubjectCategory`, `InstitutionalConfig`) and user profile entities (`StudentProfile`, `FacultyProfile`) must strictly link to the configured PDUAM Amjonga institution. API payloads or services attempting to link records to foreign or non-configured institutions are rejected at validation boundaries.
 
-#### 6.4.2 Two-Dimensional RBAC & Operation Registry
-Authorization is evaluated across two orthogonal dimensions: Institutional Scope (`college_id`) and Operational Capability (`operation`).
+#### 6.4.3 Role-Based Access Control (Single-College RBAC)
+The proposed 25-operation multi-institutional string registry is superseded by a four-tier institutional RBAC model reflecting the organizational reality of PDUAM Amjonga:
 
 ```
-+----------------------------------------------------------------------------------------------------+
-| DOMAIN                             | OPERATIONAL CAPABILITY IDENTIFIER                             |
 +------------------------------------+---------------------------------------------------------------+
-| Student Management                 | student.registration.view, student.registration.review        |
-|                                    | student.profile.view, student.profile.manage                  |
-| Faculty Management                 | faculty.profile.view, faculty.account.provision               |
-|                                    | faculty.profile.manage                                        |
-| Academic Structure                 | academic.programme.view, academic.programme.manage            |
-|                                    | academic.department.view, academic.department.manage          |
-|                                    | academic.subject.view, academic.subject.manage                |
-|                                    | academic.session.view, academic.session.manage                |
-| Offerings & Assignments            | academic.offering.view, academic.offering.manage              |
-|                                    | academic.faculty_assignment.view                              |
-|                                    | academic.faculty_assignment.manage                            |
-| Enrollment Records                 | enrollment.record.view, enrollment.record.manage              |
-| Institutional Configuration        | academic.config.read, academic.config.manage                  |
-| Administrative Membership          | admin.membership.view, admin.membership.manage                |
-+----------------------------------------------------------------------------------------------------+
+| INSTITUTIONAL ROLE                 | GOVERNANCE & OPERATIONAL SCOPE                                |
++------------------------------------+---------------------------------------------------------------+
+| SUPERADMIN                         | System governance, IT management, sensitive configuration     |
+| (Principal / IT Admin)             | (grading formulas, evidence retention, PIN delivery gate),    |
+|                                    | administrator role assignment, full security & task audit.     |
++------------------------------------+---------------------------------------------------------------+
+| COLLEGE_SUPERADMIN / ADMIN         | Academic structure management (sessions, programmes,          |
+| (Exam Branch / Academic In-Charge) | departments, offerings), student registration review,         |
+|                                    | examination scheduling, roll number generation, admit cards.  |
++------------------------------------+---------------------------------------------------------------+
+| FACULTY / EXAMINER                 | Read-only catalogue browsing; descriptive answer evaluation   |
+| (College Teachers)                 | strictly bounded to assigned paper offerings; marks entry.    |
++------------------------------------+---------------------------------------------------------------+
+| STUDENT                            | Self-registration, profile view, exam PIN entry, exam         |
+| (Enrolled Candidates)              | taking, autosave, submission, admit card and results download.|
++------------------------------------+---------------------------------------------------------------+
 ```
 
-* **Unbypassable Evaluation Pipeline:** The centralized authorization service (`authorize_institutional_operation`) is designed to verify: (1) operation code type; (2) membership in the approved 25-operation registry; (3) actor authentication; (4) actor active status; (5) rejection of student/faculty accounts; (6) college existence and active status; (7) Superadmin scope for valid operations; (8) active membership matching `(actor, college_id)`; (9) assigned role resolution; (10) role permission check.
-* **Fail-Closed Principle:** Unregistered or unknown operation codes raise `PermissionDenied` (HTTP 403) across all roles, including Superadmin.
-* **Superadmin Scope:** `SUPERADMIN` accounts possess system-wide operational authority across all colleges for registered operations, but never bypass authentication, active account checks, or relational integrity constraints.
-* **Operational Capability Restriction (Proposed Option B Policy):** Under the proposed Option B least-privilege policy, write capability for paper offerings (`academic.offering.manage`) is recommended to be restricted strictly to `SUPERADMIN` and `COLLEGE_SUPERADMIN`, while denying it to `EXAM_OFFICER` pending separate review of narrower coordination permissions. This operation-level restriction is part of the proposed Option B architecture and is not yet approved or enforced in application code; current academic CRUD services do not enforce operation-level checks, and institutional write authorization remains incomplete per Codex Finding F01.
+1. **Permission Classes:** Enforced at API boundaries via DRF permissions:
+   - [`IsAdminUserRole`](../backend/apps/accounts/permissions.py#L14-L41): Grants administrative access; strictly rejects student and faculty accounts.
+   - [`IsCollegeSuperAdmin`](../backend/apps/accounts/permissions.py#L76-L95): Grants governance authority over sensitive institutional configurations.
+   - [`IsFacultyUserRole`](../backend/apps/accounts/permissions.py#L44-L63): Grants faculty-specific access; rejects student accounts.
+   - [`IsStudentUserRole`](../backend/apps/accounts/permissions.py#L66-L73): Grants access exclusively to authenticated student accounts.
+   - [`IsAcademicAdminOrReadOnly`](../backend/apps/academics/permissions.py#L16-L35): Allows authenticated read access to academic catalogues while restricting writes to administrators.
+2. **Sensitive Configuration Boundary:** Mutations to Table 21 (`academics_institutional_config`) are governed by [`IsInstitutionalConfigPermission`](../backend/apps/academics/permissions.py#L38-L64) and service-layer checks (`check_institutional_superadmin_authority`). Sensitive keys (PIN delivery method, evidence key retention periods, grading scale definitions) require Superadmin authority.
+3. **Faculty Assignment Boundary:** Faculty write operations (entering marks, submitting evaluations) are strictly constrained to paper offerings where the faculty member is actively assigned in Table 18 (`academics_faculty_subject_assignment`). Faculty cannot modify academic hierarchy or approve student registrations.
+4. **Service-Layer Revalidation:** Mutation services revalidate active user status (`is_authenticated`, `is_active`) and role preconditions under transaction locks rather than relying solely on API gateway checks.
 
-#### 6.4.3 Strategy C Concurrency Architecture (Proposed Protocol)
-Under the proposed **Strategy C: Outer Coordination Protocol with Preserved Internal Academic Lock Families**, administrative mutations are designed to adhere to a two-tier locking hierarchy:
-1. **Level 1 (College Coordination Lock):** Acquired via `lock_colleges(*sorted_ids)` in deterministic ascending numeric primary-key order. Serializes mutations within the target college.
-2. **Level 2 (User Row Locks):** All participating `accounts_user` rows are locked in ascending primary-key order (`SELECT ... FOR UPDATE`).
-3. **Level 3 (Membership Row Locks):** Target `accounts_administrative_membership` rows are locked under the Level 1 coordination lock.
-4. **Level 4 (Internal Domain Lock Families):** Dependent domain records (e.g. `PaperOffering`, `FacultyProfile`, `StudentProfile`) are locked following established domain hierarchy.
-5. **Level 5 (Atomic Audit Log):** Membership mutations and Table 51 audit records commit within the same atomic transaction.
+#### 6.4.4 Concurrency Architecture & Deadlock Management
+1. **Supersession of Strategy C Multi-College Protocol:** The Strategy C multi-college locking protocol (`lock_colleges(*sorted_ids)` across distinct colleges) is superseded because cross-college transactions never occur.
+2. **Single-College Deadlock Reality:** A single-college application on MySQL InnoDB remains subject to database deadlocks under concurrent workloads (e.g., concurrent student exam submissions on `ExamAttempt`, registration reviews, secondary index gap locks, lock conversion, and foreign key check locks). Deadlock freedom is not guaranteed by single-college scope.
+3. **Single-College Concurrency Hierarchy:**
+   - **Institutional Coordination Lock:** For broad academic reorganizations (e.g. creating sessions or restructuring programmes), `lock_colleges` locks the single PDUAM Amjonga `College` record (`SELECT ... FOR UPDATE`), serializing institutional structural mutations.
+   - **Domain Entity Locks:** Fine-grained mutations lock target domain rows in deterministic primary-key order.
+   - **Unified Registration Lock Hierarchy:** Level 1 College Coordination Lock $\rightarrow$ Level 2 Target User $\rightarrow$ Level 3 RegistrationApproval $\rightarrow$ Level 4 EmailVerification $\rightarrow$ Level 5 StudentProfile (deterministic order established in Chunk 06 Round 5).
+   - **Exam Attempt Serialization:** Live exam submissions lock the individual `ExamAttempt` row exclusively, eliminating distributed race conditions.
+   - **Mandatory Deadlock Retry Recovery:** Application-tier handling catches MySQL error 1213 (`ER_LOCK_DEADLOCK`) and error 1205 (`ER_LOCK_WAIT_TIMEOUT`) with randomized exponential backoff and transaction rollback.
 
-* **Revocation Race Serialization:** When a Superadmin revokes an administrator's membership concurrently with that administrator executing a mutation in the same college, the proposed protocol requires both transactions to compete for the Level 1 College Coordination Lock. If revocation commits first, the unblocked administrator's mutation revalidates membership status under lock, discovers `status == 'REVOKED'`, and fails closed with HTTP 403 Forbidden. Concurrency guarantees are conditional upon consistent implementation across all services and live MySQL verification. Deadlock freedom is not unconditionally guaranteed; deadlocks may occur under concurrent execution due to gap locks and index contention, requiring application-level retry handling.
-* **Connection Isolation Level:** Django's MySQL connection ordinarily operates under `READ COMMITTED` or the database server default. The effective live MySQL connection isolation level remains unverified. Concurrency guarantees and transaction isolation behavior are subject to live MySQL 8 integration and deadlock testing. Mandatory deadlock retry recovery (MySQL error 1213) is designed for write paths.
+#### 6.4.5 Academic Catalogue Read-Visibility Baseline
+1. **Catalogue Browsing:** Active authenticated students, faculty, and administrators have global read access to browse all PDUAM Amjonga course offerings (`PaperOfferingViewSet` enforcing `IsAcademicAdminOrReadOnly` with `queryset.all()`). This enables student course discovery, minor elective selection, and multidisciplinary planning under Gauhati University FYUGP. Read-only catalogue browsing visibility remains unchanged.
+2. **Write Security:** Write mutations (POST, PUT, PATCH, DELETE) on academic structures and offerings strictly require administrator authority. Unauthorized mutation attempts fail closed with HTTP 403 Forbidden.
 
-#### 6.4.4 Academic Catalogue Read-Visibility Baseline
-* **Catalogue Browsing Preservation:** Active authenticated students, faculty, and administrators have global read access to browse all paper offerings across colleges (`PaperOfferingViewSet` enforcing `IsAcademicAdminOrReadOnly` with `queryset.all()`). This enables university-wide course discovery, minor elective selection, and multidisciplinary planning under FYUGP. Read-only catalogue browsing visibility remains unchanged.
-* **Mutation Scoping & Security Boundary:**
-  - **Intended Institutional Requirement:** The intended institutional security architecture requires that write mutations (create, update, delete) on college-bound academic records, including paper offerings, be strictly restricted to administrators authorized for the record's host college.
-  - **Proposed Option B Policy:** Under the proposed Option B architecture, this requirement is modeled via the `academic.offering.manage` operational capability within the 25-operation registry, restricted to `SUPERADMIN` and `COLLEGE_SUPERADMIN`. This operational policy is proposed and pending formal owner approval; it is not yet approved or implemented.
-  - **Current Runtime Status (Codex Finding F01):** Implemented academic CRUD APIs (`BaseAcademicViewSet`, `PaperOfferingViewSet`) do not consistently enforce college-scoped write checks; ordinary administrators can mutate academic records across colleges via HTTP. Codex F01 remains **P1 HIGH — CONFIRMED — UNRESOLVED** in application code.
-  - **Gate B Remediation Pending:** Gate B implementation remediation has not been executed or authorized. Institutional write authorization remains an open security defect until Gate B is formally authorized and implemented.
+#### 6.4.6 Durable Administrative Audit Prerequisite (Policy A)
+Under Policy A (recommended audit prerequisite), Table 51 ([`audit_system_audit_log`](database-architecture.md#table-51-audit_system_audit_log), planned in Domain I / Chunk 14) serves as an append-only relational audit sink for sensitive administrative actions at PDUAM Amjonga (institutional configuration changes, user role assignments, exam activations, PIN issuance, and result publication). Audit records and state transitions commit atomically in the same database transaction.
 
-#### 6.4.5 Durable Administrative Audit Prerequisite (Policy A — RECOMMENDED — OWNER SELECTION PENDING)
-* Under proposed Policy A, Table 51 ([`audit_system_audit_log`](database-architecture.md#table-51-audit_system_audit_log), planned in Domain I / Chunk 14) is designed as a mandatory transactional audit sink for production administrative membership lifecycle mutations. Both Table 51 and Table 53 remain explicitly unimplemented in application models and database migrations.
-* Application-level membership state transitions and Table 51 audit records are designed to commit atomically in the same database transaction; failure to record the audit entry aborts the mutation. Relational audit logging provides database-tier auditability and tamper resistance against application-tier compromise; database-level DBA modifications remain bounded by database engine controls, and relational audit logging does not by itself constitute cryptographic non-repudiation.
-
-#### 6.4.6 Institutional Authorization Defect & Interim Security Boundary (Codex Finding F01)
-* **Status:** P1 HIGH — CONFIRMED — UNRESOLVED (Application code).
-* **Defect Description:** In Chunk 05, academic ViewSets (`BaseAcademicViewSet`, `ProgrammeViewSet`, `InstitutionalConfigViewSet`) enforce only global role checks (`IsAcademicAdminOrReadOnly`) without verifying college ownership. While `accounts.authorization.get_actor_authorized_college_ids` fails closed (`set()`) for ordinary administrators, the academic APIs do not consistently invoke or enforce it, allowing ordinary administrators to modify academic records across institutions via direct API calls.
-* **Governance & Remediation:** Institutional write security remains incomplete in the current codebase. Implementation code remains untouched under Gate A. A targeted, fail-closed write check must be authorized and implemented under Gate B prior to production deployment.
+#### 6.4.7 Institutional Authorization Defect & Scope Reassessment (Codex Finding F01)
+* **Status:** **OPEN — SINGLE-COLLEGE INSTITUTIONAL INTEGRITY AND ACADEMIC WRITE-AUTHORIZATION DEFECT** (Application code).
+* **Defect Description:** In Chunk 05, academic ViewSets (`BaseAcademicViewSet`, `ProgrammeViewSet`, `PaperOfferingViewSet`, `InstitutionalConfigViewSet`) enforce only broad role permissions (`IsAcademicAdminOrReadOnly`) without verifying single-college institutional boundary confinement. While the theoretical cross-college exploit scenario is eliminated by the single-college deployment scope, the underlying API endpoints still permit actorless service calls, lack institutional boundary validation, and allow unconstrained mutations if not fortified.
+* **Remediation Scope (Gate B):** A targeted, fail-closed institutional integrity check and administrator authorization contract must be designed, implemented, and verified with dedicated regression tests under Gate B before Chunk 06 closure and prior to Chunk 07 subject registration.
 
 ---
 
