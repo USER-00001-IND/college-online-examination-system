@@ -5,6 +5,7 @@ Targeting Gauhati University FYUGP Examination System Architecture.
 
 from pathlib import Path
 import os
+import re
 import environ
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -112,6 +113,22 @@ AUTH_THROTTLE_IP_LIMIT = env.int('AUTH_THROTTLE_IP_LIMIT', default=15)
 AUTH_THROTTLE_IP_WINDOW = env.int('AUTH_THROTTLE_IP_WINDOW', default=300)  # 5 minutes
 AUTH_THROTTLE_TARGET_LIMIT = env.int('AUTH_THROTTLE_TARGET_LIMIT', default=5)
 AUTH_THROTTLE_TARGET_WINDOW = env.int('AUTH_THROTTLE_TARGET_WINDOW', default=300)  # 5 minutes
+
+# Internal Single-College Institutional Configuration (Stage B1 Foundation)
+# Defines the canonical internal identifier for Pandit Deendayal Upadhyaya Adarsha Mahavidyalaya (PDUAM), Amjonga.
+# Note: PDUAM-AMJONGA is an internal application configuration code, not an official AISHE or university code.
+INSTITUTION_CODE = env.str('INSTITUTION_CODE', default='PDUAM-AMJONGA').strip()
+if not INSTITUTION_CODE:
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured("INSTITUTION_CODE configuration setting cannot be empty.")
+if len(INSTITUTION_CODE) > 20:
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured("INSTITUTION_CODE configuration setting cannot exceed 20 characters.")
+if not re.match(r"^[A-Z0-9_-]+$", INSTITUTION_CODE):
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured(
+        "INSTITUTION_CODE configuration setting must contain only uppercase alphanumeric characters, hyphens, or underscores."
+    )
 
 # Signed 64-bit integer primary keys (consistent with MySQL 8.x schema design)
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
