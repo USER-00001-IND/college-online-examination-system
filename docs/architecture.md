@@ -234,6 +234,7 @@ flowchart TD
     faculty --> accounts
     students --> academics
     faculty --> academics
+    accounts -.->|administrative membership (Proposed Table 53)| academics
 
     enrollments --> students
     enrollments --> academics
@@ -351,6 +352,81 @@ sequenceDiagram
         SPA->>Student: Display Error Alert with Remaining Attempts
     end
 ```
+
+### 6.4 Institutional Administrator Membership & Multi-Tenancy Architecture (Option B — Proposed Architecture)
+
+*Architecture Proposal: Option B (Dedicated Administrative Membership Mapping Table). Reconciled under Gate A for Project-Owner Review; Implementation Strictly Gated.*
+
+To enforce multi-institutional isolation without coupling administrator identity to single colleges, the system proposes **Option B: Dedicated Administrative Membership Mapping Table** ([`Table 53 (Proposed): accounts_administrative_membership`](database-architecture.md#table-53-proposed-accounts_administrative_membership)) to expand the committed 52-table schema to 53 tables.
+
+```mermaid
+erDiagram
+    accounts_user ||--o{ accounts_administrative_membership : "holds"
+    academics_college ||--o{ accounts_administrative_membership : "governs"
+    accounts_role ||--o{ accounts_administrative_membership : "authorizes"
+```
+
+#### 6.4.1 Cardinality & Mandatory Institutional Roles
+1. **Multi-Tenancy Cardinality (M:N):** Administrators with primary role `ADMIN` in `accounts_user` may hold distinct administrative appointments across multiple colleges (e.g. cluster coordinators or nodal principals).
+2. **Mandatory Institutional Role:** Each membership record requires an explicit `role_id BIGINT NOT NULL` referencing [`accounts_role(id)`](../backend/apps/accounts/models.py#L110-L130) (`COLLEGE_SUPERADMIN`, `EXAM_OFFICER`, `HEAD_EXAMINER`).
+3. **Single Mutable Current-State Record:** A unique constraint on `(user_id, college_id)` enforces a single current-state record with status choices `ACTIVE`, `SUSPENDED`, or `REVOKED`. Historical assignment tenure and revocation reasons are retained on the row and permanently logged to Table 51 (`audit_system_audit_log`) under proposed Policy A.
+
+#### 6.4.2 Two-Dimensional RBAC & Operation Registry
+Authorization is evaluated across two orthogonal dimensions: Institutional Scope (`college_id`) and Operational Capability (`operation`).
+
+```
++----------------------------------------------------------------------------------------------------+
+| DOMAIN                             | OPERATIONAL CAPABILITY IDENTIFIER                             |
++------------------------------------+---------------------------------------------------------------+
+| Student Management                 | student.registration.view, student.registration.review        |
+|                                    | student.profile.view, student.profile.manage                  |
+| Faculty Management                 | faculty.profile.view, faculty.account.provision               |
+|                                    | faculty.profile.manage                                        |
+| Academic Structure                 | academic.programme.view, academic.programme.manage            |
+|                                    | academic.department.view, academic.department.manage          |
+|                                    | academic.subject.view, academic.subject.manage                |
+|                                    | academic.session.view, academic.session.manage                |
+| Offerings & Assignments            | academic.offering.view, academic.offering.manage              |
+|                                    | academic.faculty_assignment.view                              |
+|                                    | academic.faculty_assignment.manage                            |
+| Enrollment Records                 | enrollment.record.view, enrollment.record.manage              |
+| Institutional Configuration        | academic.config.read, academic.config.manage                  |
+| Administrative Membership          | admin.membership.view, admin.membership.manage                |
++----------------------------------------------------------------------------------------------------+
+```
+
+* **Unbypassable Evaluation Pipeline:** The centralized authorization service (`authorize_institutional_operation`) is designed to verify: (1) operation code type; (2) membership in the approved 25-operation registry; (3) actor authentication; (4) actor active status; (5) rejection of student/faculty accounts; (6) college existence and active status; (7) Superadmin scope for valid operations; (8) active membership matching `(actor, college_id)`; (9) assigned role resolution; (10) role permission check.
+* **Fail-Closed Principle:** Unregistered or unknown operation codes raise `PermissionDenied` (HTTP 403) across all roles, including Superadmin.
+* **Superadmin Scope:** `SUPERADMIN` accounts possess system-wide operational authority across all colleges for registered operations, but never bypass authentication, active account checks, or relational integrity constraints.
+* **Operational Capability Restriction (Proposed Option B Policy):** Under the proposed Option B least-privilege policy, write capability for paper offerings (`academic.offering.manage`) is recommended to be restricted strictly to `SUPERADMIN` and `COLLEGE_SUPERADMIN`, while denying it to `EXAM_OFFICER` pending separate review of narrower coordination permissions. This operation-level restriction is part of the proposed Option B architecture and is not yet approved or enforced in application code; current academic CRUD services do not enforce operation-level checks, and institutional write authorization remains incomplete per Codex Finding F01.
+
+#### 6.4.3 Strategy C Concurrency Architecture (Proposed Protocol)
+Under the proposed **Strategy C: Outer Coordination Protocol with Preserved Internal Academic Lock Families**, administrative mutations are designed to adhere to a two-tier locking hierarchy:
+1. **Level 1 (College Coordination Lock):** Acquired via `lock_colleges(*sorted_ids)` in deterministic ascending numeric primary-key order. Serializes mutations within the target college.
+2. **Level 2 (User Row Locks):** All participating `accounts_user` rows are locked in ascending primary-key order (`SELECT ... FOR UPDATE`).
+3. **Level 3 (Membership Row Locks):** Target `accounts_administrative_membership` rows are locked under the Level 1 coordination lock.
+4. **Level 4 (Internal Domain Lock Families):** Dependent domain records (e.g. `PaperOffering`, `FacultyProfile`, `StudentProfile`) are locked following established domain hierarchy.
+5. **Level 5 (Atomic Audit Log):** Membership mutations and Table 51 audit records commit within the same atomic transaction.
+
+* **Revocation Race Serialization:** When a Superadmin revokes an administrator's membership concurrently with that administrator executing a mutation in the same college, the proposed protocol requires both transactions to compete for the Level 1 College Coordination Lock. If revocation commits first, the unblocked administrator's mutation revalidates membership status under lock, discovers `status == 'REVOKED'`, and fails closed with HTTP 403 Forbidden. Concurrency guarantees are conditional upon consistent implementation across all services and live MySQL verification. Deadlock freedom is not unconditionally guaranteed; deadlocks may occur under concurrent execution due to gap locks and index contention, requiring application-level retry handling.
+* **Connection Isolation Level:** Django's MySQL connection ordinarily operates under `READ COMMITTED` or the database server default. The effective live MySQL connection isolation level remains unverified. Concurrency guarantees and transaction isolation behavior are subject to live MySQL 8 integration and deadlock testing. Mandatory deadlock retry recovery (MySQL error 1213) is designed for write paths.
+
+#### 6.4.4 Academic Catalogue Read-Visibility Baseline
+* **Catalogue Browsing Preservation:** Active authenticated students, faculty, and administrators have global read access to browse all paper offerings across colleges (`PaperOfferingViewSet` enforcing `IsAcademicAdminOrReadOnly` with `queryset.all()`). This enables university-wide course discovery, minor elective selection, and multidisciplinary planning under FYUGP. Read-only catalogue browsing visibility remains unchanged.
+* **Mutation Scoping & Security Boundary:**
+  - **Intended Institutional Requirement:** The intended institutional security architecture requires that write mutations (create, update, delete) on college-bound academic records, including paper offerings, be strictly restricted to administrators authorized for the record's host college.
+  - **Proposed Option B Policy:** Under the proposed Option B architecture, this requirement is modeled via the `academic.offering.manage` operational capability within the 25-operation registry, restricted to `SUPERADMIN` and `COLLEGE_SUPERADMIN`. This operational policy is proposed and pending formal owner approval; it is not yet approved or implemented.
+  - **Current Runtime Status (Codex Finding F01):** Implemented academic CRUD APIs (`BaseAcademicViewSet`, `PaperOfferingViewSet`) do not consistently enforce college-scoped write checks; ordinary administrators can mutate academic records across colleges via HTTP. Codex F01 remains **P1 HIGH — CONFIRMED — UNRESOLVED** in application code.
+  - **Gate B Remediation Pending:** Gate B implementation remediation has not been executed or authorized. Institutional write authorization remains an open security defect until Gate B is formally authorized and implemented.
+
+#### 6.4.5 Durable Administrative Audit Prerequisite (Policy A — RECOMMENDED — OWNER SELECTION PENDING)
+* Under proposed Policy A, Table 51 ([`audit_system_audit_log`](database-architecture.md#table-51-audit_system_audit_log), planned in Domain I / Chunk 14) is designed as a mandatory transactional audit sink for production administrative membership lifecycle mutations. Both Table 51 and Table 53 remain explicitly unimplemented in application models and database migrations.
+* Application-level membership state transitions and Table 51 audit records are designed to commit atomically in the same database transaction; failure to record the audit entry aborts the mutation. Relational audit logging provides database-tier auditability and tamper resistance against application-tier compromise; database-level DBA modifications remain bounded by database engine controls, and relational audit logging does not by itself constitute cryptographic non-repudiation.
+
+#### 6.4.6 Institutional Authorization Defect & Interim Security Boundary (Codex Finding F01)
+* **Status:** P1 HIGH — CONFIRMED — UNRESOLVED (Application code).
+* **Defect Description:** In Chunk 05, academic ViewSets (`BaseAcademicViewSet`, `ProgrammeViewSet`, `InstitutionalConfigViewSet`) enforce only global role checks (`IsAcademicAdminOrReadOnly`) without verifying college ownership. While `accounts.authorization.get_actor_authorized_college_ids` fails closed (`set()`) for ordinary administrators, the academic APIs do not consistently invoke or enforce it, allowing ordinary administrators to modify academic records across institutions via direct API calls.
+* **Governance & Remediation:** Institutional write security remains incomplete in the current codebase. Implementation code remains untouched under Gate A. A targeted, fail-closed write check must be authorized and implemented under Gate B prior to production deployment.
 
 ---
 
